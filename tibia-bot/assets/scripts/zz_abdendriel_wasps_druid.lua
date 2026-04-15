@@ -132,3 +132,45 @@ function on_tick(ctx)
 
     return nil
 end
+
+-- ── on_fsm_state_change: death recovery + alert ─────────────────────
+-- El bot loop invoca este hook cada vez que la FSM cambia de estado O el
+-- safety_pause_reason cambia. Lo usamos para detectar:
+--
+--   - Muerte real del char → "prompt:char_select"
+--     (Tibia no tiene death screen, va directo a char selection)
+--   - Logout forzado → "prompt:login"
+--     (kick, server save, disconnect)
+--   - Stuck en un paused state por mucho tiempo
+--
+-- IMPORTANTE: este hook NO puede retornar una hotkey — solo sirve para
+-- logging y side-effects. El bot NO responde automáticamente a muerte
+-- (sería detectable).
+function on_fsm_state_change(new_state, reason)
+    -- Ignorar transitions normales Walking↔Fighting↔Idle — solo interesan
+    -- los pausados.
+    if reason == nil then
+        return
+    end
+
+    if reason == "prompt:char_select" then
+        bot.log("error", "═══ CHAR MUERTO ═══ prompt:char_select detectado")
+        bot.log("error", "Bot pausado. Operador debe resolver manualmente:")
+        bot.log("error", "  1. Relogear el char")
+        bot.log("error", "  2. Revisar postmortem de la sesión")
+        bot.log("error", "  3. Curl /recording/stop + replay_perception --summary")
+    elseif reason == "prompt:login" then
+        bot.log("error", "═══ DISCONNECT ═══ prompt:login detectado (kick/saving/crash)")
+        bot.log("error", "Bot pausado esperando relog manual del operador")
+    elseif reason == "prompt:npc_trade" then
+        bot.log("warn", "NPC trade window abierta — bot pausado hasta que cierres")
+    elseif reason == "focus:tibia_not_foreground" then
+        -- Este es frecuente (cada alt-tab), mejor log info no error.
+        bot.log("info", "Safety: Tibia perdió foco — bot pausado hasta recuperarlo")
+    elseif string.sub(reason, 1, 5) == "break" then
+        bot.log("info", string.format("Break scheduler: %s", reason))
+    else
+        -- Cualquier otra razón desconocida — log para investigación.
+        bot.log("warn", string.format("FSM → %s  reason=%s", new_state, reason))
+    end
+end

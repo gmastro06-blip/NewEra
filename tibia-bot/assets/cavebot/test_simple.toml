@@ -1,0 +1,99 @@
+# test_simple.toml — Cavebot trivial para E.2 short test
+#
+# Objetivo: validar que el motor de cavebot + game_coords (MinimapMatcher)
+# + node navigation funcionan end-to-end CON EL STACK NUEVO.
+#
+# Este script define un "patrón cuadrado" pequeño de 5-7 nodes alrededor
+# de una coord base. El char debe caminar del node A al B al C al D
+# y volver a A, loopeando. Sin combate, sin loot, sin refill — solo
+# walking por coords absolutas.
+#
+# USO:
+#   1. Posicionar el char en una zona SEGURA (sin mobs) con espacio para
+#      moverse ~10 tiles en cualquier dirección (ej un square grande
+#      como la plaza de Ab'dendriel, o un bosque abierto).
+#   2. Obtener el coord actual del char:
+#        curl http://localhost:8080/vision/perception | jq .game_coords
+#   3. Editar los `x`, `y`, `z` de los nodes de abajo — reemplazar
+#      CENTER_X, CENTER_Y, CENTER_Z con los valores del curl.
+#      Los deltas ±3/5 están calculados para formar un patrón pequeño.
+#   4. Load con:
+#        curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/test_simple.toml&enabled=true'
+#   5. Resume con:
+#        curl -X POST http://localhost:8080/resume
+#   6. Observar /cavebot/status y los logs:
+#        watch -n1 'curl -s http://localhost:8080/cavebot/status | jq .'
+#      Deberías ver current_step incrementando al llegar a cada node.
+#
+# CRITERIOS DE ÉXITO:
+#   - El char camina físicamente en el juego al primer node
+#   - cavebot_status.current_step incrementa de 0 → 1 → 2 → ... → 5 → (loop)
+#   - game_coords tracking actualiza al nuevo coord al arribar
+#   - 0 "stuck" warnings en los logs
+#   - 0 tick overruns críticos
+#
+# STOP:
+#   curl -X POST http://localhost:8080/cavebot/pause
+#   curl -X POST http://localhost:8080/cavebot/clear
+
+[cavebot]
+loop = true
+
+# ═══════════════════════════════════════════════════════════════
+# Patrón cuadrado (reemplazar coords antes de correr)
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "start"
+
+# Node 1: Punto inicial (CENTER)
+# EDITAR: poner el coord actual del char
+[[step]]
+kind = "node"
+x = 32659         # EDITAR con curl /vision/perception .game_coords[0]
+y = 31684         # EDITAR con curl /vision/perception .game_coords[1]
+z = 7             # EDITAR con curl /vision/perception .game_coords[2]
+max_wait_ms = 15000
+
+# Node 2: 3 tiles al este
+[[step]]
+kind = "node"
+x = 32662         # CENTER_X + 3
+y = 31684         # CENTER_Y
+z = 7             # CENTER_Z
+max_wait_ms = 15000
+
+# Node 3: 3 tiles al este Y 3 al sur
+[[step]]
+kind = "node"
+x = 32662         # CENTER_X + 3
+y = 31687         # CENTER_Y + 3
+z = 7             # CENTER_Z
+max_wait_ms = 15000
+
+# Node 4: 3 tiles al sur (center_x, center_y+3)
+[[step]]
+kind = "node"
+x = 32659         # CENTER_X
+y = 31687         # CENTER_Y + 3
+z = 7             # CENTER_Z
+max_wait_ms = 15000
+
+# Node 5: regreso a CENTER
+[[step]]
+kind = "node"
+x = 32659         # CENTER_X
+y = 31684         # CENTER_Y
+z = 7             # CENTER_Z
+max_wait_ms = 15000
+
+# Pause 2 segundos en el centro antes de reloopear
+[[step]]
+kind = "wait"
+duration_ms = 2000
+
+# Vuelta al inicio
+[[step]]
+kind = "goto"
+label = "start"

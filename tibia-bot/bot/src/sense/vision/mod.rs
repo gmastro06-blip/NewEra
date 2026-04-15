@@ -78,11 +78,14 @@ pub struct Vision {
     calm_frame_count: u32,
     /// Número de frame procesado.
     frame_count:     u64,
-    /// Índice de tile-hashes para posicionamiento absoluto.
-    map_index: Option<game_coords::MapIndex>,
-    /// CCORR-based fallback para game_coords. Usado cuando dHash falla (común
-    /// con Tibia 12 por anti-aliasing). Más lento pero mucho más robusto.
+    /// Template matcher (SSDNormalized) para posicionamiento absoluto.
+    /// Reemplaza el dHash legacy que era demasiado frágil para Tibia 12.
     minimap_matcher: game_coords::MinimapMatcher,
+    /// Counter para re-validación periódica del matcher. Incrementa cada
+    /// detection (cada `coords_detect_interval` frames). Cuando excede
+    /// `COORDS_REVALIDATE_INTERVAL`, la próxima detección usa brute force
+    /// full en lugar de narrow — evita "stuck in false positive".
+    coords_detects_since_full_search: u32,
     /// Intervalo de frames entre detecciones de coords (default 15).
     coords_detect_interval: u32,
     /// Pixels por tile en el minimap NDI (default 5). Usado para downsamplear
@@ -236,8 +239,8 @@ impl Vision {
             moving_hysteresis: false,
             calm_frame_count: 0,
             frame_count: 0,
-            map_index: None,
             minimap_matcher: game_coords::MinimapMatcher::new(),
+            coords_detects_since_full_search: 0,
             coords_detect_interval: 15,
             ndi_tile_scale: 5,
             last_game_coords: None,
@@ -252,25 +255,16 @@ impl Vision {
         }
     }
 
-    /// Carga el índice de tile-hashing para posicionamiento absoluto.
+    /// Carga configuración de game_coords: ndi_tile_scale, detect_interval,
+    /// y el MinimapMatcher (template matching SSDNormalized).
+    ///
     /// Llamar después de `load()` si se configura `[game_coords]`.
+    ///
+    /// Nota 2026-04-15: el `map_index_path` (dHash precomputado) se ignora
+    /// porque dHash es demasiado frágil al anti-aliasing del cliente Tibia 12.
+    /// El archivo sigue soportado por `build_map_index` bin pero no se
+    /// consume en runtime. Ver PLAN.md Phase B.2 para el rationale completo.
     pub fn load_map_index(&mut self, cfg: &crate::config::GameCoordsConfig) {
-        if cfg.map_index_path.is_empty() {
-            return;
-        }
-        let path = std::path::PathBuf::from(&cfg.map_index_path);
-        match game_coords::MapIndex::load(&path) {
-            Ok(idx) => {
-                tracing::info!(
-                    "MapIndex cargado: {} patches desde '{}'",
-                    idx.total_patches, path.display()
-                );
-                self.map_index = Some(idx);
-            }
-            Err(e) => {
-                warn!("MapIndex no disponible ({}). Coords dHash deshabilitadas.", e);
-            }
-        }
         if let Some(interval) = cfg.detect_interval {
             self.coords_detect_interval = interval.max(1);
         }
@@ -521,45 +515,58 @@ impl Vision {
         let ui_matches = self.ui_detector.last_matches().to_vec();
 
         // Tile-hashing: detectar coordenadas absolutas cada N frames.
-        // Estrategia de 2 pasos:
-        //   1. dHash (rápido, O(1) con MapIndex): intentar primero.
-        //   2. CCORR fallback (más lento pero robusto) si dHash falla.
         //
-        // Cuando hay un `last_game_coords` reciente, el CCORR matcher solo
-        // matchea contra el sector actual + 8 vecinos (~50-100ms). Sin last
-        // known, brute force (~1-2 seg) usado solo 1 vez en boot.
+        // Primary: MinimapMatcher (SSDNormalized template matching). Robusto
+        // al anti-aliasing del cliente Tibia 12. Narrow search (~80-160ms)
+        // después del primer detect, brute force (~3-4s) solo en cold boot
+        // o cada COORDS_REVALIDATE_INTERVAL detecciones para anti-stuck.
+        //
+        // Nota 2026-04-15: el step 1 dHash (MapIndex::lookup) fue removido
+        // del hot path porque NUNCA matcheaba en live (min hamming 14-20 bits
+        // vs threshold 3, causado por anti-aliasing).
+        //
+        // Re-validación periódica (anti stuck-in-false-positive):
+        //   Cada COORDS_REVALIDATE_INTERVAL detecciones, Vision fuerza un
+        //   brute force full sobre todos los floors. Esto recupera casos
+        //   donde el narrow search se quedó pegado a un falso positivo
+        //   (ej cold start con char en login screen, transición de piso).
+        //
+        // Cadencia: detect_interval=15 (30Hz) → 500ms entre detects.
+        // REVALIDATE=30 → ~15 seg entre re-validations.
+        // Cost: 1 tick spike de ~2-4s cada 15s. Acceptable en debug,
+        // pendiente mover a background thread para prod.
+        const COORDS_REVALIDATE_INTERVAL: u32 = 30;
+
         if self.frame_count % self.coords_detect_interval as u64 == 0 {
             if let Some(ref snap) = minimap {
-                // Step 1: dHash
-                let mut detected = None;
-                if let Some(ref idx) = self.map_index {
-                    detected = game_coords::detect_position(snap, idx, self.ndi_tile_scale);
-                }
-                // Step 2: CCORR fallback
-                if detected.is_none() && !self.minimap_matcher.is_empty() {
+                if !self.minimap_matcher.is_empty() {
+                    let force_full = self.last_game_coords.is_none()
+                        || self.coords_detects_since_full_search >= COORDS_REVALIDATE_INTERVAL;
                     let t0 = std::time::Instant::now();
-                    detected = self.minimap_matcher.detect(
+                    let detected = self.minimap_matcher.detect(
                         snap,
                         self.ndi_tile_scale,
                         self.last_game_coords,
+                        force_full,
                     );
                     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    // Log en info solo el primer brute force (slow path). Los
-                    // subsiguientes narrow searches son debug para evitar spam.
-                    if self.last_game_coords.is_none() {
+                    if force_full {
+                        // Reset counter. Log en info (los full searches son raros).
+                        self.coords_detects_since_full_search = 0;
                         tracing::info!(
-                            "MinimapMatcher brute-force frame={} → {:?} ({:.1}ms)",
-                            self.frame_count, detected, elapsed_ms
+                            "MinimapMatcher full frame={} last={:?} → {:?} ({:.1}ms)",
+                            self.frame_count, self.last_game_coords, detected, elapsed_ms
                         );
                     } else {
+                        self.coords_detects_since_full_search += 1;
                         tracing::debug!(
                             "MinimapMatcher narrow frame={} last={:?} → {:?} ({:.1}ms)",
                             self.frame_count, self.last_game_coords, detected, elapsed_ms
                         );
                     }
-                }
-                if detected.is_some() {
-                    self.last_game_coords = detected;
+                    if detected.is_some() {
+                        self.last_game_coords = detected;
+                    }
                 }
             }
         }

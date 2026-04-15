@@ -19,11 +19,11 @@
 ///
 /// Tiempo estimado: ~10-30 seg (paralelizado con rayon).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use image::{GenericImageView, GrayImage};
+use image::GrayImage;
 use imageproc::template_matching::{match_template_parallel, MatchTemplateMethod};
 
 use tibia_bot::sense::vision::game_coords::parse_minimap_filename;

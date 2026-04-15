@@ -40,6 +40,7 @@ pub const PATCH_TILES: usize = 16;
 const HASH_DIM: usize = 8;
 
 /// Máxima hamming distance aceptable para un match.
+#[allow(dead_code)] // legacy dHash, superseded by MinimapMatcher
 const MAX_HAMMING: u32 = 3;
 
 /// Stride entre patches al indexar (overlap 50% con PATCH_TILES=16).
@@ -92,6 +93,7 @@ pub fn dhash(data: &[u8], width: usize, height: usize) -> u64 {
 
 /// Hamming distance entre dos hashes de 64 bits.
 #[inline]
+#[allow(dead_code)] // legacy dHash, used only by MapIndex::lookup_fuzzy + tests
 pub fn hamming(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
@@ -116,12 +118,16 @@ pub struct MapIndex {
     pub total_patches: usize,
 }
 
+// NOTA 2026-04-15: MapIndex / dHash están en modo legacy. No se usan en
+// Vision::tick porque dHash es frágil al anti-aliasing del cliente Tibia
+// 12 (min hamming 14-20 bits vs threshold 3). Reemplazado por MinimapMatcher
+// (SSDNormalized template matching) al final del módulo. Los símbolos siguen
+// por compat con build_map_index bin, debug_game_coords bin, y tests.
+#[allow(dead_code)]
 impl MapIndex {
-    #[allow(dead_code)]
     pub fn new() -> Self { Self::default() }
 
     /// Inserta un hash → posición en el índice.
-    #[allow(dead_code)]
     pub fn insert(&mut self, hash: u64, pos: MapPos) {
         self.entries.entry(hash).or_default().push(pos);
         self.total_patches += 1;
@@ -148,7 +154,6 @@ impl MapIndex {
     }
 
     /// Serializa el índice a bytes (bincode).
-    #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let data = bincode::serialize(self)?;
         std::fs::write(path, data)?;
@@ -256,6 +261,7 @@ pub fn index_minimap_png(
 ///
 /// Retorna el patch downsampleado como `PATCH_TILES² * 4` bytes BGRA, listo
 /// para hashear con `dhash`.
+#[allow(dead_code)] // legacy dHash path, only called by detect_position
 fn extract_and_downsample(
     snap: &MinimapSnapshot,
     px: usize,
@@ -310,6 +316,7 @@ fn extract_and_downsample(
 ///
 /// Retorna `None` si no hay match, el minimap es demasiado pequeño, o el index
 /// está vacío.
+#[allow(dead_code)] // legacy dHash-based detect, superseded by MinimapMatcher
 pub fn detect_position(
     snap: &MinimapSnapshot,
     index: &MapIndex,
@@ -555,22 +562,32 @@ impl MinimapMatcher {
         Some((best, best_x, best_y))
     }
 
-    /// Detecta la posición del char vía template matching. Estrategia:
-    /// - Si `last_known` está presente, solo matchea contra el sector actual
-    ///   y sus 8 vecinos (9 sectores = ~50-100ms). Fast path.
-    /// - Si no, brute force sobre TODOS los sectores del piso `preferred_floor`
-    ///   (o todos los floors si es None). Slow path usado solo en boot.
+    /// Detecta la posición del char vía template matching.
+    ///
+    /// Modos de search:
+    /// - **Narrow** (default, `force_full=false`): si `last_known` presente,
+    ///   matchea solo contra el sector actual + 8 vecinos (9 sectores =
+    ///   ~50-100ms). Fast path.
+    /// - **Full** (`force_full=true` O `last_known=None`): brute force sobre
+    ///   TODOS los sectores de TODOS los floors cargados. Slow path (~1-4s)
+    ///   usado en cold boot y para re-validación periódica.
+    ///
+    /// La re-validación periódica es el mecanismo clave contra
+    /// "stuck in false positive": si el narrow search cae en un sector
+    /// equivocado en el cold start (ej char en login screen), sin
+    /// re-validación el bot queda pegado ahí. Vision llama con
+    /// `force_full=true` cada `COORDS_REVALIDATE_INTERVAL` detecciones.
     ///
     /// Retorna `None` si:
     /// - El matcher está vacío
     /// - El minimap NDI es demasiado pequeño
     /// - Ningún match pasó el threshold
-    #[allow(dead_code)]
     pub fn detect(
         &self,
         snap: &MinimapSnapshot,
         ndi_tile_scale: u32,
         last_known: Option<(i32, i32, i32)>,
+        force_full: bool,
     ) -> Option<(i32, i32, i32)> {
         if self.sectors_by_floor.is_empty() {
             return None;
@@ -581,19 +598,26 @@ impl MinimapMatcher {
             return None;
         }
 
-        // Determine which sectors to search.
-        let candidate_floors: Vec<i32> = if let Some((_, _, z)) = last_known {
-            vec![z]
+        // Use narrow search only when we have last_known AND force_full=false.
+        // Otherwise: full brute force over all loaded floors.
+        let use_narrow = !force_full && last_known.is_some();
+
+        // Determine which floors to search.
+        let candidate_floors: Vec<i32> = if use_narrow {
+            // Narrow: only the current floor of last_known.
+            vec![last_known.map(|(_, _, z)| z).unwrap_or(0)]
         } else {
+            // Full brute force: all loaded floors.
             self.sectors_by_floor.keys().copied().collect()
         };
 
-        // Collect candidate sectors as refs.
+        // Collect candidate sectors.
         let mut candidates: Vec<&ReferenceSector> = Vec::new();
         for floor in candidate_floors {
             if let Some(list) = self.sectors_by_floor.get(&floor) {
-                if let Some((lx, ly, _)) = last_known {
+                if use_narrow {
                     // Narrow to current sector + 8 neighbors (3×3 grid of 256-tile sectors).
+                    let (lx, ly) = last_known.map(|(x, y, _)| (x, y)).unwrap_or((0, 0));
                     let cur_fx = (lx / 256) * 256;
                     let cur_fy = (ly / 256) * 256;
                     for sector in list {
@@ -844,5 +868,236 @@ mod tests {
 
         assert_eq!(deserialized.lookup_exact(0xAAAA).len(), 1);
         assert_eq!(deserialized.lookup_exact(0xBBBB)[0], MapPos { x: 4, y: 5, z: 6 });
+    }
+
+    // ── MinimapMatcher tests ─────────────────────────────────────────────
+
+    /// Crea un reference PNG sintético 256×256 con patrones únicos globales
+    /// (no periódicos), útil para tests determinísticos del matcher donde
+    /// cada posición del template tiene UN solo mejor match.
+    ///
+    /// Formula: combina términos lineales (x*7, y*13) con un término no-lineal
+    /// (x*y) para romper cualquier periodicidad diagonal o axial. El resultado
+    /// es un patrón pseudo-aleatorio determinístico sin false positives.
+    fn make_synthetic_reference() -> GrayImage {
+        let mut img = GrayImage::new(256, 256);
+        for y in 0..256u32 {
+            for x in 0..256u32 {
+                let v = (x.wrapping_mul(7)
+                    .wrapping_add(y.wrapping_mul(13))
+                    .wrapping_add(x.wrapping_mul(y) % 256)
+                    .wrapping_add(((x / 4) ^ (y / 4)) * 17)) % 256;
+                img.put_pixel(x, y, image::Luma([v as u8]));
+            }
+        }
+        img
+    }
+
+    /// Crea un MinimapSnapshot sintético que representa un recorte 107×110
+    /// de un reference PNG en una posición específica, con scale=1 (1 px/tile).
+    /// Usado para validar que detect() retorna el coord esperado.
+    fn make_synthetic_minimap_from_ref(
+        reference: &GrayImage,
+        center_x: u32,
+        center_y: u32,
+        view_w: u32,
+        view_h: u32,
+    ) -> MinimapSnapshot {
+        // Calcular la esquina top-left del view en la reference.
+        let tl_x = center_x.saturating_sub(view_w / 2);
+        let tl_y = center_y.saturating_sub(view_h / 2);
+        let mut data = vec![0u8; (view_w * view_h * 4) as usize];
+        for y in 0..view_h {
+            for x in 0..view_w {
+                let sx = tl_x + x;
+                let sy = tl_y + y;
+                let luma = if sx < reference.width() && sy < reference.height() {
+                    reference.get_pixel(sx, sy).0[0]
+                } else {
+                    0
+                };
+                let off = ((y * view_w + x) * 4) as usize;
+                // RGBA: byte[0]=R, byte[1]=G, byte[2]=B (luma en los 3)
+                data[off] = luma;
+                data[off + 1] = luma;
+                data[off + 2] = luma;
+                data[off + 3] = 255;
+            }
+        }
+        MinimapSnapshot { width: view_w, height: view_h, data }
+    }
+
+    #[test]
+    fn matcher_empty_returns_none() {
+        let matcher = MinimapMatcher::new();
+        assert!(matcher.is_empty());
+        let snap = MinimapSnapshot { width: 107, height: 110, data: vec![0u8; 107 * 110 * 4] };
+        assert_eq!(matcher.detect(&snap, 1, None, false), None);
+        assert_eq!(matcher.detect(&snap, 1, Some((100, 100, 7)), false), None);
+    }
+
+    #[test]
+    fn matcher_finds_known_position_scale1() {
+        // Given: un reference sintético + snapshot que captura la misma
+        // región en el centro del quadrante GRADIENT (top-left), donde cada
+        // pixel tiene luma única (x+y) % 256. Esto garantiza que match_template
+        // encuentre una sola posición óptima, sin falsos positivos periódicos
+        // como pasa con el checkerboard quadrant.
+        let reference = make_synthetic_reference();
+        let mut matcher = MinimapMatcher::new();
+        // Insertar manualmente 1 sector en el atlas
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![ReferenceSector {
+                file_x: 32000,
+                file_y: 31000,
+                z:      7,
+                image:  reference.clone(),
+            }],
+        );
+        matcher.match_threshold = 0.15;
+
+        // Snapshot centrado en (64, 64) del reference = tile del mundo
+        // (32000+64, 31000+64, 7) = (32064, 31064, 7). View 60×60 cubre
+        // (34-93, 34-93) todo en quadrante gradient.
+        let snap = make_synthetic_minimap_from_ref(&reference, 64, 64, 60, 60);
+
+        // Full brute force (force_full=true).
+        let detected = matcher.detect(&snap, 1, None, true);
+        assert!(detected.is_some(), "matcher debe encontrar match en reference sintético");
+        let (x, y, z) = detected.unwrap();
+        // Tolerancia ±2 por rounding del centro del template.
+        assert!(
+            (x - 32064).abs() <= 2,
+            "x esperado ~32064, obtenido {}",
+            x
+        );
+        assert!(
+            (y - 31064).abs() <= 2,
+            "y esperado ~31064, obtenido {}",
+            y
+        );
+        assert_eq!(z, 7);
+    }
+
+    #[test]
+    fn matcher_narrow_search_uses_only_current_floor() {
+        // Insert 2 floors, each with 1 sector. Narrow should only match the one
+        // matching last_known.z.
+        let mut matcher = MinimapMatcher::new();
+        let ref7 = make_synthetic_reference();
+        let mut ref8 = GrayImage::new(256, 256);
+        // ref8 = patrón distinto (luma fija) para que NO matchee el snap
+        for y in 0..256u32 {
+            for x in 0..256u32 {
+                ref8.put_pixel(x, y, image::Luma([128]));
+            }
+        }
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![ReferenceSector { file_x: 32000, file_y: 31000, z: 7, image: ref7.clone() }],
+        );
+        matcher.sectors_by_floor.insert(
+            8,
+            vec![ReferenceSector { file_x: 32000, file_y: 31000, z: 8, image: ref8 }],
+        );
+        matcher.match_threshold = 0.15;
+
+        let snap = make_synthetic_minimap_from_ref(&ref7, 64, 64, 60, 60);
+        // Narrow search con last_known en piso 7 (coord aproximado).
+        let detected = matcher.detect(&snap, 1, Some((32064, 31064, 7)), false);
+        assert!(detected.is_some());
+        assert_eq!(detected.unwrap().2, 7, "narrow debe mantener piso 7");
+    }
+
+    #[test]
+    fn matcher_force_full_searches_all_floors() {
+        // Con force_full=true, el matcher debe considerar sectores de todos
+        // los pisos cargados, no solo el de last_known.
+        let mut matcher = MinimapMatcher::new();
+        let ref7 = make_synthetic_reference();
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![ReferenceSector { file_x: 32000, file_y: 31000, z: 7, image: ref7.clone() }],
+        );
+        matcher.match_threshold = 0.15;
+
+        let snap = make_synthetic_minimap_from_ref(&ref7, 64, 64, 60, 60);
+        // last_known dice piso 8 (incorrecto), force_full=true debe encontrar piso 7 real.
+        let detected = matcher.detect(&snap, 1, Some((33000, 32000, 8)), true);
+        assert!(detected.is_some());
+        assert_eq!(detected.unwrap().2, 7, "force_full debe recuperar piso correcto");
+    }
+
+    #[test]
+    fn matcher_rejects_above_threshold() {
+        // Un snap totalmente distinto al reference debe producir SSD alto
+        // y retornar None cuando está por encima del threshold.
+        let mut matcher = MinimapMatcher::new();
+        let reference = make_synthetic_reference();
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![ReferenceSector { file_x: 32000, file_y: 31000, z: 7, image: reference }],
+        );
+        matcher.match_threshold = 0.01; // MUY estricto
+
+        // Snap con patrón random (no viene del reference).
+        let mut data = vec![0u8; 60 * 60 * 4];
+        for i in 0..(60 * 60) {
+            let v = ((i * 137) % 256) as u8;
+            data[i * 4]     = v;
+            data[i * 4 + 1] = v.wrapping_add(80);
+            data[i * 4 + 2] = v.wrapping_add(160);
+            data[i * 4 + 3] = 255;
+        }
+        let snap = MinimapSnapshot { width: 60, height: 60, data };
+
+        let detected = matcher.detect(&snap, 1, None, true);
+        assert_eq!(detected, None, "snap unrelated no debe matchear con threshold 0.01");
+    }
+
+    #[test]
+    fn matcher_build_template_rgba_luma_correct() {
+        // Verifica que build_template calcula luma BT.601 correctamente
+        // asumiendo RGBA byte order (byte[0]=R, byte[1]=G, byte[2]=B).
+        let mut data = vec![0u8; 4 * 4 * 4];
+        for i in 0..16 {
+            data[i * 4]     = 255; // R
+            data[i * 4 + 1] = 128; // G
+            data[i * 4 + 2] = 64;  // B
+            data[i * 4 + 3] = 255; // A
+        }
+        let snap = MinimapSnapshot { width: 4, height: 4, data };
+        let template = MinimapMatcher::build_template(&snap, 1).unwrap();
+        assert_eq!(template.dimensions(), (4, 4));
+        // Luma = 0.299*255 + 0.587*128 + 0.114*64 = 76.245 + 75.136 + 7.296 = 158.677
+        let expected = (0.299 * 255.0 + 0.587 * 128.0 + 0.114 * 64.0) as u8;
+        let actual = template.get_pixel(0, 0).0[0];
+        assert!(
+            (actual as i16 - expected as i16).abs() <= 1,
+            "luma esperada ~{}, obtenida {}",
+            expected, actual
+        );
+    }
+
+    #[test]
+    fn matcher_build_template_downsamples_correctly() {
+        // Scale=2 debe promediar bloques 2×2 → output tiene la mitad de dimensiones.
+        let w = 8u32;
+        let h = 8u32;
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        // Pattern: todos los pixels tienen luma 100 (R=100, G=100, B=100)
+        for i in 0..(w * h) as usize {
+            data[i * 4]     = 100;
+            data[i * 4 + 1] = 100;
+            data[i * 4 + 2] = 100;
+            data[i * 4 + 3] = 255;
+        }
+        let snap = MinimapSnapshot { width: w, height: h, data };
+        let template = MinimapMatcher::build_template(&snap, 2).unwrap();
+        assert_eq!(template.dimensions(), (4, 4), "downsample by 2 → 4×4");
+        // Promedio de bloques uniformes sigue siendo 100.
+        assert_eq!(template.get_pixel(0, 0).0[0], 100);
+        assert_eq!(template.get_pixel(3, 3).0[0], 100);
     }
 }

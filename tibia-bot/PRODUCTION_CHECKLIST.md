@@ -1,4 +1,4 @@
-# Production smoke test checklist
+# Production runbook + smoke test checklist
 
 Runbook ejecutable para validar el bot en vivo con NDI + HID bridge reales. Diseñado
 para correr en orden de arriba a abajo en una sola sesión (~2-3h).
@@ -6,31 +6,174 @@ para correr en orden de arriba a abajo en una sola sesión (~2-3h).
 Cada fase tiene **comandos exactos** + **criterios pass/fail**. Si una fase falla,
 parar y diagnosticar antes de seguir.
 
-## Status (última sesión: 2026-04-15)
+## Status (última sesión: 2026-04-15 session 3)
 
-**Validado en vivo**:
-- Vision pipeline (HP/mana/battle list/inventory) leyendo en tiempo real
-- Lua healer druida level 11 (`zz_abdendriel_wasps_druid.lua`) — sobrevivió HP=2%
-- Arduino Leonardo HID bridge (3.23ms RTT, reemplazo de Pico 2)
-- Safety gate `focus:tibia_not_foreground` bloqueando comandos con Tibia sin foco
-- 370 lib tests pass
+**Validado en vivo (end-to-end)**:
+- Vision pipeline: HP/mana/battle list/inventory leyendo en tiempo real, HP range 50-100%
+- **game_coords tracking con MinimapMatcher** (SSDNormalized), live validated en (32659, 31683, 7)
+- FSM transitions Walking ↔ Fighting ↔ Idle durante combate real
+- Lua healer druida level 11 (`zz_abdendriel_wasps_druid.lua`) con F3 exura + F1 mana pot
+  validado por usuario visualmente en cliente Tibia
+- Arduino Leonardo HID bridge (3.23ms RTT, reemplazo del Pico 2)
+- Safety gates: `focus:tibia_not_foreground` + `prompt:*` + `break:*`
+- Anchor tracking sidebar_top (score 0.05-0.06 vs umbral 0.30)
+- Recording append mode 78049 snapshots / 43 min sin corrupción
+- Hot-reload `/scripts/reload` (confirmado, bug previo era falso)
+- Death recovery hook `on_fsm_state_change` para alertar muerte/disconnect
+- **380+ lib tests pass**, 0 regresiones, build limpio
 
-**Bugs fixados (Phase A de single-session plan)**:
-- `recorder.rs`: append mode (sobrevive restart del bot durante sesión)
-- `loop_.rs` SpellContext: fallback HP 0.5 en vez de 1.0 (seguro ante vitals sostenido None)
-- `scripting/mod.rs` `load_dir`: reset completo del Lua state al reload
-  (antes los hooks no se reemplazaban cuando usaban upvalues locales — bug
-  observado al intentar fixear el F2 spam)
-- `metrics.rs`: tests explícitos de que `None` no contamina rolling averages
-- FSM state change hook `on_fsm_state_change(new_state, reason)` para detectar
-  muerte/disconnect/breaks desde Lua scripts (ver druid.lua para ejemplo)
+**Bugs fixados (Phase A + B de single-session plan)**:
+- `recorder.rs`: `OpenOptions::append` (sobrevive restart del bot)
+- `loop_.rs` SpellContext: fallback HP 0.5 (seguro ante vitals sostenido None)
+- `loop_.rs` dead match arm: warn silencioso en lugar de panic
+- `scripting/mod.rs`: reload confirmado working (bug reportado era falso)
+- `calibration.toml` anchor `expected_roi = (1700, 0, 80, 70)` match exacto a make_anchors
+- `game_coords.rs` **MinimapMatcher** SSDNormalized template matching reemplaza el
+  dHash legacy que era frágil al anti-aliasing del cliente Tibia 12
+- `game_coords.rs` `build_template` usa RGBA byte order correcto (byte[0]=R)
+- `config.toml` `ndi_tile_scale = 2` (valor real empírico, no 5 como asumía el default)
+- Re-validación periódica cada 30 detects para anti stuck-in-false-positive
 
-**Pendiente / known blockers**:
-- `game_coords`: tile-hashing retorna null siempre (min hamming 10-17 bits).
-  Diagnóstico con `bin/diff_minimap_pixels` (ver "Phase B del plan" más abajo).
-  Mientras no se resuelva, usar cavebot con `walk` steps temporales, NO con
-  `node` steps absolutos.
-- Anchor score=0.0 — regenerar con `make_anchors` + frame fresh (ver Phase G).
+**Ready for production**:
+- ✅ Modo "assist healer": usuario mueve char manualmente, bot detecta vitals + dispara
+  heal/mana pot/attack. 100% funcional hoy.
+- ⏳ Modo "full cavebot": cavebot código listo pero pending live validation de
+  node navigation (E.2) + refill loop (D.2+D.3+E.3). ~3-4h trabajo restante.
+
+**No blockers** — todos los bugs críticos resueltos.
+
+---
+
+## Operational runbook (start/monitor/stop)
+
+Use case: sesión de 30-120 min con modo "assist healer" (sin cavebot) o con cavebot
+(cuando D.2+D.3 estén calibrados).
+
+### Arranque
+
+```powershell
+# PC Gaming: Tibia + OBS con DistroAV NDI source activo
+# Arduino Leonardo conectado en COM8 (verificar: arduino-cli board list)
+
+cd C:\Users\gmast\Documents\GitHub\NewEra\tibia-bot
+
+# 1. Bridge (console #1)
+.\target\release\pico_bridge.exe bridge\bridge_config.toml
+
+# 2. Bot (console #2)
+.\target\release\tibia_bot.exe bot\config.toml assets
+
+# 3. Monitoring (opcional, otro console)
+cd monitoring ; docker-compose up -d
+# Grafana en http://localhost:3000 admin/admin, dashboard "tibia-bot"
+
+# 4. Start session script (opcional, wraps lo anterior)
+.\scripts\start_session.ps1 -Label "hunt-20260415"
+```
+
+### Verificación post-arranque (primeros 30 seg)
+
+```powershell
+# Health check
+curl http://localhost:8080/health
+
+# Esperado: {"ok":true,"reason":"ok","details":{"has_frame":true,...}}
+# Si reason="no_frame" → NDI no conectada. Verificar DistroAV.
+# Si reason="paused_*" → check safety_pause_reason, resolver manualmente.
+
+# Vitals + game_coords
+curl http://localhost:8080/vision/perception | jq '.hp_percent, .mana_percent, .game_coords'
+
+# Esperado: hp ~100, mana ~100, game_coords una tupla (x, y, z) NO null
+
+# Anchor score (sidebar stability)
+# Buscar en logs del bot: "Ancla: score=0.XX (umbral=0.30) FOUND"
+# Score debe ser < 0.30 (SSD lower=better). Si > 0.30, regenerar template:
+.\scripts\regen_anchor.ps1
+```
+
+### Monitoring durante la sesión
+
+Los siguientes checks son útiles periódicamente (cada 15 min) o cuando algo parece raro:
+
+```powershell
+# Dispatch stats (cuántos heals/attacks han ido al cliente)
+curl http://localhost:8080/dispatch/stats
+
+# FSM debug (estado actual + cooldowns)
+curl http://localhost:8080/fsm/debug
+
+# Latencias de procesamiento
+curl http://localhost:8080/health | jq '.details.bot_proc_ms, .details.ticks_overrun'
+# Esperado: bot_proc_ms < 10ms typical, ticks_overrun crece lento (<1% del total)
+
+# Script errors (si los hay, el bot queda funcional pero hay un bug Lua)
+curl http://localhost:8080/scripts/status | jq '.last_errors'
+```
+
+### Protocolo de emergencia
+
+**Escenario 1: HP cae peligrosamente**
+1. `curl -X POST http://localhost:8080/pause` — pausa inmediata
+2. Resolver manualmente en el cliente (drink potions, retreat)
+3. `curl -X POST http://localhost:8080/resume` o restart bot si es grave
+
+**Escenario 2: Char muerto (prompt:char_select)**
+1. El death recovery hook Lua ya loggea el evento con `bot.log("error", ...)`
+2. Bot queda en safety_pause automáticamente
+3. Relogear el char manualmente en el cliente
+4. El bot detecta que `prompt:char_select` ya no está, resume automáticamente (o curl /resume)
+5. **Postmortem obligatorio**: `.\scripts\postmortem.ps1 sessions\<latest>.jsonl`
+
+**Escenario 3: Bot stuck (nunca sale de un estado)**
+1. `curl http://localhost:8080/fsm/debug` — ver current state + tick counters
+2. Si cavebot stuck: `curl -X POST http://localhost:8080/cavebot/pause`
+3. Si waypoints stuck: `curl -X POST http://localhost:8080/waypoints/pause`
+4. Si FSM stuck en Fighting sin enemies reales: vision reader fallando. Restart bot.
+
+**Escenario 4: Bridge desconectado**
+Síntoma: logs muestran `PicoLink: error de conexión`
+1. Verificar que `pico_bridge.exe` sigue corriendo
+2. Si cayó: relanzarlo. El bot reconnectará automáticamente (backoff exponencial)
+3. Si COM port cambió (post flash de Arduino, etc): actualizar `bridge/bridge_config.toml`
+   y relanzar bridge
+
+### Parada
+
+```powershell
+# 1. Pausar bot (seguro — no pierde la sesión)
+curl -X POST http://localhost:8080/pause
+
+# 2. Stop recording (si estaba activo)
+curl -X POST http://localhost:8080/recording/stop
+
+# 3. Postmortem
+.\scripts\postmortem.ps1 sessions\<latest>.jsonl
+
+# 4. Kill processes
+taskkill /F /IM tibia_bot.exe
+taskkill /F /IM pico_bridge.exe
+
+# O con script:
+.\scripts\stop_session.ps1
+```
+
+### Qué revisar en el postmortem
+
+```
+HP p50/p95 + min observed  → char health distribution
+Mana p50/p95 + min observed → mana efficiency
+In combat %                → hunt intensity
+Max enemies                → peaks (swarm incidents)
+Unique coords              → movement tracking (cavebot only)
+Inventory peak (slots)     → supplies consumed
+```
+
+Red flags:
+- HP min < 20% → healer late o muy stressed
+- Ticks overrun > 5% → performance issue
+- Unique coords = 1 (no movement) con recording largo → bot stuck
+- Recording tamaño 0 bytes → recorder falló (check permissions)
 
 ---
 
