@@ -115,3 +115,63 @@ pub struct MetricsSnapshot {
     /// Número de samples en el historial (máx. 1800).
     pub sample_count: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Simula el patrón real del loop: `if let Some(r) = hp_ratio { push_hp(r) }`.
+    /// Verifica que Nones NO contaminan la rolling average.
+    #[test]
+    fn hp_avg_excludes_missing_readings() {
+        let mut m = VisionMetrics::default();
+
+        // 3 reads reales + 5 Nones + 3 reads reales más.
+        let inputs: [Option<f32>; 11] = [
+            Some(0.4),  // real
+            Some(0.5),  // real
+            Some(0.6),  // real
+            None,       // skipped
+            None,       // skipped
+            None,       // skipped
+            None,       // skipped
+            None,       // skipped
+            Some(0.4),  // real
+            Some(0.5),  // real
+            Some(0.6),  // real
+        ];
+        for r in inputs.iter() {
+            if let Some(v) = r {
+                m.push_hp(*v);
+            }
+        }
+
+        let snap = m.snapshot();
+        assert_eq!(snap.sample_count, 6, "solo 6 valores reales deben contar");
+        // Avg = (0.4+0.5+0.6+0.4+0.5+0.6) / 6 = 0.5.
+        let avg = snap.hp_avg.expect("hp_avg debe estar presente con 6 samples");
+        assert!((avg - 0.5).abs() < 1e-6, "hp_avg esperado 0.5, got {}", avg);
+    }
+
+    /// Verifica que un historial vacío retorna None (no 0.0, no 1.0).
+    #[test]
+    fn empty_metrics_return_none() {
+        let m = VisionMetrics::default();
+        let snap = m.snapshot();
+        assert_eq!(snap.hp_avg, None);
+        assert_eq!(snap.hp_stddev, None);
+        assert_eq!(snap.mana_avg, None);
+        assert_eq!(snap.sample_count, 0);
+    }
+
+    /// Verifica que el historial rodante se capa en HISTORY_CAPACITY.
+    #[test]
+    fn history_caps_at_capacity() {
+        let mut m = VisionMetrics::default();
+        for _ in 0..(HISTORY_CAPACITY + 100) {
+            m.push_hp(0.5);
+        }
+        let snap = m.snapshot();
+        assert_eq!(snap.sample_count, HISTORY_CAPACITY as u32);
+    }
+}

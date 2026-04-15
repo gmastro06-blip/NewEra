@@ -96,11 +96,15 @@ slot_cols      = 4
 slot_rows      = 1
 
 # ── Anclas de referencia ──────────────────────────────────────────────────────
-# Anchor regenerado 2026-04-10: header del panel "Battle List" (esquina superior
-# izquierda). Zona estable: pixel-art del texto "Battle List" + iconos de botones
-# (X, lupa, menú). NO cambia entre frames a diferencia del anchor anterior que
-# apuntaba al minimap (contenido dinámico).
+# sidebar_top: header del panel lateral derecho (sidebar UI estable con
+# "Battle List" texto + iconos). Regenerable con:
+#   curl /test/grab -o frame.png && make_anchors frame.png assets
+#
+# 2026-04-15: make_anchors crops en (1700, 0, 80, 70). El expected_roi debe
+# ser una ventana un poco mayor al template para permitir drifts pequeños
+# de ventana (±10 px típicamente), pero NO más grande porque entonces la
+# template matching puede encontrar false positives.
 [[anchors]]
 name          = "sidebar_top"
 template_path = "sidebar_top.png"
-expected_roi  = { x = 0, y = 0, w = 180, h = 100 }
+expected_roi  = { x = 1700, y = 0, w = 80, h = 70 }

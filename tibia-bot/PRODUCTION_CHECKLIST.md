@@ -1,10 +1,70 @@
 # Production smoke test checklist
 
-Runbook ejecutable para validar el bot en vivo con NDI + Pico reales. Diseñado
+Runbook ejecutable para validar el bot en vivo con NDI + HID bridge reales. Diseñado
 para correr en orden de arriba a abajo en una sola sesión (~2-3h).
 
 Cada fase tiene **comandos exactos** + **criterios pass/fail**. Si una fase falla,
 parar y diagnosticar antes de seguir.
+
+## Status (última sesión: 2026-04-15)
+
+**Validado en vivo**:
+- Vision pipeline (HP/mana/battle list/inventory) leyendo en tiempo real
+- Lua healer druida level 11 (`zz_abdendriel_wasps_druid.lua`) — sobrevivió HP=2%
+- Arduino Leonardo HID bridge (3.23ms RTT, reemplazo de Pico 2)
+- Safety gate `focus:tibia_not_foreground` bloqueando comandos con Tibia sin foco
+- 370 lib tests pass
+
+**Bugs fixados (Phase A de single-session plan)**:
+- `recorder.rs`: append mode (sobrevive restart del bot durante sesión)
+- `loop_.rs` SpellContext: fallback HP 0.5 en vez de 1.0 (seguro ante vitals sostenido None)
+- `scripting/mod.rs` `load_dir`: reset completo del Lua state al reload
+  (antes los hooks no se reemplazaban cuando usaban upvalues locales — bug
+  observado al intentar fixear el F2 spam)
+- `metrics.rs`: tests explícitos de que `None` no contamina rolling averages
+- FSM state change hook `on_fsm_state_change(new_state, reason)` para detectar
+  muerte/disconnect/breaks desde Lua scripts (ver druid.lua para ejemplo)
+
+**Pendiente / known blockers**:
+- `game_coords`: tile-hashing retorna null siempre (min hamming 10-17 bits).
+  Diagnóstico con `bin/diff_minimap_pixels` (ver "Phase B del plan" más abajo).
+  Mientras no se resuelva, usar cavebot con `walk` steps temporales, NO con
+  `node` steps absolutos.
+- Anchor score=0.0 — regenerar con `make_anchors` + frame fresh (ver Phase G).
+
+---
+
+## Ruta express: single-session ready-for-2h
+
+Si solo querés validar el stack rápidamente sin pasar por todo el runbook:
+
+```bash
+# 1. Build clean (2-4 min primera vez)
+cargo build --release && cargo test --release
+
+# 2. Bridge arriba (PC gaming) — Arduino Leonardo en COM8
+.\target\release\pico_bridge.exe bridge\bridge_config.toml
+
+# 3. Bot arriba (PC bot)
+./target/release/tibia_bot bot/config.toml assets
+
+# 4. Health check
+curl -s http://localhost:8080/health | jq .
+
+# 5. Recording start + passive test (30 min)
+curl -X POST "http://localhost:8080/recording/start?path=sessions/smoke.jsonl"
+# Usuario mueve char manualmente, se deja pegar
+# Observar: HP < 70% → F3 exura / Mana < 40% → F1 / HP < 25% → F2
+curl -X POST http://localhost:8080/recording/stop
+
+# 6. Postmortem
+./target/release/replay_perception --input sessions/smoke.jsonl --summary
+```
+
+Si los 6 pasos anteriores pasan sin intervención, el bot está listo para
+sesiones de 30-60 min supervisadas. Para sesiones 2h/día necesita además las
+calibraciones de Phase G (click coords deposit/buy_item) y cavebot con nodes
+(bloqueado por game_coords).
 
 ## Prerequisitos
 
@@ -605,3 +665,110 @@ Cuando termines el live test, reporta:
 3. **Coords finales** para deposit/buy_item (para docs futuros)
 4. **Tiempo de overrun medio** tras 1h
 5. **Items/ideas no cubiertos** por el runbook
+
+---
+
+## Emergency stop protocol
+
+Durante operación 2h/día, si hay que abortar una sesión inmediatamente:
+
+```powershell
+# Option 1: pausa graceful (el bridge sigue vivo, bot para de actuar)
+curl -X POST http://localhost:8080/pause
+
+# Option 2: kill proceso (si HTTP no responde)
+taskkill /F /IM tibia_bot.exe
+taskkill /F /IM pico_bridge.exe
+
+# Option 3: alt-tab fuera de Tibia (el bot detecta focus:tibia_not_foreground
+# y pausa automáticamente dentro de 100ms). Esto NO mata el bot, solo lo frena
+# hasta que Tibia vuelva a tener foco.
+```
+
+Después de cualquier emergency stop:
+1. Revisar el último snapshot de recording: `replay_perception --input <latest.jsonl> --filter hp_below:30`
+2. Revisar logs del bot (stderr): buscar ERROR/WARN repetidos
+3. Si hubo muerte del char: NO reanudar hasta revisar por qué el healer no salvó
+
+---
+
+## Game_coords troubleshooting (parked investigation)
+
+Si `curl /vision/perception | jq .game_coords` retorna `null`:
+
+```bash
+# 1. Capturar frame con un coord conocido (mirá el char en el juego,
+#    leé su posición en el minimap UI de Tibia, anotala).
+curl http://localhost:8080/test/grab -o frame_for_diag.png
+
+# 2. Correr el diagnóstico pixel-a-pixel.
+./target/release/diff_minimap_pixels \
+    --frame frame_for_diag.png \
+    --minimap-roi <x,y,w,h> \
+    --char-coord <x,y,z> \
+    --map-dir assets/minimap/minimap \
+    --scale 5 \
+    --output diag.png
+
+# 3. El tool imprime un diagnóstico automático:
+#    - "shift uniforme" → problema de color space (NDI/OBS)
+#    - "variación alta sin shift" → smoothing del cliente Tibia
+#    - "shift alto + variación alta" → ROI mal o scale mal
+#    - "todo low" → el problema está en dhash(), no en los pixels
+```
+
+Mientras no se resuelva game_coords, usar cavebot con `walk` steps temporales
+en lugar de `node` steps absolutos. Documentar en el script.
+
+---
+
+## Lua hot-reload (Phase A.4 fix)
+
+Tras el fix de Phase A.4, `/scripts/reload` resetea completamente el Lua
+runtime antes de re-cargar los .lua del directorio. Esto garantiza que:
+
+- Cambios en locals (ej `EMERGENCY_COOLDOWN_TICKS = 30`) se apliquen
+- Funciones que capturaban upvalues viejos sean reemplazadas
+- La API `bot.*` siga disponible (se re-instala automáticamente)
+
+```bash
+# Editar el .lua
+# ...
+
+# Reload
+curl -X POST http://localhost:8080/scripts/reload
+
+# Verificar que cargó sin errores
+curl -s http://localhost:8080/scripts/status | jq .
+```
+
+Si `/scripts/status` retorna errores, revisar el syntax del .lua y volver a
+reload. **NO es necesario reiniciar el bot** para cambios en scripts Lua.
+
+---
+
+## Recording append (Phase A.1 fix)
+
+El `PerceptionRecorder` ahora abre archivos en **append mode** en lugar de
+truncate. Esto significa que si el bot se reinicia durante una sesión de 2h,
+la data previa se preserva:
+
+```bash
+# Primera sesión
+curl -X POST "http://localhost:8080/recording/start?path=sessions/day1.jsonl"
+# ... bot corre 1h, se reinicia por bug ...
+
+# Segunda sesión (mismo path)
+curl -X POST "http://localhost:8080/recording/start?path=sessions/day1.jsonl"
+# Los records nuevos se appendean, no sobrescriben
+
+# Postmortem incluye TODO el histórico
+./target/release/replay_perception --input sessions/day1.jsonl --summary
+```
+
+Para separar sesiones físicamente, usar paths con timestamp:
+
+```powershell
+$ts = Get-Date -Format "yyyy-MM-dd_HHmm"
+curl -X POST "http://localhost:8080/recording/start?path=sessions/session_$ts.jsonl"
+```

@@ -80,6 +80,9 @@ pub struct Vision {
     frame_count:     u64,
     /// Índice de tile-hashes para posicionamiento absoluto.
     map_index: Option<game_coords::MapIndex>,
+    /// CCORR-based fallback para game_coords. Usado cuando dHash falla (común
+    /// con Tibia 12 por anti-aliasing). Más lento pero mucho más robusto.
+    minimap_matcher: game_coords::MinimapMatcher,
     /// Intervalo de frames entre detecciones de coords (default 15).
     coords_detect_interval: u32,
     /// Pixels por tile en el minimap NDI (default 5). Usado para downsamplear
@@ -234,6 +237,7 @@ impl Vision {
             calm_frame_count: 0,
             frame_count: 0,
             map_index: None,
+            minimap_matcher: game_coords::MinimapMatcher::new(),
             coords_detect_interval: 15,
             ndi_tile_scale: 5,
             last_game_coords: None,
@@ -264,7 +268,7 @@ impl Vision {
                 self.map_index = Some(idx);
             }
             Err(e) => {
-                warn!("MapIndex no disponible ({}). Coords deshabilitadas.", e);
+                warn!("MapIndex no disponible ({}). Coords dHash deshabilitadas.", e);
             }
         }
         if let Some(interval) = cfg.detect_interval {
@@ -273,6 +277,33 @@ impl Vision {
         if cfg.ndi_tile_scale > 0 {
             self.ndi_tile_scale = cfg.ndi_tile_scale;
             tracing::info!("game_coords ndi_tile_scale = {}", self.ndi_tile_scale);
+        }
+
+        // ── MinimapMatcher (CCORR fallback) ────────────────────────────────
+        // Carga reference PNGs en RAM para template matching cuando dHash falla.
+        // Se guía por los mismos floors que el map_index.
+        if !cfg.minimap_dir.is_empty() {
+            let dir = std::path::PathBuf::from(&cfg.minimap_dir);
+            let floors: Vec<i32> = cfg.matcher_floors
+                .as_ref()
+                .map(|s| s.split(',').filter_map(|f| f.trim().parse().ok()).collect())
+                .unwrap_or_default();
+            match self.minimap_matcher.load_dir(&dir, &floors) {
+                Ok((n, mb)) => {
+                    tracing::info!(
+                        "MinimapMatcher: {} sectores cargados ({} MB RAM, floors={:?})",
+                        n, mb,
+                        if floors.is_empty() { "all".to_string() } else { format!("{:?}", floors) }
+                    );
+                }
+                Err(e) => {
+                    warn!("MinimapMatcher no disponible ({}). CCORR fallback deshabilitado.", e);
+                }
+            }
+            if cfg.matcher_threshold > 0.0 {
+                self.minimap_matcher.match_threshold = cfg.matcher_threshold;
+                tracing::info!("MinimapMatcher threshold = {:.4}", cfg.matcher_threshold);
+            }
         }
     }
 
@@ -490,10 +521,45 @@ impl Vision {
         let ui_matches = self.ui_detector.last_matches().to_vec();
 
         // Tile-hashing: detectar coordenadas absolutas cada N frames.
-        if let Some(ref idx) = self.map_index {
-            if self.frame_count % self.coords_detect_interval as u64 == 0 {
-                if let Some(ref snap) = minimap {
-                    self.last_game_coords = game_coords::detect_position(snap, idx, self.ndi_tile_scale);
+        // Estrategia de 2 pasos:
+        //   1. dHash (rápido, O(1) con MapIndex): intentar primero.
+        //   2. CCORR fallback (más lento pero robusto) si dHash falla.
+        //
+        // Cuando hay un `last_game_coords` reciente, el CCORR matcher solo
+        // matchea contra el sector actual + 8 vecinos (~50-100ms). Sin last
+        // known, brute force (~1-2 seg) usado solo 1 vez en boot.
+        if self.frame_count % self.coords_detect_interval as u64 == 0 {
+            if let Some(ref snap) = minimap {
+                // Step 1: dHash
+                let mut detected = None;
+                if let Some(ref idx) = self.map_index {
+                    detected = game_coords::detect_position(snap, idx, self.ndi_tile_scale);
+                }
+                // Step 2: CCORR fallback
+                if detected.is_none() && !self.minimap_matcher.is_empty() {
+                    let t0 = std::time::Instant::now();
+                    detected = self.minimap_matcher.detect(
+                        snap,
+                        self.ndi_tile_scale,
+                        self.last_game_coords,
+                    );
+                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    // Log en info solo el primer brute force (slow path). Los
+                    // subsiguientes narrow searches son debug para evitar spam.
+                    if self.last_game_coords.is_none() {
+                        tracing::info!(
+                            "MinimapMatcher brute-force frame={} → {:?} ({:.1}ms)",
+                            self.frame_count, detected, elapsed_ms
+                        );
+                    } else {
+                        tracing::debug!(
+                            "MinimapMatcher narrow frame={} last={:?} → {:?} ({:.1}ms)",
+                            self.frame_count, self.last_game_coords, detected, elapsed_ms
+                        );
+                    }
+                }
+                if detected.is_some() {
+                    self.last_game_coords = detected;
                 }
             }
         }

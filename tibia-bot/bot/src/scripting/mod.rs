@@ -205,9 +205,52 @@ impl ScriptEngine {
         Ok(())
     }
 
+    /// Resetea completamente el runtime Lua. Crea un nuevo `Lua::new()`,
+    /// re-aplica el sandbox, re-instala la API `bot`, y re-registra el hook
+    /// de budget. **Preserva** `say_queue` y `hook_deadline` vía `Rc::clone`
+    /// para que el BotLoop que ya tiene referencias a ellos siga funcionando.
+    ///
+    /// Se usa desde `load_dir` para garantizar que los hooks antiguos
+    /// (`on_tick`, `on_low_hp`, upvalues capturados) desaparezcan por
+    /// completo en un reload. Sin este reset, scripts que tuvieron errores
+    /// parciales podrían dejar globals stale en el estado.
+    fn reset_lua_state(&mut self) -> Result<()> {
+        let new_lua = Lua::new();
+        Self::apply_sandbox(&new_lua)
+            .map_err(|e| anyhow!("reset: error aplicando sandbox: {}", e))?;
+        Self::install_bot_api(&new_lua, &self.say_queue)
+            .map_err(|e| anyhow!("reset: error instalando API bot: {}", e))?;
+
+        // Re-registrar el debug hook de budget con el mismo `hook_deadline`.
+        let deadline_cb = self.hook_deadline.clone();
+        new_lua.set_hook(
+            HookTriggers::new().every_nth_instruction(1000),
+            move |_lua, _dbg| {
+                if let Some(dl) = deadline_cb.get() {
+                    if Instant::now() >= dl {
+                        return Err(mlua::Error::RuntimeError(
+                            "script hook budget exceeded".into()
+                        ));
+                    }
+                }
+                Ok(VmState::Continue)
+            },
+        );
+
+        self.lua = new_lua;
+        Ok(())
+    }
+
     /// Carga todos los archivos .lua del directorio dado (no recursivo).
     /// Los archivos se ejecutan en orden alfabético para que el usuario
     /// pueda controlar dependencias con prefijos numéricos.
+    ///
+    /// **IMPORTANTE**: antes de cargar, el runtime Lua se resetea por
+    /// completo (sandbox + bot_api re-aplicados, globals nukeados). Esto
+    /// garantiza que un hot-reload sobrescriba funciones viejas incluso
+    /// cuando capturan upvalues locales del chunk (patrón común en los
+    /// scripts de healer con `local last_heal_tick = 0`). Sin este reset,
+    /// la hot-reload era no-op para cambios en locals/cooldowns.
     ///
     /// Si un script falla al cargar, el error se registra en `last_errors`
     /// y los otros scripts siguen cargándose. El engine nunca queda en
@@ -215,6 +258,8 @@ impl ScriptEngine {
     pub fn load_dir(&mut self, dir: &Path) -> Result<()> {
         self.loaded_files.clear();
         self.last_errors.clear();
+        self.reset_lua_state()
+            .with_context(|| "reset Lua state antes de load_dir")?;
 
         if !dir.exists() {
             anyhow::bail!("script_dir '{}' no existe", dir.display());
@@ -276,6 +321,49 @@ impl ScriptEngine {
             Err(e) => return ScriptResult::Error(format!("get on_tick: {}", e)),
         };
         self.invoke_with_budget("on_tick", move || func.call::<Value>(tbl))
+    }
+
+    /// Invoca `on_fsm_state_change(new_state, reason)` cuando el FSM cambia
+    /// de estado o el `safety_pause_reason` cambia. El hook es best-effort:
+    /// los scripts pueden loggear alertas (char muerto, disconnect, break
+    /// iniciado) sin impactar la decisión del FSM.
+    ///
+    /// **Argumentos pasados**:
+    /// - `new_state: string` — nombre del FsmState nuevo ("Paused", "Idle", ...)
+    /// - `reason: string | nil` — motivo de safety pause (ej "prompt:char_select",
+    ///   "char:dead", "break:micro"); `nil` si no hay pause reason asociada.
+    ///
+    /// El retorno del hook se IGNORA (no puede override la transición — eso
+    /// corrompería la FSM). Solo usar para side-effects (log, say, alerts).
+    ///
+    /// **Ejemplo de uso en Lua**:
+    /// ```lua
+    /// function on_fsm_state_change(new_state, reason)
+    ///     if reason == "prompt:char_select" then
+    ///         bot.log("error", "CHAR MUERTO — sesión detenida")
+    ///     end
+    /// end
+    /// ```
+    pub fn fire_on_fsm_state_change(
+        &mut self,
+        new_state: &str,
+        reason: Option<&str>,
+    ) -> ScriptResult {
+        if !self.has_hook("on_fsm_state_change") {
+            return ScriptResult::Noop;
+        }
+        let func: Function = match self.lua.globals().get("on_fsm_state_change") {
+            Ok(f)  => f,
+            Err(e) => return ScriptResult::Error(format!("get on_fsm_state_change: {}", e)),
+        };
+        let state_str = new_state.to_string();
+        let reason_opt = reason.map(|s| s.to_string());
+        self.invoke_with_budget("on_fsm_state_change", move || {
+            match reason_opt {
+                Some(r) => func.call::<Value>((state_str, r)),
+                None    => func.call::<Value>((state_str, Value::Nil)),
+            }
+        })
     }
 
     /// Invoca `on_low_hp(ctx)`. El hook recibe una tabla Lua con el mismo
@@ -755,5 +843,174 @@ mod tests {
             .count();
         assert_eq!(e.loaded_files().len(), lua_count,
             "esperaba {} scripts cargados, got {}", lua_count, e.loaded_files().len());
+    }
+
+    /// Bug fix (Phase A.4): /scripts/reload no aplicaba cambios en scripts
+    /// con upvalues locales. El reset_lua_state en load_dir lo arregla.
+    ///
+    /// Este test reproduce el escenario: carga un script v1 que retorna F1,
+    /// invoca el hook, verifica F1. Luego sobrescribe el archivo con v2 que
+    /// retorna F2, vuelve a llamar load_dir, invoca el hook, verifica F2.
+    ///
+    /// Sin reset_lua_state, el Lua runtime mantenía closures viejas en
+    /// upvalues capturados y la nueva versión no se aplicaba correctamente.
+    #[test]
+    fn reload_replaces_old_function() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("tibia_bot_reload_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("healer.lua");
+
+        // Versión 1: retorna F1 con cooldown corto (upvalue local).
+        let v1 = r#"
+            local COOLDOWN = 10
+            local last = 0
+            function on_low_hp(ctx)
+                if ctx.tick - last >= COOLDOWN then
+                    last = ctx.tick
+                    return "F1"
+                end
+                return nil
+            end
+        "#;
+        std::fs::File::create(&script_path).unwrap().write_all(v1.as_bytes()).unwrap();
+
+        let mut e = engine();
+        e.load_dir(&dir).expect("v1 load");
+        // F1 = 0x3A
+        let mut ctx = low_hp_ctx(0.10);
+        ctx.tick = 100;
+        assert_eq!(e.fire_on_low_hp(&ctx), ScriptResult::Hotkey(0x3A), "v1 debería emitir F1");
+
+        // Versión 2: retorna F2 con cooldown distinto.
+        // Si el reload NO resetea el runtime, la closure v1 seguiría activa
+        // y devolvería F1 en lugar de F2.
+        let v2 = r#"
+            local COOLDOWN = 5
+            local last = 0
+            function on_low_hp(ctx)
+                if ctx.tick - last >= COOLDOWN then
+                    last = ctx.tick
+                    return "F2"
+                end
+                return nil
+            end
+        "#;
+        std::fs::File::create(&script_path).unwrap().write_all(v2.as_bytes()).unwrap();
+        e.load_dir(&dir).expect("v2 reload");
+
+        // Tras reload, v2 debe estar activa: F2 = 0x3B, Y el cooldown se
+        // resetea (last=0), por lo que la primera llamada dispara sin esperar.
+        ctx.tick = 200;
+        assert_eq!(
+            e.fire_on_low_hp(&ctx),
+            ScriptResult::Hotkey(0x3B),
+            "v2 debería emitir F2 tras reload — si retorna F1, el reset no funcionó",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase C.1: verifica que `fire_on_fsm_state_change` pasa los args
+    /// correctos al hook Lua y que el hook puede usar `bot.log`/`bot.say`
+    /// para emitir alertas.
+    #[test]
+    fn fire_on_fsm_state_change_passes_args_to_hook() {
+        let mut e = engine();
+        // Hook que captura (new_state, reason) en globals para verificar.
+        load_inline(&e, r#"
+            captured_state = nil
+            captured_reason = nil
+            function on_fsm_state_change(new_state, reason)
+                captured_state = new_state
+                captured_reason = reason
+                if reason == "prompt:char_select" then
+                    bot.say("char_dead_alert")
+                end
+            end
+        "#, "fsm_hook");
+
+        // Transición a Paused con reason = prompt:char_select.
+        let r = e.fire_on_fsm_state_change("Paused", Some("prompt:char_select"));
+        assert_eq!(r, ScriptResult::Noop, "hook retorna nil → Noop");
+
+        // Verificar los valores capturados por el hook.
+        let state: String = e.lua.globals().get("captured_state").unwrap();
+        let reason: String = e.lua.globals().get("captured_reason").unwrap();
+        assert_eq!(state, "Paused");
+        assert_eq!(reason, "prompt:char_select");
+
+        // El hook debe haber llamado bot.say("char_dead_alert").
+        assert_eq!(e.drain_say_queue(), vec!["char_dead_alert"]);
+    }
+
+    /// Phase C.1: verifica que el hook recibe `nil` cuando no hay reason.
+    #[test]
+    fn fire_on_fsm_state_change_nil_reason_is_nil_in_lua() {
+        let mut e = engine();
+        load_inline(&e, r#"
+            captured_was_nil = nil
+            function on_fsm_state_change(new_state, reason)
+                captured_was_nil = (reason == nil)
+            end
+        "#, "fsm_nil_reason");
+
+        let r = e.fire_on_fsm_state_change("Walking", None);
+        assert_eq!(r, ScriptResult::Noop);
+
+        let was_nil: bool = e.lua.globals().get("captured_was_nil").unwrap();
+        assert!(was_nil, "el hook debe recibir nil cuando reason es None");
+    }
+
+    /// Phase C.1: sin hook definido, fire es no-op.
+    #[test]
+    fn fire_on_fsm_state_change_no_hook_is_noop() {
+        let mut e = engine();
+        assert_eq!(e.fire_on_fsm_state_change("Idle", None), ScriptResult::Noop);
+        assert_eq!(
+            e.fire_on_fsm_state_change("Paused", Some("prompt:char_select")),
+            ScriptResult::Noop
+        );
+    }
+
+    /// Verifica que el reset_lua_state preserva la API `bot` (no rompe
+    /// `bot.log` o `bot.say` después de un reload).
+    #[test]
+    fn reload_preserves_bot_api() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("tibia_bot_reload_api_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("uses_bot.lua");
+
+        let src = r#"
+            function on_tick(ctx)
+                bot.log("info", "hi from lua")
+                bot.say("hello")
+            end
+        "#;
+        std::fs::File::create(&script_path).unwrap().write_all(src.as_bytes()).unwrap();
+
+        let mut e = engine();
+        // Primer load
+        e.load_dir(&dir).expect("first load");
+        let ctx = TickContext {
+            tick: 0,
+            hp_ratio: Some(1.0),
+            mana_ratio: Some(1.0),
+            enemy_count: 0,
+            fsm_state: "Idle".into(),
+            ui_matches: vec![],
+        };
+        assert_eq!(e.fire_on_tick(&ctx), ScriptResult::Noop);
+        assert_eq!(e.drain_say_queue(), vec!["hello"]);
+
+        // Segundo load (reload) — la API bot debe seguir funcionando.
+        e.load_dir(&dir).expect("reload");
+        assert_eq!(e.fire_on_tick(&ctx), ScriptResult::Noop);
+        assert_eq!(e.drain_say_queue(), vec!["hello"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

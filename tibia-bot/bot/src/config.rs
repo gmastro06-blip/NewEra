@@ -218,14 +218,28 @@ pub struct GameCoordsConfig {
     /// Tibia 10+/12+ con minimap zoom default. Si el minimap está en otro
     /// zoom, ajustar (valores comunes: 3, 4, 5, 6).
     pub ndi_tile_scale: u32,
+    /// Directorio de reference PNGs (Minimap_Color_*.png) para el CCORR
+    /// fallback. Si está vacío, el fallback NO se usa y game_coords depende
+    /// solo de dHash (que puede fallar con Tibia 12 por anti-aliasing).
+    /// Valor típico: "assets/minimap/minimap"
+    pub minimap_dir: String,
+    /// Threshold SSD_NORMED para el CCORR matcher (lower=better match).
+    /// Default 0.05 = match muy fuerte. 0 = usar el default del matcher (0.05).
+    pub matcher_threshold: f32,
+    /// CSV de pisos a cargar en el matcher (ej "6,7,8"). Vacío/None = todos
+    /// los pisos del directorio (consume más RAM, ~70 MB vs ~15 MB por piso).
+    pub matcher_floors: Option<String>,
 }
 
 impl Default for GameCoordsConfig {
     fn default() -> Self {
         Self {
-            map_index_path: String::new(),
-            detect_interval: None,
-            ndi_tile_scale: 5,
+            map_index_path:    String::new(),
+            detect_interval:   None,
+            ndi_tile_scale:    5,
+            minimap_dir:       String::new(),
+            matcher_threshold: 0.0,
+            matcher_floors:    None,
         }
     }
 }

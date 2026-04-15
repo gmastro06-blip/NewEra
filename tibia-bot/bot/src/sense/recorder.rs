@@ -16,7 +16,7 @@
 //! - **Errores silenciosos**: si falla write (disco lleno), loggea warning
 //!   y desactiva el recorder para no matar el tick loop.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
@@ -33,20 +33,26 @@ pub struct PerceptionRecorder {
 }
 
 impl PerceptionRecorder {
-    /// Crea un recorder que escribe al path dado. El archivo se crea o
-    /// se trunca. Llama a `is_enabled()` para chequear.
+    /// Crea un recorder que escribe al path dado. El archivo se crea si no
+    /// existe, o se **appendea** si ya existe. Esto permite sobrevivir a
+    /// reinicios del bot durante una sesión larga sin perder el histórico.
+    /// Llama a `is_enabled()` para chequear.
     pub fn new(path: PathBuf, interval_ticks: u32) -> Self {
-        let writer = match File::create(&path) {
+        let writer = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             Ok(f) => {
                 tracing::info!(
-                    "PerceptionRecorder: grabando a '{}' (interval={} ticks)",
+                    "PerceptionRecorder: grabando a '{}' (interval={} ticks, append mode)",
                     path.display(), interval_ticks.max(1)
                 );
                 Some(BufWriter::new(f))
             }
             Err(e) => {
                 tracing::warn!(
-                    "PerceptionRecorder: no se pudo crear '{}': {}. Grabación deshabilitada.",
+                    "PerceptionRecorder: no se pudo abrir '{}': {}. Grabación deshabilitada.",
                     path.display(), e
                 );
                 None
@@ -191,5 +197,51 @@ mod tests {
         // record es no-op, no panic.
         rec.record(&PerceptionSnapshot::default());
         assert_eq!(rec.records_written(), 0);
+    }
+
+    /// Simula crash/restart del bot durante una sesión: abrir → escribir →
+    /// drop → re-abrir el MISMO path → escribir más → verificar que los
+    /// records originales sobrevivieron (append mode, no truncate).
+    #[test]
+    fn recorder_appends_on_second_open() {
+        let tmp = std::env::temp_dir().join(format!("tibia_recorder_append_{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Primera sesión: 2 records.
+        {
+            let mut rec = PerceptionRecorder::new(tmp.clone(), 1);
+            assert!(rec.is_enabled());
+            let mut snap = PerceptionSnapshot::default();
+            snap.tick = 10;
+            rec.record(&snap);
+            snap.tick = 11;
+            rec.record(&snap);
+            assert_eq!(rec.records_written(), 2);
+        }
+
+        // Segunda sesión (simulando restart): 2 records más en el MISMO path.
+        {
+            let mut rec = PerceptionRecorder::new(tmp.clone(), 1);
+            assert!(rec.is_enabled());
+            let mut snap = PerceptionSnapshot::default();
+            snap.tick = 20;
+            rec.record(&snap);
+            snap.tick = 21;
+            rec.record(&snap);
+            assert_eq!(rec.records_written(), 2); // counter es per-instance
+        }
+
+        // El archivo final debe tener los 4 records (2+2).
+        let mut content = String::new();
+        std::fs::File::open(&tmp).unwrap().read_to_string(&mut content).unwrap();
+        let lines: Vec<_> = content.lines().collect();
+        assert_eq!(lines.len(), 4, "esperados 4 records tras 2 sesiones, got {}", lines.len());
+
+        let s1: PerceptionSnapshot = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(s1.tick, 10, "primer record debe ser de la sesión 1");
+        let s4: PerceptionSnapshot = serde_json::from_str(lines[3]).unwrap();
+        assert_eq!(s4.tick, 21, "último record debe ser de la sesión 2");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

@@ -302,6 +302,15 @@ impl BotLoop {
         let mut prev_was_interrupting = false;
         let mut current_pause_reason: Option<String> = None;
 
+        // ── Phase C.1: FSM state change tracking ────────────────────────────
+        // Usados para disparar `on_fsm_state_change(new_state, reason)` a los
+        // scripts Lua cuando el FSM transiciona o la safety pause cambia.
+        // Inicializamos a "Idle" + None para que el primer tick con state
+        // distinto (o con reason) ya dispare el hook (evento sintético de
+        // "bot arrancó con estado X").
+        let mut prev_fsm_state_str: String = "Idle".to_string();
+        let mut prev_pause_reason_str: Option<String> = None;
+
         // ── Kill counter + activity tracking (para cavebot Stand/GotoIf) ────
         // `kills_total` se incrementa cada vez que `target_active` hace
         // flanco true → false mientras hay combat. Es la aproximación más
@@ -721,9 +730,17 @@ impl BotLoop {
             let is_safety_paused = current_pause_reason.is_some();
 
             // SpellTable: evaluar heal y attack override.
+            //
+            // Fallback en None: 0.5 (no 1.0). Razón: F1.2 vitals debouncing ya
+            // filtra single-frame bad reads (<5 frames → retorna last_hp_stable).
+            // Cuando hp_ratio llega None AQUÍ, es porque hubo ≥5 frames bad
+            // seguidos (150ms+) = problema sostenido de reader. En ese caso
+            // asumir full HP (1.0) es peligroso: cancela heals. 0.5 es neutral:
+            // pick_heal probablemente no dispare (mayoría de thresholds >0.5),
+            // pero no pollutes la decisión con "full HP confirmado".
             let spell_ctx = crate::core::spell_table::SpellContext {
-                hp:      hp_ratio.unwrap_or(1.0),
-                mana:    mana_ratio.unwrap_or(1.0),
+                hp:      hp_ratio.unwrap_or(0.5),
+                mana:    mana_ratio.unwrap_or(0.5),
                 enemies: perception.battle.enemy_count() as u32,
                 tick:    tick_num,
             };
@@ -779,6 +796,33 @@ impl BotLoop {
             };
             let fsm_state_snapshot = fsm.state.clone();
             prev_was_interrupting = fsm.is_interrupting_waypoints();
+
+            // ── Phase C.1: Fire on_fsm_state_change si hubo transición ────
+            // Comparamos contra prev_fsm_state_str y prev_pause_reason_str.
+            // Si cualquiera cambió, disparamos el hook con el NUEVO state +
+            // NUEVA reason. El hook es best-effort (log/alerta) — no puede
+            // override la transición.
+            //
+            // Este es el gancho para que scripts Lua detecten char:dead
+            // (reason = "prompt:char_select"), disconnect (reason = "prompt:login"),
+            // breaks iniciados/finalizados, etc.
+            {
+                let new_state_str = format!("{:?}", fsm_state_snapshot);
+                let new_reason_str = current_pause_reason.clone();
+                if new_state_str != prev_fsm_state_str || new_reason_str != prev_pause_reason_str {
+                    if let Some(eng) = scripts.as_mut() {
+                        let result = eng.fire_on_fsm_state_change(
+                            &new_state_str,
+                            new_reason_str.as_deref(),
+                        );
+                        if let ScriptResult::Error(msg) = result {
+                            warn!("on_fsm_state_change script error: {}", msg);
+                        }
+                    }
+                    prev_fsm_state_str = new_state_str;
+                    prev_pause_reason_str = new_reason_str;
+                }
+            }
 
             // ── RATE LIMIT ────────────────────────────────────────────────────
             // Hard cap global de acciones/segundo. Si se excede, se descarta
@@ -1194,9 +1238,11 @@ impl BotLoop {
                 self.cavebot_enabled = false;
             }
             LoopCommand::ReloadScripts { .. } => {
-                // Se procesa inline en run() porque necesita acceso al
-                // ScriptEngine local. Este arm es unreachable en la práctica.
-                debug_assert!(false, "ReloadScripts debe procesarse en run()");
+                // Se procesa inline en run() (líneas ~376-409) porque necesita
+                // acceso al ScriptEngine local. Este arm es unreachable en la
+                // práctica, pero mantenemos el match exhaustivo sin panic en
+                // debug — si llegara aquí por un refactor, solo warning.
+                warn!("ReloadScripts llegó a handle_command — debería procesarse inline en run()");
             }
             LoopCommand::StartRecording { path } => {
                 let final_path = PathBuf::from(path.unwrap_or_else(|| "session.jsonl".to_string()));

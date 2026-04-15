@@ -1,0 +1,163 @@
+# abdendriel_wasps_walks_only.toml
+#
+# **FALLBACK variant** del cavebot para cuando `game_coords` no funciona
+# (ver Phase B del single-session plan). Usa `walk` steps TEMPORALES en
+# lugar de `node` steps ABSOLUTOS. Sin navegación por tile-hashing.
+#
+# **Limitaciones vs abdendriel_wasps.toml completo**:
+# - No hay refill loop (sin deposit ni buy_item)
+# - No hay navegación absoluta: si el char se desvía, el loop queda off
+# - No hay validación de "llegué al tile correcto" → drift acumulativo
+# - NO apto para sesiones > 30 min sin supervisión (drift garantizado)
+#
+# **Requisitos para usar**:
+# 1. El usuario debe posicionar manualmente el char en el entry del hunt
+#    antes de cargar este cavebot.
+# 2. Supplies full antes de start (5+ mana potions, 3+ health potions).
+# 3. Supervisión humana cada 5-10 min para verificar que el char no se
+#    perdió.
+#
+# **Flujo**:
+#   hunt_loop:
+#     → walk 3s en dirección A → stand 5s (atacar cualquier wasp) → loot 1x
+#     → walk 2s en dirección B → stand 5s → loot 1x
+#     → walk 2s en dirección C → stand 5s → loot 1x
+#     → walk 2s en dirección D (vuelta al inicio aprox) → stand
+#     → goto hunt_loop (si supplies OK)
+#     → goto safety_stop (si supplies bajos)
+#
+# Cargar:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/abdendriel_wasps_walks_only.toml&enabled=true'
+
+[cavebot]
+loop = true
+
+# ═══════════════════════════════════════════════════════════════════════
+# HUNT LOOP (sin navegación absoluta)
+# ═══════════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "hunt_loop"
+
+# Check supplies antes de cada iteración. Si no hay al menos 2 mana potions
+# o 2 health potions, salir del hunt (el usuario debe refillar manualmente).
+[[step]]
+kind = "goto_if"
+label = "safety_stop"
+when = "not:has_item(mana_potion, 2)"
+
+[[step]]
+kind = "goto_if"
+label = "safety_stop"
+when = "not:has_item(health_potion, 2)"
+
+# ── Spawn 1: NE del entry ──
+# Caminar 3s hacia NE (diagonal up-right vía W + D alternados cada 250ms)
+# Nota: Tibia responde mejor a W+D simultáneos para diagonales, pero el
+# cavebot solo emite una key a la vez. Walk con key=Q diagonal NW si está
+# configurada, o usar 2 walks consecutivos.
+[[step]]
+kind = "walk"
+key = "W"
+duration_ms = 1500
+interval_ms = 250
+
+[[step]]
+kind = "walk"
+key = "D"
+duration_ms = 1500
+interval_ms = 250
+
+# Stand en spawn 1: quedarse hasta no más combate o timeout 8s.
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 8000
+
+# Loot del spawn: click en el tile bajo los pies del char (viewport center).
+# CALIBRAR: el viewport center en tu NDI típicamente está en (960, 540)
+# si la captura es 1920×1080.
+[[step]]
+kind = "loot"
+vx = 960
+vy = 540
+retry_count = 2
+
+# ── Spawn 2: E ──
+[[step]]
+kind = "walk"
+key = "D"
+duration_ms = 2000
+interval_ms = 250
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 8000
+
+[[step]]
+kind = "loot"
+vx = 960
+vy = 540
+retry_count = 2
+
+# ── Spawn 3: S ──
+[[step]]
+kind = "walk"
+key = "S"
+duration_ms = 2000
+interval_ms = 250
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 8000
+
+[[step]]
+kind = "loot"
+vx = 960
+vy = 540
+retry_count = 2
+
+# ── Vuelta al entry (W) ──
+[[step]]
+kind = "walk"
+key = "A"
+duration_ms = 2000
+interval_ms = 250
+
+[[step]]
+kind = "walk"
+key = "W"
+duration_ms = 1500
+interval_ms = 250
+
+# Pausa corta antes de recomenzar
+[[step]]
+kind = "wait"
+duration_ms = 500
+
+# Volver al inicio del loop
+[[step]]
+kind = "goto"
+label = "hunt_loop"
+
+# ═══════════════════════════════════════════════════════════════════════
+# SAFETY STOP (supplies bajos o error)
+# ═══════════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "safety_stop"
+
+# Wait 30 min en este punto (el cavebot queda efectivamente pausado).
+# El usuario debe intervenir: refillar supplies, recolocar char, y
+# reload del cavebot.
+[[step]]
+kind = "wait"
+duration_ms = 1800000
+
+[[step]]
+kind = "goto"
+label = "safety_stop"

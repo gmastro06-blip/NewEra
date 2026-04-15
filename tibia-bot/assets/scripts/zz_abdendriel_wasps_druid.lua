@@ -26,6 +26,9 @@
 --   "exura" — light heal, level 8+, druid/sorcerer/paladin, 40 HP / 20 mana
 
 -- ── Parámetros para level 11 (conservadores) ────────────────────────
+-- Validación live 2026-04-15 Phase E.1: stack end-to-end validado con
+-- thresholds temporariamente a 0.95. User confirma visualmente exura + mana
+-- pot drinking en el cliente. Revertido a valores normales de level 11.
 local HEAL_THRESHOLD          = 0.70  -- exura a 70% HP (margen amplio)
 local EMERGENCY_HP_POT        = 0.25  -- F2 health pot si HP < 25% (~45 HP)
 local MANA_POT_THRESHOLD      = 0.40  -- F1 mana pot si mana < 40% (~55 mana)
@@ -42,6 +45,27 @@ local last_emergency_tick = 0   -- último tick que F2 (emergency) se emitió
 -- toma ~1 segundo, no tiene sentido drink más rápido. Esto evita spam de
 -- F2 cuando HP queda atrapado en zona crítica varios ticks seguidos.
 local EMERGENCY_COOLDOWN_TICKS = 30
+
+-- ── on_fsm_state_change: alertas de eventos críticos ────────────────
+-- El bot llama este hook cuando la FSM transiciona O cuando la safety
+-- pause reason cambia. `reason` llega como string con el motivo (ej.
+-- "prompt:char_select" = char muerto, "prompt:login" = disconnect,
+-- "break:micro" = break iniciado, "focus:tibia_not_foreground" = alt-tab).
+--
+-- Este hook es informativo: NO puede override la FSM. Solo log/alerta.
+function on_fsm_state_change(new_state, reason)
+    if reason == "prompt:char_select" then
+        -- Char select aparece tras muerte O tras disconnect. En ambos
+        -- casos el hunt se detiene hasta intervención humana.
+        bot.log("error", "CHAR MUERTO O DESCONECTADO → sesión detenida")
+    elseif reason == "prompt:login" then
+        bot.log("error", "LOGIN SCREEN detectado → disconnect, sesión detenida")
+    elseif reason == "prompt:npc_trade" then
+        bot.log("info", "NPC trade window abierto → pausando cavebot")
+    elseif reason and string.find(reason, "^break:") then
+        bot.log("info", "Safety break iniciado: " .. reason)
+    end
+end
 
 -- ── on_low_hp: FSM dispara esto cuando HP < 30% (emergencia) ────────
 function on_low_hp(ctx)

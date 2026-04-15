@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use image::GrayImage;
+use imageproc::template_matching::{match_template_parallel, MatchTemplateMethod};
 use serde::{Deserialize, Serialize};
 
 use crate::sense::perception::MinimapSnapshot;
@@ -371,6 +373,270 @@ pub fn detect_position(
     let center_x = pos.x + (snap.width as i32 / 2) / scale as i32;
     let center_y = pos.y + (snap.height as i32 / 2) / scale as i32;
     Some((center_x, center_y, pos.z))
+}
+
+// ── MinimapMatcher (CCORR fallback) ───────────────────────────────────────────
+//
+// dHash-based detection falla con el cliente Tibia 12 porque el anti-aliasing
+// del renderer altera suficientes pixels para que 2 patches "iguales" en área
+// del mundo produzcan hashes diferentes (observado min hamming 14-20 bits vs
+// threshold 3). SSD normalized template matching es MUCHO más robusto porque:
+// - Opera en luma (ignora color shifts del NDI/OBS)
+// - Promedia sobre un área grande (107×110 pixels → ~21×22 tiles) que absorbe
+//   ruido local
+// - Retorna un score continuo en [0, 1] con decisión clara por threshold
+//
+// **Costo**: 1 match_template sobre un reference 256×256 es ~5-10ms. Con
+// brute-force sobre todos los PNGs de un piso (~220), 1-2 seg por detección.
+// Inaceptable para 30Hz. MITIGACIÓN: usar `last_known` para limitar el search
+// a ~9 PNGs adyacentes (el sector actual + 8 vecinos), bajando a ~50-100ms por
+// detección.
+//
+// **Uso**: se carga desde `assets/minimap/minimap/` vía `load_dir(floors)` al
+// boot. Luego `detect` se llama como fallback del dHash en Vision::tick.
+
+/// Entry de reference en el atlas: el GrayImage del PNG + sus coords world.
+#[allow(dead_code)]
+pub struct ReferenceSector {
+    pub file_x:  i32,
+    pub file_y:  i32,
+    pub z:       i32,
+    pub image:   GrayImage,
+}
+
+/// Atlas de reference PNGs indexado por piso. Para cada piso, mantiene la
+/// lista de sectores (cada sector = 1 PNG del minimap de Tibia).
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct MinimapMatcher {
+    /// Sector list por piso. Usar HashMap para lookup O(1) por piso.
+    sectors_by_floor: HashMap<i32, Vec<ReferenceSector>>,
+    /// Threshold SSD (CCORR_NORMED lower=better). Default 0.05 = match muy fuerte.
+    /// Si no hay matches bajo este threshold, retornamos None.
+    pub match_threshold: f32,
+}
+
+impl MinimapMatcher {
+    pub fn new() -> Self {
+        Self {
+            sectors_by_floor: HashMap::new(),
+            match_threshold: 0.05,
+        }
+    }
+
+    /// Carga todos los reference PNGs del dir para los floors dados.
+    /// Si `floors` está vacío, carga todos los floors (consume más RAM).
+    ///
+    /// Retorna (total_sectors, total_bytes_estimate_mb).
+    #[allow(dead_code)]
+    pub fn load_dir(&mut self, dir: &Path, floors: &[i32]) -> anyhow::Result<(usize, usize)> {
+        self.sectors_by_floor.clear();
+        if !dir.exists() {
+            anyhow::bail!("MinimapMatcher dir no existe: {}", dir.display());
+        }
+
+        let mut total_sectors = 0;
+        let mut total_bytes: usize = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Some((fx, fy, fz)) = parse_minimap_filename(&name_str) else { continue };
+
+            if !floors.is_empty() && !floors.contains(&fz) {
+                continue;
+            }
+
+            let img = match image::open(entry.path()) {
+                Ok(i) => i.to_luma8(),
+                Err(e) => {
+                    tracing::warn!("MinimapMatcher: skip '{}': {}", entry.path().display(), e);
+                    continue;
+                }
+            };
+
+            total_bytes += (img.width() * img.height()) as usize;
+            self.sectors_by_floor
+                .entry(fz)
+                .or_default()
+                .push(ReferenceSector {
+                    file_x: fx,
+                    file_y: fy,
+                    z:      fz,
+                    image:  img,
+                });
+            total_sectors += 1;
+        }
+        tracing::info!(
+            "MinimapMatcher: {} sectores cargados desde '{}' ({:.1} MB RAM)",
+            total_sectors, dir.display(), total_bytes as f64 / 1_048_576.0
+        );
+        Ok((total_sectors, total_bytes / 1_048_576))
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.sectors_by_floor.is_empty()
+    }
+
+    /// Extrae el template luma del minimap NDI downsamplealo por `scale`.
+    /// Retorna (template, downsampled_width, downsampled_height).
+    ///
+    /// **IMPORTANTE**: `MinimapSnapshot.data` está en orden **RGBA** (byte[0]=R,
+    /// byte[2]=B), confirmado por:
+    /// - `/test/grab` pasa `frame.data` directo a `ImageBuffer<Rgba<u8>>` y el
+    ///   PNG resultante tiene colores correctos
+    /// - `CLAUDE.md` memory: "NDI frame format is RGBA"
+    ///
+    /// Luma formula (BT.601): Y = 0.299R + 0.587G + 0.114B
+    #[allow(dead_code)]
+    fn build_template(snap: &MinimapSnapshot, scale: u32) -> Option<GrayImage> {
+        let scale = scale.max(1);
+        let dw = snap.width / scale;
+        let dh = snap.height / scale;
+        if dw == 0 || dh == 0 {
+            return None;
+        }
+        let mut out = GrayImage::new(dw, dh);
+        let stride = snap.width as usize * 4;
+        let n = (scale * scale) as u32;
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let mut sum_r = 0u32;
+                let mut sum_g = 0u32;
+                let mut sum_b = 0u32;
+                for by in 0..scale {
+                    for bx in 0..scale {
+                        let sx = dx * scale + bx;
+                        let sy = dy * scale + by;
+                        let off = sy as usize * stride + sx as usize * 4;
+                        sum_r += snap.data[off] as u32;       // R byte 0
+                        sum_g += snap.data[off + 1] as u32;   // G byte 1
+                        sum_b += snap.data[off + 2] as u32;   // B byte 2
+                    }
+                }
+                let r = (sum_r / n) as f32;
+                let g = (sum_g / n) as f32;
+                let b = (sum_b / n) as f32;
+                let luma = (0.299 * r + 0.587 * g + 0.114 * b) as u8;
+                out.put_pixel(dx, dy, image::Luma([luma]));
+            }
+        }
+        Some(out)
+    }
+
+    /// Matchea el template contra un sector individual. Retorna (best_score_ssd,
+    /// local_x, local_y) del mejor match encontrado dentro del sector.
+    #[allow(dead_code)]
+    fn match_sector(sector: &ReferenceSector, template: &GrayImage) -> Option<(f32, u32, u32)> {
+        let (iw, ih) = sector.image.dimensions();
+        let (tw, th) = template.dimensions();
+        if iw < tw || ih < th {
+            return None;
+        }
+        let result = match_template_parallel(
+            &sector.image,
+            template,
+            MatchTemplateMethod::SumOfSquaredErrorsNormalized,
+        );
+        let mut best = f32::MAX;
+        let mut best_x = 0u32;
+        let mut best_y = 0u32;
+        for y in 0..result.height() {
+            for x in 0..result.width() {
+                let s = result.get_pixel(x, y).0[0];
+                if s < best {
+                    best = s;
+                    best_x = x;
+                    best_y = y;
+                }
+            }
+        }
+        Some((best, best_x, best_y))
+    }
+
+    /// Detecta la posición del char vía template matching. Estrategia:
+    /// - Si `last_known` está presente, solo matchea contra el sector actual
+    ///   y sus 8 vecinos (9 sectores = ~50-100ms). Fast path.
+    /// - Si no, brute force sobre TODOS los sectores del piso `preferred_floor`
+    ///   (o todos los floors si es None). Slow path usado solo en boot.
+    ///
+    /// Retorna `None` si:
+    /// - El matcher está vacío
+    /// - El minimap NDI es demasiado pequeño
+    /// - Ningún match pasó el threshold
+    #[allow(dead_code)]
+    pub fn detect(
+        &self,
+        snap: &MinimapSnapshot,
+        ndi_tile_scale: u32,
+        last_known: Option<(i32, i32, i32)>,
+    ) -> Option<(i32, i32, i32)> {
+        if self.sectors_by_floor.is_empty() {
+            return None;
+        }
+        let template = Self::build_template(snap, ndi_tile_scale)?;
+        let (tw, th) = template.dimensions();
+        if tw == 0 || th == 0 {
+            return None;
+        }
+
+        // Determine which sectors to search.
+        let candidate_floors: Vec<i32> = if let Some((_, _, z)) = last_known {
+            vec![z]
+        } else {
+            self.sectors_by_floor.keys().copied().collect()
+        };
+
+        // Collect candidate sectors as refs.
+        let mut candidates: Vec<&ReferenceSector> = Vec::new();
+        for floor in candidate_floors {
+            if let Some(list) = self.sectors_by_floor.get(&floor) {
+                if let Some((lx, ly, _)) = last_known {
+                    // Narrow to current sector + 8 neighbors (3×3 grid of 256-tile sectors).
+                    let cur_fx = (lx / 256) * 256;
+                    let cur_fy = (ly / 256) * 256;
+                    for sector in list {
+                        let dx = (sector.file_x - cur_fx).abs();
+                        let dy = (sector.file_y - cur_fy).abs();
+                        if dx <= 256 && dy <= 256 {
+                            candidates.push(sector);
+                        }
+                    }
+                } else {
+                    // Full brute force over this floor.
+                    candidates.extend(list.iter());
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Match against each candidate, find the global best.
+        let mut global_best: f32 = f32::MAX;
+        let mut global_best_world: Option<(i32, i32, i32)> = None;
+        for sector in candidates {
+            let Some((score, lx, ly)) = Self::match_sector(sector, &template) else { continue };
+            if score < global_best {
+                global_best = score;
+                let world_x = sector.file_x + lx as i32 + (tw / 2) as i32;
+                let world_y = sector.file_y + ly as i32 + (th / 2) as i32;
+                global_best_world = Some((world_x, world_y, sector.z));
+            }
+        }
+
+        if global_best <= self.match_threshold {
+            global_best_world
+        } else {
+            tracing::debug!(
+                "MinimapMatcher: best SSD {:.4} > threshold {:.4}, no match",
+                global_best, self.match_threshold
+            );
+            None
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
