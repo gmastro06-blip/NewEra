@@ -1,0 +1,106 @@
+# calibration.toml — ROIs calibrados con layout custom 2026-04-09.
+# Mediciones tomadas con GIMP Rectangle Select sobre frame 1920x1080.
+# Convención: { x = LEFT, y = TOP, w = WIDTH, h = HEIGHT } en píxeles del frame NDI.
+
+# ── Barras de vida ────────────────────────────────────────────────────────────
+# HP: barra verde "215/215", arriba izquierda.
+hp_bar   = { x = 188, y = 5, w = 637, h = 25 }
+
+# Mana: barra naranja "100/100", arriba centro-derecha.
+mana_bar = { x = 921, y = 5, w = 635, h = 25 }
+
+# ── Panel de batalla ─────────────────────────────────────────────────────────
+# Panel izquierdo completo. Medido con GIMP 2026-04-10 por el usuario.
+# y=36 empieza justo debajo del header "Battle List".
+# w=171 cubre el slot entero (icono + nombre + HP bar).
+# h=1006 abarca todo el sidebar vertical — permite ver cualquier número
+# de mobs en la battle list. El lector hace n_rows = h/22 = 45 rows.
+# Rows vacías simplemente no superan MIN_HP_BAR_PX, coste perf negligible.
+battle_list = { x = 2, y = 36, w = 171, h = 1006 }
+
+# ── Minimapa ──────────────────────────────────────────────────────────────────
+minimap = { x = 1753, y = 4, w = 107, h = 110 }
+
+# ── Viewport de juego ─────────────────────────────────────────────────────────
+game_viewport = { x = 388, y = 94, w = 967, h = 708 }
+
+# ── Target HP bar (encima del viewport) ──────────────────────────────────────
+# Área donde Tibia muestra la barra de vida + nombre del target actual.
+# Vacío = char sin target. Con píxeles cromáticos = char atacando algo.
+#
+# PLACEHOLDER — calibrar en Fase F con GIMP. Valores de ejemplo para 1920x1080.
+# Descomentar y ajustar antes de validación real.
+#target_hp_bar = { x = 660, y = 94, w = 220, h = 20 }
+
+# ── Detección de prompts bloqueantes ─────────────────────────────────────────
+# npc_trade: panel "Commerce" de shopkeeper (left sidebar del juego).
+prompt_npc_trade   = { x = 50,  y = 25,  w = 420, h = 650 }
+
+# ── UI genérica (depot chest, menús contextuales) ────────────────────────────
+# ROIs de búsqueda para los templates de assets/templates/ui/.
+# Calibrar con GIMP sobre un frame real con la ventana abierta.
+# Sin ROI el detector busca en el frame completo (más lento).
+[ui_rois]
+# depot_chest: panel lateral derecho donde aparece la ventana del depot.
+# Ajustar tras abrir el depot chest en Tibia y medir con GIMP.
+depot_chest = { x = 1550, y = 0, w = 370, h = 500 }
+# stow_menu: menú de contexto aparece donde hagas click derecho.
+# Cubre toda la mitad derecha de la pantalla (inventario + containers).
+stow_menu   = { x = 900,  y = 0, w = 1020, h = 800 }
+
+# ── Inventory backpack strip (layout vertical con N backpacks stacked) ──────
+# Calibrado 2026-04-15 con GIMP sobre el layout real del usuario.
+#
+# Strip completo: (1567, 22) → (1745, 1027), 178×1005
+#   178 = ancho total (4 slots × 32 + 3 gaps + margins = 134+6+38 ≈ 178)
+#   1005 = alto total (suficiente para ~15 backpacks stacked)
+#
+# Backpack individual: 174×67
+#   174 = ancho (header icons + 4 slots)
+#   67  = alto (title bar 16 + slot row 32 + capacity bar 19)
+#
+# Layout por backpack:
+#   - title bar    0..15 px
+#   - slot row   16..47 px (margen top_offset=18 por capacity header pequeño)
+#   - capacity   48..66 px
+#
+# Layout del slot:
+#   - x_offset=6 (margen desde left edge del backpack al 1er slot)
+#   - slot_size=32 (estándar Tibia item icons)
+#   - gap=2 (separación entre slots)
+#   - 4 cols × 1 row = 4 slots por backpack
+#
+# Con 8 backpacks stacked × 4 slots = 32 slots total.
+# Ajustar backpack_count al número de backpacks que mantengas abiertos.
+#
+# Verificación: tras arrancar el bot, `GET /vision/grab/inventory` dibuja
+# rectángulos amarillos sobre cada slot detectado. Debes ver 32 cuadrados
+# amarillos alineados con los iconos de items dentro de cada backpack.
+# Si están desalineados, ajustar slot_x_offset / slot_y_offset.
+[inventory_backpack_strip]
+# Calibrado empíricamente 2026-04-15 contra frame NDI real:
+# - Strip en (1567, 22), ancho 174
+# - 2 backpacks abiertos (Backpack + Bag), stride vertical 68 px
+# - Slot row en el TOP de cada backpack (title bar va debajo, no arriba)
+# - Items detectados: ring/shovel/potion en Backpack 1, 3 mana potions en Bag
+x              = 1567
+y              = 22
+backpack_w     = 174
+backpack_h     = 68
+backpack_count = 2     # Backpack + Bag (ajustar si abres más)
+slot_x_offset  = 18    # margen interno del backpack al 1er slot
+slot_y_offset  = 0     # slots al top del backpack (sin offset)
+slot_size      = 32
+slot_gap       = 2
+slot_cols      = 4
+slot_rows      = 1
+
+# ── Anclas de referencia ──────────────────────────────────────────────────────
+# Anchor regenerado 2026-04-10: header del panel "Battle List" (esquina superior
+# izquierda). Zona estable: pixel-art del texto "Battle List" + iconos de botones
+# (X, lupa, menú). NO cambia entre frames a diferencia del anchor anterior que
+# apuntaba al minimap (contenido dinámico).
+[[anchors]]
+name          = "sidebar_top"
+template_path = "sidebar_top.png"
+expected_roi  = { x = 0, y = 0, w = 180, h = 100 }

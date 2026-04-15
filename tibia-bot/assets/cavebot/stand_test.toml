@@ -1,0 +1,24 @@
+# stand_test.toml — Valida kill counting y stand_until sin routing.
+#
+# Úsalo parado en cualquier spot con mobs agresivos.
+# El bot planta, mata, cuenta kills, y repite — sin moverse.
+#
+# Cargar:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/stand_test.toml&enabled=true'
+
+[cavebot]
+loop = true
+
+[[step]]
+kind = "label"
+name = "loop"
+
+# Planta y mata hasta 3 kills o 90s de timeout.
+[[step]]
+kind = "stand"
+until = "mobs_killed(3)"
+max_wait_ms = 90000
+
+[[step]]
+kind = "goto"
+label = "loop"

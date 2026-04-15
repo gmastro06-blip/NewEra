@@ -1,0 +1,68 @@
+# ── Rust build artifacts ────────────────────────────────────────────
+target/
+**/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# ── tibia-bot runtime artifacts ─────────────────────────────────────
+# Sessions (recordings JSONL) — pueden ser grandes y son per-run
+sessions/
+*.jsonl
+
+# Map index + walkability binarios — pesados, regenerables
+tibia-bot/assets/map_index.bin
+tibia-bot/assets/map_index_all.bin
+tibia-bot/assets/walkability.bin
+tibia-bot/assets/test_*.bin
+
+# Minimap raw PNGs descargados de TibiaMaps.io (~6 MB compressed,
+# ~50 MB uncompressed). User debe descargar manualmente
+tibia-bot/assets/minimap/
+tibia-bot/assets/minimap-without-markers.zip
+
+# Per-user runtime configs (los .example sí se commitean)
+tibia-bot/bot/config.toml
+tibia-bot/bridge/bridge_config.toml
+tibia-bot/assets/calibration.toml.bak*
+
+# Pathfinding overrides — per-user
+tibia-bot/assets/pathfinding_overrides.toml
+
+# ── Frame captures / debug screenshots ──────────────────────────────
+debug_frame.png
+tibia_*.png
+frame.png
+raw.png
+*_frame.png
+test_frames/
+
+# Debug captures que el bot escribe al CWD del proceso
+tibia-bot/grab_*.png
+tibia-bot/minimap_area.png
+tibia-bot/*.png
+# Excepción: si hay PNGs intencionales en el repo de tibia-bot top-level, agregarlos explícitamente
+
+# Test smoke frames — son grandes y se generan por synth_frames bin
+tibia-bot/test_smoke/frames/*.png
+tibia-bot/test_smoke/frames/*.jsonl
+
+# ── IDE / editor ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Claude Code local settings (personal) ───────────────────────────
+.claude/
+**/.claude/
+
+# ── Logs ────────────────────────────────────────────────────────────
+*.log
+smoke_report.txt
+
+# ── Stray files ─────────────────────────────────────────────────────
+null

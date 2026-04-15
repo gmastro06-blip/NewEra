@@ -1,0 +1,57 @@
+# pathfinding_overrides.toml — Correcciones manuales al auto-detect de
+# transiciones entre pisos del A* multi-floor.
+#
+# Copia este archivo a `assets/pathfinding_overrides.toml` y edítalo con tus
+# correcciones reales. Se carga vía:
+#
+#   cargo run --release --bin path_finder -- \
+#       --walkability assets/walkability.bin \
+#       --overrides assets/pathfinding_overrides.toml \
+#       --from X,Y,Z --to X,Y,Z
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# `add` — Tiles que se añaden como transiciones manuales.
+#
+# Usar para:
+#   - Rope spots: el auto-detect rara vez los ve porque el piso superior
+#     no es walkable directamente
+#   - Holes (tile que requiere `use shovel`)
+#   - Ladders
+#   - Teleports / portales mágicos
+#
+# Cada transición debe definirse con AMBOS endpoints. A* solo conecta dos
+# pisos si los DOS tiles están marcados.
+# ─────────────────────────────────────────────────────────────────────────────
+
+add = [
+    # ─── Ejemplo: rope spot en Venore market ─────────────────────────────────
+    # [32957, 32076, 7],
+    # [32957, 32076, 6],
+
+    # ─── Ejemplo: hole en Drefia (cementerio) ────────────────────────────────
+    # [33212, 31664, 9],
+    # [33212, 31664, 10],
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# `remove` — Tiles que se desmarcan (corrige falsos positivos).
+#
+# El auto-detect marca como transición cualquier tile walkable que tenga un
+# tile walkable en el piso adyacente con mismo (x,y). Esto genera falsos
+# positivos en:
+#   - Bridges (puente arriba + agua/calle por debajo, ambos walkable pero
+#     no físicamente conectados)
+#   - Rooftops (techo arriba + habitación abajo)
+#   - Cualquier estructura vertical donde dos pisos son walkable pero
+#     desconectados
+# ─────────────────────────────────────────────────────────────────────────────
+
+remove = [
+    # ─── Ejemplo: puente sobre el río en Thais (calle abajo + puente arriba) ─
+    # [32369, 32241, 7],
+    # [32369, 32241, 8],
+
+    # ─── Ejemplo: techo de la casa de Bozo (jester) — Thais ──────────────────
+    # [32365, 32228, 6],
+    # [32365, 32228, 7],
+]

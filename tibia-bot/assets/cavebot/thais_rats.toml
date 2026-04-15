@@ -1,0 +1,87 @@
+# thais_rats.toml — Cavebot LINEAL para Thais Rat Cave.
+#
+# **Patrón**: lineal ida-vuelta entre 2 puntos.
+#   walk N → stand hasta 5 kills → walk S → stand hasta 5 kills → loop
+#
+# Este TOML asume WASD como teclas de movimiento y que `W` te lleva
+# hacia un spawn. Si en tu spot el spawn está en otra dirección,
+# cambia los `key` (ver tabla abajo).
+#
+# ## Ajuste rápido según dirección
+#
+# Si caminar en N no encuentra mobs, prueba cambiando las keys:
+#
+#   | Tu spawn está al | Walk A key | Walk B key |
+#   |------------------|-----------|-----------|
+#   | NORTE y SUR      | "W"       | "S"       |
+#   | ESTE y OESTE     | "D"       | "A"       |
+#   | NE y SW          | ver notas | ver notas |
+#
+# Para diagonales (NE/NW/SE/SW) no hay una sola key — tendrías que
+# usar dos steps consecutivos con W+D (NE), etc. Para MVP linear
+# usa solo N/S o E/W.
+#
+# ## Cómo recargar sin reiniciar el bot
+#
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/thais_rats.toml&enabled=true'
+#
+# ## Debugging
+#
+#   curl http://localhost:8080/status        # fsm_state, overruns
+#   curl http://localhost:8080/dispatch/stats # attacks/heals/loot totals
+#   curl http://localhost:8080/combat/events  # last 200 actions
+
+[cavebot]
+loop = true
+
+# ══════════════════════════════════════════════════════════════════════
+# CICLO PRINCIPAL: walk N → stand → walk S → stand → loop
+# ══════════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "punto_a"
+
+# ── Caminar al NORTE ──────────────────────────────────────────────────
+# duration_ms = 5000 → 5 segundos de walking.
+# interval_ms = 400  → una tecla cada 400ms (≈ 1 SQM cada 400-500ms
+# en speed base). En 5 segundos cubre ~10-12 SQMs.
+# Si el char se choca con un obstáculo menor al principio, el walk
+# largo le da tiempo a superarlo y seguir avanzando.
+[[step]]
+kind = "walk"
+key = "W"
+duration_ms = 5000
+interval_ms = 400
+
+# ── Plantar y matar 5 rats ─────────────────────────────────────────────
+# max_wait_ms = 90000 → timeout de 90 segundos. Si no aparecen 5 mobs
+# en ese tiempo, el step avanza igual para no quedarse atascado.
+# El auto-heal + auto-attack + auto-loot manejan el combate en paralelo.
+[[step]]
+kind = "stand"
+until = "mobs_killed(5)"
+max_wait_ms = 90000
+
+# ── Caminar al SUR (hacia punto_b) ────────────────────────────────────
+# Misma distancia que el walk N — debería volver al mismo sitio.
+[[step]]
+kind = "walk"
+key = "S"
+duration_ms = 5000
+interval_ms = 400
+
+[[step]]
+kind = "label"
+name = "punto_b"
+
+# ── Plantar y matar 5 rats en punto B ─────────────────────────────────
+[[step]]
+kind = "stand"
+until = "mobs_killed(5)"
+max_wait_ms = 90000
+
+# ── Loop: vuelve a punto_a ─────────────────────────────────────────────
+[[step]]
+kind = "goto"
+label = "punto_a"

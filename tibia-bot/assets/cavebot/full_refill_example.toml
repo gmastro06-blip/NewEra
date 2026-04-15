@@ -1,0 +1,134 @@
+# full_refill_example.toml
+#
+# Ciclo completo hunt → check supplies → deposit → buy → return.
+#
+# **Coordenadas de click**: los valores de `chest_vx/vy`, `stow_vx/vy`, `item_vx/vy`,
+# `confirm_vx/vy` son PLACEHOLDERS calibrados para Tibia 12 @ 1920×1080 estándar.
+# Debes ajustarlos según tu posición física del depot chest, el shopkeeper NPC
+# y el layout de tu trade window.
+#
+# **Cómo calibrar**:
+#   1. Párate junto al depot chest / NPC.
+#   2. Captura un frame con `curl http://localhost:8080/test/grab -o frame.png`
+#   3. Abre frame.png en GIMP, mide las coordenadas del chest/opción stow/items.
+#   4. Reemplaza los valores de este archivo.
+#
+# **Coordenadas de game_coords**: ajustar las 3 coords absolutas (x, y, z) al
+# hunt spawn y depot/NPC del mapa que uses. Usa `goto_if at_coord(...)` con
+# la coord real del waypoint.
+
+[cavebot]
+loop = true
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+[[step]]
+kind = "label"
+name = "start"
+
+# Antes de hunt: verificar que hay supplies suficientes.
+[[step]]
+kind = "check_supplies"
+on_fail = "refill_entry"
+requirements = [
+    { item = "mana_potion",           min_count = 3 },  # ≥3 slots con mana potion
+    { item = "ultimate_healing_rune", min_count = 2 },  # ≥2 slots con UH rune
+]
+
+# ── Hunt zone ────────────────────────────────────────────────────────────────
+[[step]]
+kind = "label"
+name = "hunt_entry"
+
+# Walk al hunt spot (reemplazar con Node coords reales).
+# [[step]]
+# kind = "node"
+# x = 32100
+# y = 32200
+# z = 7
+# max_wait_ms = 15000
+
+# Stand matando mobs hasta que mana < 30% o kills = 20.
+[[step]]
+kind = "stand"
+until = "mobs_killed(20)"
+max_wait_ms = 300000  # 5 min máximo
+
+# Check supplies tras hunt session.
+[[step]]
+kind = "goto_if"
+label = "refill_entry"
+when = "not:has_item(mana_potion, 2)"
+
+[[step]]
+kind = "goto"
+label = "start"
+
+# ── Refill cycle ─────────────────────────────────────────────────────────────
+[[step]]
+kind = "label"
+name = "refill_entry"
+
+# Walk al depot (reemplazar con tu ruta).
+# [[step]]
+# kind = "node"
+# x = 32010
+# y = 32000
+# z = 7
+
+# Depositar backpack en depot chest.
+# Coordenadas estimadas para Tibia 12 1920×1080:
+#   - chest_vx/vy: centro del depot chest en la UI o en el game world
+#   - stow_vx/vy: opción "Stow all" del context menu (~40px abajo del click)
+[[step]]
+kind = "deposit"
+chest_vx = 1850    # ajustar: centro visible del chest
+chest_vy = 300
+stow_vx  = 1880    # ajustar: típicamente cerca del click original + offset
+stow_vy  = 340
+menu_wait_ms = 300
+process_ms = 500
+
+# Walk al NPC shopkeeper.
+# [[step]]
+# kind = "node"
+# x = 32020
+# y = 32005
+# z = 7
+
+# Abrir trade window via chat.
+[[step]]
+kind = "npc_dialog"
+phrases = ["hi", "trade"]
+wait_prompt_ms = 1500
+
+# Comprar 100 mana potions.
+# Coordenadas del trade window (placeholder — calibrar con GIMP):
+[[step]]
+kind = "buy_item"
+item_vx    = 120   # click en el item "mana potion" dentro del trade window
+item_vy    = 340
+confirm_vx = 300   # click en botón "Buy 1" o similar
+confirm_vy = 520
+quantity   = 100
+spacing_ms = 150
+
+# Comprar 50 ultimate healing runes.
+[[step]]
+kind = "buy_item"
+item_vx    = 120
+item_vy    = 380   # item distinto → misma columna, fila de abajo
+confirm_vx = 300
+confirm_vy = 520
+quantity   = 50
+spacing_ms = 150
+
+# Cerrar diálogo con NPC.
+[[step]]
+kind = "npc_dialog"
+phrases = ["bye"]
+wait_prompt_ms = 500
+
+# Return al hunt spot.
+[[step]]
+kind = "goto"
+label = "hunt_entry"

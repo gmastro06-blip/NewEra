@@ -1,0 +1,57 @@
+[
+  {
+    "name": "01: heal on HP critical",
+    "ok": true,
+    "detail": "hp=0.199 heals=1 first_cmd=KEY_TAP 0x3A"
+  },
+  {
+    "name": "02: attack on enemy",
+    "ok": true,
+    "detail": "entries=2 attacks=1"
+  },
+  {
+    "name": "03: emergency emits heal (within window)",
+    "ok": true,
+    "detail": "first_heal=340ms heals=1"
+  },
+  {
+    "name": "04: nominal -> idle",
+    "ok": true,
+    "detail": "hp=1.00 residual_keys=0"
+  },
+  {
+    "name": "05: reaction time HP critical",
+    "ok": true,
+    "detail": "delay=194ms (esperado 150-350ms)"
+  },
+  {
+    "name": "06: scripts healthy",
+    "ok": true,
+    "detail": "loaded=2"
+  },
+  {
+    "name": "07: tick rate stable",
+    "ok": true,
+    "detail": "rate=30.3Hz overruns=0"
+  },
+  {
+    "name": "08: bot_proc_ms under budget",
+    "ok": true,
+    "detail": "bot_proc_ms=0.157ms"
+  },
+  {
+    "name": "09: waypoints load and run",
+    "ok": true,
+    "detail": "steps=4 current_step=walk_south"
+  },
+  {
+    "name": "10: inject endpoint rejects garbage",
+    "ok": true,
+    "detail": "message='PNG inv\u00e1lido: The image format could not'"
+  },
+  {
+    "name": "11: safety fields in /status",
+    "ok": true,
+    "detail": "rate_dropped=0"
+  }
+]

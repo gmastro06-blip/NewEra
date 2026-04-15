@@ -1,0 +1,290 @@
+# abdendriel_wasps_hunt_only.toml — Versión MÍNIMA para primer test.
+#
+# No incluye refill/deposit/NPC. Asume que:
+#   1. Tu char está junto a la entrada del wasp cave ((32616, 31716, 7)
+#      o similar — verificar con `GET /vision/perception` antes de arrancar)
+#   2. Tienes supplies manuales antes de empezar (mana potions x N)
+#   3. Haces refill MANUAL cuando veas HP/mana bajos
+#
+# Este script es para VALIDAR que:
+#   - El hunt loop funciona (descenso, ropes, ascenso)
+#   - Los nodes matchean la realidad del juego
+#   - El healer Lua dispara correctamente
+#   - La safety pause funciona (F5 → force pause mid-run)
+#
+# Cargar con:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/abdendriel_wasps_hunt_only.toml&enabled=true'
+
+[cavebot]
+loop = true
+
+# ═══════════════════════════════════════════════════════════════
+# ENTRY — asume char en superficie z=7 cerca del wasp cave entry
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "start"
+
+# Verificar supplies ANTES del hunt. Si no hay mana potions, sale.
+[[step]]
+kind = "check_supplies"
+on_fail = "safety_stop"
+requirements = [
+    { item = "mana_potion", min_count = 5 },
+]
+
+# Walk to hunt entry (superficie)
+[[step]]
+kind = "node"
+x = 32616
+y = 31716
+z = 7
+max_wait_ms = 30000
+
+# ═══════════════════════════════════════════════════════════════
+# HUNT LOOP — descenso z=7 → z=10, ropes para volver
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "hunt"
+
+# ── z=7 pre-ladder ─────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32607
+y = 31702
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32603
+y = 31704
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Walk to ladder tile z=7 → z=8
+[[step]]
+kind = "node"
+x = 32612
+y = 31703
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "ladder"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=8 ────────────────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32616
+y = 31700
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Walk to ladder z=8 → z=9
+[[step]]
+kind = "node"
+x = 32612
+y = 31683
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "ladder"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=9 ────────────────────────────────────────────────────
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Walk to ladder z=9 → z=10
+[[step]]
+kind = "node"
+x = 32618
+y = 31706
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "ladder"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=10 fondo ─────────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32618
+y = 31706
+z = 10
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32634
+y = 31700
+z = 10
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32623
+y = 31688
+z = 10
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Rope z=10 → z=9
+[[step]]
+kind = "node"
+x = 32612
+y = 31683
+z = 10
+max_wait_ms = 30000
+
+[[step]]
+kind = "rope"
+key = "F6"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=9 vuelta ─────────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32604
+y = 31707
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32627
+y = 31709
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Rope z=9 → z=8
+[[step]]
+kind = "node"
+x = 32622
+y = 31691
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "rope"
+key = "F6"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=8 vuelta ─────────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32607
+y = 31697
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Rope z=8 → z=7
+[[step]]
+kind = "node"
+x = 32603
+y = 31704
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "rope"
+key = "F6"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ═══════════════════════════════════════════════════════════════
+# CHECK SUPPLIES MID-HUNT → si bajo, pausa safety
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "check_supplies"
+on_fail = "safety_stop"
+requirements = [
+    { item = "mana_potion", min_count = 3 },
+]
+
+# Si sobrevivimos: loop de nuevo.
+[[step]]
+kind = "goto"
+label = "hunt"
+
+# ═══════════════════════════════════════════════════════════════
+# SAFETY STOP — supplies agotados, pausar para refill manual
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "safety_stop"
+
+# No hacemos ningún node/action — el cavebot se queda aquí.
+# El operador ve en /status que el cavebot está en "safety_stop" y
+# sabe que debe refillar manualmente y cargar el script de nuevo.
+#
+# TODO (futuro): añadir un kind = "pause" o "stop" para que el bot
+# emita una safety pause explícita en vez de stuck en un label vacío.

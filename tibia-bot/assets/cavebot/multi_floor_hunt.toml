@@ -1,0 +1,437 @@
+# multi_floor_hunt.toml — Hunt multi-piso (Z6-Z10) con refill + deposit + NPC.
+#
+# Usa StepKind::Node para navegacion por click en minimap (auto-walk de Tibia).
+# El personaje camina automaticamente siguiendo el pathfinding A* del servidor.
+#
+# Teclas asumidas (ajustar a tu config):
+#   F6 = Rope     (TODO: cambiar si tu hotkey es diferente)
+#
+# Cargar con:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/multi_floor_hunt.toml&enabled=true'
+
+[cavebot]
+loop = true
+
+# ======================================================================
+# REFILL — Depositar, vender, comprar potions
+# ======================================================================
+
+[[step]]
+kind = "label"
+name = "start"
+
+[[step]]
+kind = "label"
+name = "refill"
+
+# Posicion inicial: zona depot (32681, 31686, 6)
+[[step]]
+kind = "node"
+x = 32681
+y = 31686
+z = 6
+
+# ── Depositar loot ────────────────────────────────────────────────────
+# Right-click depot chest → "Stow all" del context menu.
+# CALIBRAR: chest_vx/vy y stow_vx/vy con `curl /test/grab` + GIMP cuando
+# estés frente al chest.
+[[step]]
+kind = "deposit"
+chest_vx     = 1850
+chest_vy     = 300
+stow_vx      = 1880
+stow_vy      = 340
+menu_wait_ms = 300
+process_ms   = 800
+
+# ── Caminar al NPC ───────────────────────────────────────────────────
+[[step]]
+kind = "node"
+x = 32681
+y = 31669
+z = 6
+
+[[step]]
+kind = "node"
+x = 32670
+y = 31660
+z = 6
+
+[[step]]
+kind = "node"
+x = 32670
+y = 31659
+z = 6
+
+# ── Vender items al NPC ──────────────────────────────────────────────
+# TODO: ajustar frases segun el NPC de tu server.
+[[step]]
+kind = "npc_dialog"
+phrases = ["hi", "trade"]
+wait_prompt_ms = 2000
+
+[[step]]
+kind = "hotkey"
+key = "Escape"
+
+[[step]]
+kind = "stand"
+until = "timer_ms(500)"
+max_wait_ms = 1500
+
+# ── Comprar potions via trade window ────────────────────────────────
+# CALIBRAR item_vx/vy y confirm_vx/vy con la trade window real.
+[[step]]
+kind = "buy_item"
+item_vx    = 120
+item_vy    = 340
+confirm_vx = 300
+confirm_vy = 520
+quantity   = 50
+spacing_ms = 150
+
+# Cerrar diálogo
+[[step]]
+kind = "npc_dialog"
+phrases = ["bye"]
+wait_prompt_ms = 500
+
+[[step]]
+kind = "node"
+x = 32669
+y = 31663
+z = 6
+
+# ── Verificar supplies por inventario (no por mana ratio) ──────────
+[[step]]
+kind = "check_supplies"
+on_fail = "refill"
+requirements = [
+    { item = "mana_potion", min_count = 3 },
+]
+
+# ======================================================================
+# GO HUNT — Caminar desde depot (Z6) hasta zona de caza (Z7)
+# ======================================================================
+
+[[step]]
+kind = "label"
+name = "go_hunt"
+
+[[step]]
+kind = "node"
+x = 32659
+y = 31664
+z = 6
+
+[[step]]
+kind = "node"
+x = 32656
+y = 31673
+z = 6
+
+# Entrar al hole/escalera Z6 -> Z7
+[[step]]
+kind = "node"
+x = 32656
+y = 31674
+z = 6
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── Ahora en Z7 ─────────────────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32645
+y = 31693
+z = 7
+
+[[step]]
+kind = "node"
+x = 32638
+y = 31713
+z = 7
+
+[[step]]
+kind = "node"
+x = 32616
+y = 31716
+z = 7
+
+# ======================================================================
+# HUNT — Circuito multi-piso Z7 -> Z8 -> Z9 -> Z10 -> subir
+# ======================================================================
+
+[[step]]
+kind = "label"
+name = "hunt"
+
+[[step]]
+kind = "node"
+x = 32607
+y = 31702
+z = 7
+
+# Stand: pelear en (32603, 31704, 7)
+[[step]]
+kind = "node"
+x = 32603
+y = 31704
+z = 7
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# ── Bajar a Z8 ───────────────────────────────────────────────────────
+# TODO: si el hole necesita shovel, agregar hotkey antes.
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+[[step]]
+kind = "node"
+x = 32612
+y = 31703
+z = 8
+
+[[step]]
+kind = "node"
+x = 32616
+y = 31700
+z = 8
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# ── Bajar a Z9 ───────────────────────────────────────────────────────
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+[[step]]
+kind = "node"
+x = 32612
+y = 31683
+z = 9
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# ── Bajar a Z10 ──────────────────────────────────────────────────────
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+[[step]]
+kind = "node"
+x = 32618
+y = 31706
+z = 10
+
+[[step]]
+kind = "node"
+x = 32634
+y = 31700
+z = 10
+
+[[step]]
+kind = "node"
+x = 32623
+y = 31688
+z = 10
+
+# ── Rope Z10 -> Z9 ──────────────────────────────────────────────────
+[[step]]
+kind = "node"
+x = 32612
+y = 31683
+z = 10
+
+# Usar rope — TODO: ajustar hotkey si no es F6
+[[step]]
+kind = "hotkey"
+key = "F6"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── Circuito Z9 ─────────────────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32604
+y = 31707
+z = 9
+
+[[step]]
+kind = "node"
+x = 32627
+y = 31709
+z = 9
+
+[[step]]
+kind = "node"
+x = 32642
+y = 31709
+z = 9
+
+[[step]]
+kind = "node"
+x = 32639
+y = 31692
+z = 9
+
+[[step]]
+kind = "node"
+x = 32631
+y = 31677
+z = 9
+
+# ── Rope Z9 -> Z8 ──────────────────────────────────────────────────
+[[step]]
+kind = "node"
+x = 32622
+y = 31691
+z = 9
+
+[[step]]
+kind = "hotkey"
+key = "F6"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── Circuito Z8 ─────────────────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32607
+y = 31697
+z = 8
+
+[[step]]
+kind = "node"
+x = 32605
+y = 31701
+z = 8
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32603
+y = 31703
+z = 8
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# ── Rope Z8 -> Z7 ──────────────────────────────────────────────────
+[[step]]
+kind = "node"
+x = 32603
+y = 31704
+z = 8
+
+[[step]]
+kind = "hotkey"
+key = "F6"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── Ahora en Z7 ──────────────────────────────────────────────────────
+
+# ======================================================================
+# COUNT / CHECK — Decidir si seguir cazando o salir
+# ======================================================================
+
+# Si mana OK, seguir cazando. Si mana < 30%, salir a refill.
+[[step]]
+kind = "goto_if"
+label = "hunt"
+when = "not:mana_below(0.30)"
+
+# ======================================================================
+# LEAVE — Volver a superficie (Z7 -> Z6)
+# ======================================================================
+
+[[step]]
+kind = "label"
+name = "leave"
+
+[[step]]
+kind = "node"
+x = 32610
+y = 31712
+z = 7
+
+[[step]]
+kind = "node"
+x = 32630
+y = 31713
+z = 7
+
+[[step]]
+kind = "node"
+x = 32640
+y = 31709
+z = 7
+
+[[step]]
+kind = "node"
+x = 32649
+y = 31684
+z = 7
+
+# Subir por ladder Z7 -> Z6
+[[step]]
+kind = "node"
+x = 32656
+y = 31674
+z = 7
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── Ahora en Z6 ──────────────────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32666
+y = 31686
+z = 6
+
+[[step]]
+kind = "node"
+x = 32681
+y = 31687
+z = 6
+
+# ======================================================================
+# CHECK TIME — Decidir si hacer otra ronda o terminar
+# ======================================================================
+
+# TODO: ajustar condicion si quieres limitar por kills/tiempo.
+# Por ahora: siempre volver a refill (loop infinito).
+[[step]]
+kind = "goto"
+label = "start"

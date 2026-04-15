@@ -1,0 +1,22 @@
+/target
+Cargo.lock
+*.exe
+*.pdb
+*.d
+
+# Configuraciones locales con rutas/IPs específicas del entorno
+bot/config.toml
+bridge/bridge_config.toml
+
+# Logs
+*.log
+
+# IntelliJ / VS Code
+.idea/
+.vscode/
+*.iml
+
+# Binarios del firmware compilados
+firmware/**/*.bin
+firmware/**/*.uf2
+firmware/**/*.hex

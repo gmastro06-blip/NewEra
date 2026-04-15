@@ -1,0 +1,596 @@
+# abdendriel_wasps.toml — Cavebot Ab'dendriel Wasps (druida level 11)
+#
+# Convertido 2026-04-15 desde los waypoints originales del usuario
+# (formato BlackD-style → formato nativo del bot).
+#
+# IMPORTANTE: Char centrado en Ab'dendriel (NO en Carlin — son ciudades
+# distintas con coordenadas distintas). Las coords de refill/depot son las
+# que tú me pasaste en tus waypoints; si la ubicación real del depot/NPC
+# en tu Ab'dendriel es diferente, ajustar los nodes de la sección REFILL.
+#
+# Flujo completo:
+#   start / refill → deposit Ab'dendriel → NPC sell/buy → check supplies
+#                 → go_hunt → ladder z=6→7 → walk to wasp cave entry
+#                 → hunt (z=7 → z=8 → z=9 → z=10 vía ladders)
+#                 → ropes para subir (z=10 → z=9 → z=8 → z=7)
+#                 → leave → ladder z=7→6 → depot → goto start
+#
+# Hotkeys usadas:
+#   F6 = Rope (coincide con tu hotbar, item count "1")
+#
+# CALIBRACIÓN PENDIENTE (antes del primer run):
+#   - chest_vx/vy, stow_vx/vy : click coords del depot chest y su menu
+#   - item_vx/vy, confirm_vx/vy : click coords del item y botón buy en trade
+#   Cuando estés frente al depot/NPC, abre GIMP sobre el frame NDI y mide.
+#
+# Cargar con:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/abdendriel_wasps.toml&enabled=true'
+
+[cavebot]
+loop = true
+
+# ═══════════════════════════════════════════════════════════════
+# LABELS DE ENTRADA
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "start"
+
+[[step]]
+kind = "label"
+name = "refill"
+
+# ═══════════════════════════════════════════════════════════════
+# REFILL — Ab'dendriel depot + NPC potions
+# ═══════════════════════════════════════════════════════════════
+
+# Walk to Ab'dendriel depot (ajustar coord si tu depot real está en otro sitio)
+[[step]]
+kind = "node"
+x = 32681
+y = 31686
+z = 6
+max_wait_ms = 30000
+
+# Deposit: right-click depot chest → "Stow all"
+[[step]]
+kind = "deposit"
+chest_vx     = 1850   # CALIBRAR: centro del depot chest visible en el frame
+chest_vy     = 300
+stow_vx      = 1880   # CALIBRAR: opción "Stow all" del context menu
+stow_vy      = 340
+menu_wait_ms = 300
+process_ms   = 800
+
+# Walk to NPC shopkeeper (intermediate nodes para evitar stuck en pillars)
+[[step]]
+kind = "node"
+x = 32681
+y = 31669
+z = 6
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32670
+y = 31660
+z = 6
+max_wait_ms = 30000
+
+# Stand next to NPC
+[[step]]
+kind = "node"
+x = 32670
+y = 31659
+z = 6
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 5000
+
+# TODO: action sell — requires sell_item step (no implementado aún).
+# Workaround: por ahora abrir trade directamente y comprar (el deposit
+# ya movió el loot a la bag que Stow all limpia al regresar). Si quieres
+# vender loot específico, hazlo manualmente antes de arrancar la sesión.
+#
+# Alternativa futura: añadir sell_item step al cavebot runner.
+
+# Buy 100 mana potions
+[[step]]
+kind = "npc_dialog"
+phrases = ["hi", "trade"]
+wait_prompt_ms = 1500
+
+[[step]]
+kind = "buy_item"
+item_vx    = 120     # CALIBRAR: posición del mana potion en el trade window
+item_vy    = 340
+confirm_vx = 300     # CALIBRAR: botón confirm/buy
+confirm_vy = 520
+quantity   = 100
+spacing_ms = 150
+
+[[step]]
+kind = "npc_dialog"
+phrases = ["bye"]
+wait_prompt_ms = 500
+
+# Step away from NPC
+[[step]]
+kind = "node"
+x = 32669
+y = 31663
+z = 6
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 5000
+
+# Verify supplies before going back to hunt
+[[step]]
+kind = "check_supplies"
+on_fail = "refill"
+requirements = [
+    { item = "mana_potion", min_count = 3 },
+]
+
+# ═══════════════════════════════════════════════════════════════
+# GO HUNT — Ab'dendriel city → ladder z=6→7 → surface
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "go_hunt"
+
+[[step]]
+kind = "node"
+x = 32659
+y = 31664
+z = 6
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32656
+y = 31673
+z = 6
+max_wait_ms = 30000
+
+# Arrive at ladder tile on z=6
+[[step]]
+kind = "node"
+x = 32656
+y = 31674
+z = 6
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 5000
+
+# Descend z=6 → z=7
+[[step]]
+kind = "ladder"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ═══════════════════════════════════════════════════════════════
+# SUPERFICIE z=7 — camino a la cueva wasps
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "node"
+x = 32645
+y = 31693
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32638
+y = 31713
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32616
+y = 31716
+z = 7
+max_wait_ms = 30000
+
+# ═══════════════════════════════════════════════════════════════
+# HUNT LOOP
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "hunt"
+
+# ── z=7 hunt pre-ladder ──────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32607
+y = 31702
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32603
+y = 31704
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Walk to ladder tile z=7 → z=8
+[[step]]
+kind = "node"
+x = 32612
+y = 31703
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "ladder"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=8 hunt ─────────────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32616
+y = 31700
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Walk to ladder z=8 → z=9
+[[step]]
+kind = "node"
+x = 32612
+y = 31683
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "ladder"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=9 stand post-descent ──────────────────────────────────
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Walk to ladder z=9 → z=10
+[[step]]
+kind = "node"
+x = 32618
+y = 31706
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "ladder"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=10 hunt (fondo de la cueva) ────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32618
+y = 31706
+z = 10
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32634
+y = 31700
+z = 10
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32623
+y = 31688
+z = 10
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Rope z=10 → z=9
+[[step]]
+kind = "node"
+x = 32612
+y = 31683
+z = 10
+max_wait_ms = 30000
+
+[[step]]
+kind = "rope"
+key = "F6"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=9 hunt (vuelta) ────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32604
+y = 31707
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32627
+y = 31709
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32642
+y = 31709
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32639
+y = 31692
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32631
+y = 31677
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Rope z=9 → z=8
+[[step]]
+kind = "node"
+x = 32622
+y = 31691
+z = 9
+max_wait_ms = 30000
+
+[[step]]
+kind = "rope"
+key = "F6"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ── z=8 hunt (vuelta) ────────────────────────────────────────
+
+[[step]]
+kind = "node"
+x = 32607
+y = 31697
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32605
+y = 31701
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32603
+y = 31703
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "stand"
+until = "no_combat"
+max_wait_ms = 30000
+
+# Rope z=8 → z=7
+[[step]]
+kind = "node"
+x = 32603
+y = 31704
+z = 8
+max_wait_ms = 30000
+
+[[step]]
+kind = "rope"
+key = "F6"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# ═══════════════════════════════════════════════════════════════
+# COUNT / CONTINUE / CHECK (supplies mid-hunt)
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "count"
+
+[[step]]
+kind = "label"
+name = "continue"
+
+# Verificar supplies — si quedan <10 manas, ir directo a leave (refill).
+[[step]]
+kind = "check_supplies"
+on_fail = "leave"
+requirements = [
+    { item = "mana_potion", min_count = 10 },
+]
+
+# ═══════════════════════════════════════════════════════════════
+# LEAVE — vuelta a Ab'dendriel city (depot)
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "leave"
+
+[[step]]
+kind = "node"
+x = 32610
+y = 31712
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32630
+y = 31713
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32640
+y = 31709
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32649
+y = 31684
+z = 7
+max_wait_ms = 30000
+
+# Ladder z=7 → z=6 (subir a Ab'dendriel city)
+[[step]]
+kind = "node"
+x = 32656
+y = 31674
+z = 7
+max_wait_ms = 30000
+
+[[step]]
+kind = "ladder"
+
+[[step]]
+kind = "wait"
+duration_ms = 1500
+
+# Walk back to Ab'dendriel depot area
+[[step]]
+kind = "node"
+x = 32666
+y = 31686
+z = 6
+max_wait_ms = 30000
+
+[[step]]
+kind = "node"
+x = 32681
+y = 31687
+z = 6
+max_wait_ms = 30000
+
+# action check_time — TODO: implementar condición time_elapsed_min > N
+# Por ahora loop directo al start.
+
+# ═══════════════════════════════════════════════════════════════
+# TRAIN (placeholder — no implementado aún)
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "train"
+
+[[step]]
+kind = "node"
+x = 32681
+y = 31687
+z = 6
+max_wait_ms = 30000
+
+# action end → goto start (loop infinito)
+[[step]]
+kind = "goto"
+label = "start"
+
+# ═══════════════════════════════════════════════════════════════
+# START_TRAINER (placeholder — alcanzable solo vía goto futuro)
+# ═══════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "start_trainer"

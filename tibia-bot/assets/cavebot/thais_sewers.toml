@@ -1,0 +1,279 @@
+# thais_sewers.toml — Knight, Thais Sewers Z=8 (Cave Rats / Rats)
+#
+# Loop completo basado en coordenadas reales del mapa:
+#   WP2  (32013,32099)  corredor norte       → primera sala
+#   WP3  (32010,32104)  bifurcación norte    → heal_check
+#   WP4  (32006,32110)  sala central norte   → Rats + Cave Rats
+#   WP5  (32018,32110)  corredor este        → Cave Rats
+#   WP6  (32024,32115)  fondo este           → 3-4 Cave Rats dense
+#   WP7  (32010,32115)  corredor central     → camino suroeste
+#   WP8  (32003,32118)  zona suroeste        → MAYOR DENSIDAD
+#   WP9  (31998,32122)  fondo suroeste       → corredor estrecho
+#   WP10 (32002,32112)  giro norte regreso   →
+#   WP11 (32008,32107)  sala central sur     → pre-subida
+#
+# Velocidad base: 450ms/tile knight sin buff. Ajustar si se atasca:
+#   - Llega muy lejos: bajar duration_ms en ese walk
+#   - No llega: subir duration_ms
+#
+# Iniciar con char ya dentro del sewer (Z=8), posicionado en corredor norte.
+# Hot-reload: curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/thais_sewers.toml&enabled=true'
+
+[cavebot]
+loop = true
+
+# ═══════════════════════════════════════════════════════════════════
+# LOOP START — WP2: corredor norte (32013, 32099)
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp2_corredor_norte"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(2)"
+max_wait_ms = 25000
+
+# WP2→WP3: dy=+5 (S), dx=-3 (W)
+[[step]]
+kind = "walk"
+key = "S"
+duration_ms = 2300
+interval_ms = 400
+
+[[step]]
+kind = "walk"
+key = "A"
+duration_ms = 1400
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# WP3: bifurcación norte (32010, 32104)
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp3_bifurcacion"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(2)"
+max_wait_ms = 30000
+
+# WP3→WP4: dy=+6 (S), dx=-4 (W)
+[[step]]
+kind = "walk"
+key = "S"
+duration_ms = 2700
+interval_ms = 400
+
+[[step]]
+kind = "walk"
+key = "A"
+duration_ms = 1800
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# WP4: sala central norte (32006, 32110)
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp4_sala_central_norte"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(3)"
+max_wait_ms = 45000
+
+# WP4→WP5: dx=+12 (E), dy=0
+[[step]]
+kind = "walk"
+key = "D"
+duration_ms = 5400
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# WP5: corredor este (32018, 32110)
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp5_corredor_este"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(2)"
+max_wait_ms = 30000
+
+# WP5→WP6: dx=+6 (E), dy=+5 (S)
+[[step]]
+kind = "walk"
+key = "D"
+duration_ms = 2700
+interval_ms = 400
+
+[[step]]
+kind = "walk"
+key = "S"
+duration_ms = 2300
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# WP6: fondo este (32024, 32115) — 3-4 Cave Rats
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp6_fondo_este"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(3)"
+max_wait_ms = 45000
+
+# WP6→WP7: dx=-14 (W), dy=0
+[[step]]
+kind = "walk"
+key = "A"
+duration_ms = 6400
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# WP7: corredor central (32010, 32115)
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp7_corredor_central"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(1)"
+max_wait_ms = 15000
+
+# WP7→WP8: dx=-7 (W), dy=+3 (S)
+[[step]]
+kind = "walk"
+key = "A"
+duration_ms = 3200
+interval_ms = 400
+
+[[step]]
+kind = "walk"
+key = "S"
+duration_ms = 1400
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# WP8: zona suroeste (32003, 32118) — MAYOR DENSIDAD
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp8_zona_suroeste"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(5)"
+max_wait_ms = 90000
+
+# WP8→WP9: dx=-5 (W), dy=+4 (S)
+[[step]]
+kind = "walk"
+key = "A"
+duration_ms = 2300
+interval_ms = 400
+
+[[step]]
+kind = "walk"
+key = "S"
+duration_ms = 1800
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# WP9: fondo suroeste (31998, 32122)
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp9_fondo_suroeste"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(2)"
+max_wait_ms = 30000
+
+# WP9→WP10: dy=-10 (N), dx=+4 (E)
+[[step]]
+kind = "walk"
+key = "W"
+duration_ms = 4500
+interval_ms = 400
+
+[[step]]
+kind = "walk"
+key = "D"
+duration_ms = 1800
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# WP10: giro norte regreso (32002, 32112)
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp10_giro_norte"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(1)"
+max_wait_ms = 15000
+
+# WP10→WP11: dy=-5 (N), dx=+6 (E)
+[[step]]
+kind = "walk"
+key = "W"
+duration_ms = 2300
+interval_ms = 400
+
+[[step]]
+kind = "walk"
+key = "D"
+duration_ms = 2700
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# WP11: sala central sur (32008, 32107)
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "wp11_sala_central_sur"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(2)"
+max_wait_ms = 30000
+
+# WP11→WP2: dy=-8 (N), dx=+5 (E)
+[[step]]
+kind = "walk"
+key = "W"
+duration_ms = 3600
+interval_ms = 400
+
+[[step]]
+kind = "walk"
+key = "D"
+duration_ms = 2300
+interval_ms = 400
+
+# ═══════════════════════════════════════════════════════════════════
+# LOOP
+# ═══════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "goto"
+label = "wp2_corredor_norte"

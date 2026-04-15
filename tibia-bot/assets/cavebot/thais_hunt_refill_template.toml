@@ -1,0 +1,193 @@
+# thais_hunt_refill_template.toml — Hunt + deposit + refill loop completo.
+#
+# Circuito:
+#   hunt → (mana < 30%) → walk depot → depositar loot → walk NPC →
+#   comprar mana pots → walk hunt → loop
+#
+# ─────────────────────────────────────────────────────────────────────
+# ANTES DE USAR: ajustar los walk steps marcados con TODO con los
+# tiempos y direcciones reales de tu mapa. Medir con el bot pausado.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Detección de UI (nuevo):
+#   ui_visible(depot_chest) → true cuando el panel "Depot Chest" está abierto
+#   ui_visible(stow_menu)   → true cuando el menú de contexto está visible
+#   Calibrar ROIs en assets/calibration.toml [ui_rois] si hay falsos positivos.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Cargar con:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/thais_hunt_refill_template.toml&enabled=true'
+
+[cavebot]
+loop = true
+
+# ══════════════════════════════════════════════════════════════════════
+# HUNT LOOP
+# ══════════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "hunt_entry"
+
+# TODO: ajustar key/duration_ms al layout del rat cave.
+[[step]]
+kind = "walk"
+key = "W"
+duration_ms = 5000
+interval_ms = 400
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(5)"
+max_wait_ms = 90000
+
+[[step]]
+kind = "walk"
+key = "S"
+duration_ms = 5000
+interval_ms = 400
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(5)"
+max_wait_ms = 90000
+
+# ── Chequeo de refill ─────────────────────────────────────────────────
+[[step]]
+kind = "goto_if"
+label = "refill_entry"
+when = "mana_below(0.30)"
+
+[[step]]
+kind = "goto"
+label = "hunt_entry"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# REFILL: walk al depot
+# ══════════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "refill_entry"
+
+# TODO: reemplazar con el walk real desde el hunt spot hasta el depot.
+# Si hay escaleras de salida del sewer, añadir un hotkey step entre walks.
+# Ejemplo multi-step:
+#
+# [[step]]
+# kind = "walk"
+# key = "S"
+# duration_ms = 8000
+# interval_ms = 400
+#
+# [[step]]
+# kind = "hotkey"
+# key = "..."    # usar rope/shovel si aplica
+#
+# [[step]]
+# kind = "walk"
+# key = "N"
+# duration_ms = 5000
+# interval_ms = 400
+
+[[step]]
+kind = "wait"
+duration_ms = 500   # placeholder — reemplazar con el walk real
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DEPOSIT: abrir depot chest y stow loot
+# ══════════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "deposit_entry"
+
+# Stow loot del backpack al depot chest.
+#
+# Mecánica: right-click en el chest → context menu aparece → click en
+# "Stow all". El step `deposit` encapsula este flujo (4 fases internas:
+# right-click → wait menu → left-click stow → wait process).
+#
+# CALIBRAR estas 4 coordenadas con GIMP sobre un frame real:
+#   1. chest_vx/vy: centro visible del depot chest (la caja en el game world
+#      o el ícono de la locker en el sidebar)
+#   2. stow_vx/vy: posición exacta de la opción "Stow all" dentro del context
+#      menu. Suele aparecer ~30-40 px abajo y un poco a la derecha del click.
+#
+# Para calibrar:
+#   curl http://localhost:8080/test/grab -o frame.png
+#   gimp frame.png   # medir las coords y reemplazar abajo
+[[step]]
+kind = "deposit"
+chest_vx     = 1850
+chest_vy     = 300
+stow_vx      = 1880
+stow_vy      = 340
+menu_wait_ms = 300
+process_ms   = 800
+
+
+# ══════════════════════════════════════════════════════════════════════
+# REFILL: walk al NPC y comprar mana potions
+# ══════════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "npc_entry"
+
+# CALIBRAR: walk del depot al NPC vendedor de mana potions.
+# En Thais: Tamara (north of depot), Obi, Yana, etc.
+[[step]]
+kind = "wait"
+duration_ms = 500   # placeholder — reemplazar con walk steps reales
+
+# Abrir trade window con el NPC.
+[[step]]
+kind = "npc_dialog"
+phrases = ["hi", "trade"]
+wait_prompt_ms = 1500
+
+# Comprar 50 mana potions clickeando en el item + confirm × N.
+# CALIBRAR item_vx/vy y confirm_vx/vy con la trade window real.
+[[step]]
+kind = "buy_item"
+item_vx    = 120
+item_vy    = 340
+confirm_vx = 300
+confirm_vy = 520
+quantity   = 50
+spacing_ms = 150
+
+# Cerrar dialogo con el NPC.
+[[step]]
+kind = "npc_dialog"
+phrases = ["bye"]
+wait_prompt_ms = 500
+
+# Verificar que tenemos supplies antes de volver al hunt.
+[[step]]
+kind = "check_supplies"
+on_fail = "deposit_entry"
+requirements = [
+    { item = "mana_potion", min_count = 3 },
+]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# VUELTA AL HUNT
+# ══════════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "return_entry"
+
+# TODO: reverso del walk refill_entry → depot.
+[[step]]
+kind = "wait"
+duration_ms = 500   # placeholder — reemplazar con el walk real
+
+[[step]]
+kind = "goto"
+label = "hunt_entry"

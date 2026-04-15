@@ -1,0 +1,146 @@
+apiVersion: 1
+
+# Alertas Grafana para tibia-bot. Se cargan automáticamente al arrancar el
+# contenedor y son visibles en:
+#   http://localhost:3000/alerting/list
+#
+# Las alertas NO se envían a ningún lado por default — solo aparecen en la UI
+# de Grafana (estado verde/rojo en el sidebar de alerting). Para añadir
+# notificaciones (email, webhook, Slack) edita contact-points.yml.
+
+groups:
+  - orgId: 1
+    name: tibia-bot-critical
+    folder: tibia-bot
+    interval: 30s
+    rules:
+      - uid: tb-alert-no-frame
+        title: NDI frame stalled
+        condition: A
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: tibia_bot_has_frame == 0
+              refId: A
+              intervalMs: 5000
+              maxDataPoints: 43200
+        noDataState: Alerting
+        execErrState: Error
+        for: 30s
+        annotations:
+          summary: "El bot no está recibiendo frames NDI hace >30s"
+          description: "Verifica que OBS/DistroAV esté ejecutándose y el NDI source esté activo."
+        labels:
+          severity: critical
+          component: ndi
+
+      - uid: tb-alert-tick-stall
+        title: Tick processing stalled
+        condition: A
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: rate(tibia_bot_ticks_total[1m]) < 20
+              refId: A
+              intervalMs: 5000
+              maxDataPoints: 43200
+        noDataState: Alerting
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: "Tick rate < 20/s (esperado 30)"
+          description: "El game loop está bajando su rate — probablemente stall o freeze del proceso."
+        labels:
+          severity: critical
+          component: loop
+
+      - uid: tb-alert-proc-slow
+        title: Bot proc time degraded
+        condition: A
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: tibia_bot_proc_ms > 50
+              refId: A
+              intervalMs: 5000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: "Tick proc time > 50ms"
+          description: "El bot está excediendo el budget por tick. Revisa qué módulo se volvió lento (ver dashboard Latency panel)."
+        labels:
+          severity: warning
+          component: perf
+
+  - orgId: 1
+    name: tibia-bot-safety
+    folder: tibia-bot
+    interval: 30s
+    rules:
+      - uid: tb-alert-hp-low
+        title: Character HP persistently low
+        condition: A
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: tibia_bot_hp_ratio < 0.30
+              refId: A
+              intervalMs: 5000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Error
+        for: 15s
+        annotations:
+          summary: "HP < 30% durante >15s"
+          description: "El healer Lua no está compensando el daño. Pausa el bot y revisa el script o huye a refill."
+        labels:
+          severity: critical
+          component: safety
+
+      - uid: tb-alert-safety-pause
+        title: Safety pause active
+        condition: A
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: tibia_bot_is_paused == 1
+              refId: A
+              intervalMs: 5000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: "Bot pausado >1 minuto"
+          description: "El bot lleva más de 1 minuto pausado. Verifica en /health la razón (login/char_select/npc_trade/manual)."
+        labels:
+          severity: warning
+          component: fsm
+
+      - uid: tb-alert-pico-rtt
+        title: Pico command latency spike
+        condition: A
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: tibia_bot_pico_latency_ms > 50
+              refId: A
+              intervalMs: 5000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Error
+        for: 30s
+        annotations:
+          summary: "Pico RTT > 50ms"
+          description: "Los comandos al bridge están tardando demasiado. Verifica conexión TCP al Pico bridge."
+        labels:
+          severity: warning
+          component: actuator

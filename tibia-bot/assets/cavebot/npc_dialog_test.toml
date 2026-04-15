@@ -1,0 +1,66 @@
+# npc_dialog_test.toml — Test aislado del step npc_dialog.
+#
+# **Objetivo**: validar que el bot escribe texto en el chat correctamente,
+# el NPC responde, y el bot completa la secuencia "hi → item → yes".
+#
+# **Prerequisito**: char manualmente posicionado al lado de un NPC que
+# venda mana potions (Obi, Tamara, u otro en Thais).
+#
+# **Uso**:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/npc_dialog_test.toml&enabled=true'
+#
+# **Qué hace**:
+#   1. Espera 2s (por si el char está en transición)
+#   2. Dice "hi" → NPC debería saludar
+#   3. Espera 1.5s para la respuesta
+#   4. Dice "mana potion" → NPC debería ofrecer precio
+#   5. Espera 1.5s
+#   6. Dice "yes" → NPC debería vender 1 potion
+#   7. Loop (vuelve al inicio, pero no caminando — el char sigue al lado del NPC)
+#
+# **Señales de éxito**:
+#   - Ves el texto "hi" aparecer en el chat
+#   - NPC responde saludando ("Hello, Aelzerand Neeymas")
+#   - Ves "mana potion" en el chat
+#   - NPC dice algo tipo "Do you want to buy a strong mana potion for X gold?"
+#   - Ves "yes"
+#   - Recibes la potion (+1 slot en backpack) y aparece el oro descontado
+#
+# **Señales de fallo**:
+#   - El texto sale con chars extras o faltantes (typing buffer rate)
+#   - El char no tiene la ventana de chat abierta y el bot escribe en el mundo
+#   - NPC no responde (char fuera de rango)
+#   - Mayúsculas/caracteres especiales aparecen raros (ascii_to_hid solo soporta lowercase)
+#
+# **Nota importante**: el step `npc_dialog` emite un `CavebotAction::Say`
+# por frase. El loop de tibia_bot convierte esa frase en keystrokes: [Enter,
+# chars..., Enter]. El primer Enter abre el chat, los chars se tipean, el
+# segundo Enter envía el mensaje y cierra el chat.
+
+[cavebot]
+loop = false  # no loopear — con 1 compra nos vale para el test
+
+# ── Wait inicial de 2s (estabilización) ──────────────────────────────
+[[step]]
+kind = "wait"
+duration_ms = 2000
+
+# ── NpcDialog: secuencia "hi" → "mana potion" → "yes" ────────────────
+#
+# `phrases` es array de strings. Cada string se convierte en una
+# secuencia de keystrokes tipeados en el chat. El step emite 1 phrase
+# por tick y espera que el loop drene el typing buffer antes de avanzar.
+#
+# `wait_prompt_ms` = tiempo que espera tras tipear la última frase
+# para que el NPC responda y ejecute la compra.
+[[step]]
+kind = "npc_dialog"
+phrases = ["hi", "mana potion", "yes"]
+wait_prompt_ms = 2000
+
+# ── Wait final + stop ────────────────────────────────────────────────
+# Al terminar (loop=false), el cavebot entra en Finished y el bot
+# vuelve a Idle. Solo queríamos una pasada para ver si funciona.
+[[step]]
+kind = "wait"
+duration_ms = 1000

@@ -1,0 +1,56 @@
+# bridge_config.toml — Copiar a bridge_config.toml y editar para tu hardware.
+# Colocar en el mismo directorio que pico_bridge.exe antes de ejecutarlo.
+
+# ── Modo de input ──────────────────────────────────────────────────────────
+# El bridge soporta 2 backends de actuación HID:
+#
+#   "sendinput": usa la Windows API SendInput para inyectar mouse/keyboard
+#                directamente en el proceso de la ventana en foreground.
+#                NO requiere hardware. Útil para dev/testing.
+#
+#   "serial":    forwardea comandos via puerto serial COM a un microcontrolador
+#                con USB HID nativo (Pico 2, Arduino Leonardo, Pro Micro).
+#                Más realista (eventos de hardware reales) pero requiere
+#                el dispositivo conectado.
+[input]
+mode = "sendinput"   # cambiar a "serial" para usar Pico 2 / Arduino Leonardo
+
+# ── Configuración serial (solo si mode = "serial") ─────────────────────────
+# Soporta tanto Raspberry Pi Pico 2 como Arduino Leonardo / Pro Micro.
+# Ambos hablan el mismo protocolo line-based ASCII a 115200 baud.
+#
+# Para Arduino Leonardo: ver arduino/README.md para flash del sketch.
+[serial]
+# Puerto COM asignado al device por Windows.
+# Verificar en Administrador de dispositivos > Puertos (COM y LPT).
+# Pico 2:   aparece como "USB Serial Device (COMx)"
+# Leonardo: aparece como "Arduino Leonardo (COMx)"
+port = "COM5"
+baud = 115200
+
+[tcp]
+# El bridge escucha aquí. El bot del PC procesador se conecta a esta IP:puerto.
+listen_addr = "0.0.0.0:9000"
+
+[watchdog]
+# Watchdog de inactividad del bot. Si no llega ningún comando del bot durante
+# N segundos, el bridge cierra la conexión TCP. Esto previene "clicks fantasma"
+# si el bot crashea o se cuelga: al perder la conexión, no quedan comandos
+# huérfanos ejecutándose.
+#
+# El bot real envía PING ~cada tick (33ms a 30 Hz) cuando está vivo, así que
+# valores entre 5s y 30s son seguros. 0 desactiva el watchdog.
+idle_timeout_secs = 10
+
+[focus]
+# Detección de foco: si Tibia no es la ventana activa, el bridge bloquea
+# comandos HID (MOUSE_MOVE, MOUSE_CLICK, KEY_TAP) para evitar que keystrokes
+# y clicks vayan a la ventana equivocada. PING y RESET siempre pasan.
+#
+# Deshabilitado por defecto para compatibilidad.
+enabled = false
+# Substring a buscar en el título de la ventana activa.
+# Tibia usa "Tibia - NombrePersonaje" como título.
+window_title_contains = "Tibia"
+# Intervalo de polling en ms. 100ms es suficiente (el bot corre a 30Hz = 33ms).
+poll_interval_ms = 100

@@ -1,0 +1,56 @@
+# thais_rats_test.toml — Cavebot básico para Thais Rat Cave.
+#
+# **Propósito**: primer test in-vivo del cavebot v2. Circuito simple
+# north-south (walk N → stand y matar → walk S → loop).
+#
+# **Asunciones**:
+# - El char empieza en un punto donde caminar al norte lleva a rats
+# - 2.5s de walk cubre ~2-3 tiles (SQMs) a pace normal
+# - Los rats se aggrean solos al estar cerca
+# - Chase + Attack activado en Tibia
+# - WASD como teclas de movimiento (W=norte, S=sur)
+#
+# **Cómo ajustar**: si al probar resulta que los mobs están en otra
+# dirección, cambiar `key` de "W"/"S" a "D"/"A" (E/W). Si 2.5s es
+# demasiado lejos (char sale de rat area), bajar `duration_ms`.
+# Si 3 kills es demasiado, bajar a 2 o usar `until = "no_combat"`.
+#
+# **Cargar con**:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/thais_rats_test.toml&enabled=true'
+
+[cavebot]
+loop = true
+
+# ── Ciclo principal ──────────────────────────────────────────────────────────
+
+[[step]]
+kind = "label"
+name = "start"
+
+# Caminar al NORTE ~2.5s. interval_ms=400 emite W cada 400ms → ~6 taps.
+# A velocidad base, eso son ~2-3 SQMs.
+[[step]]
+kind = "walk"
+key = "W"
+duration_ms = 2500
+interval_ms = 400
+
+# Plantar y matar. Si aparecen 3 rats, el bot los mata (heal auto +
+# loot auto ya validados). Si tarda mucho porque no hay mobs, timeout
+# a los 60s y sigue al siguiente step.
+[[step]]
+kind = "stand"
+until = "mobs_killed(3)"
+max_wait_ms = 60000
+
+# Caminar al SUR ~2.5s para volver al punto inicial.
+[[step]]
+kind = "walk"
+key = "S"
+duration_ms = 2500
+interval_ms = 400
+
+# Loop infinito.
+[[step]]
+kind = "goto"
+label = "start"

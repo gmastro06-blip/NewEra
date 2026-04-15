@@ -1,0 +1,108 @@
+# has_stack_example.toml — Uso de `has_stack` para refill preciso.
+#
+# **Diferencia clave vs has_item**:
+#   - `has_item(mana_potion, 5)`  → ≥5 SLOTS con mana potion (1 stack de 100 = 1 slot)
+#   - `has_stack(mana_potion, 50)` → ≥50 UNIDADES totales (requiere digit OCR)
+#
+# `has_stack` requiere que hayas calibrado los digit templates en
+# `assets/templates/digits/0.png` ... `9.png`. Sin ellos, se comporta como
+# has_item (1 unit per slot).
+#
+# Ver `bot/src/sense/vision/inventory_ocr.rs` para detalles del OCR.
+
+[cavebot]
+loop = true
+
+[[step]]
+kind = "label"
+name = "start"
+
+# ── Refill precondition: necesitamos ≥50 mana pots (units) + ≥10 UH (units) ──
+[[step]]
+kind = "check_supplies"
+on_fail = "refill"
+requirements = [
+    { item = "mana_potion",           min_count = 3 },   # fallback: ≥3 slots si no hay OCR
+    { item = "ultimate_healing_rune", min_count = 1 },
+]
+
+# Con OCR calibrado, preferir has_stack para precisión:
+[[step]]
+kind = "goto_if"
+label = "refill"
+when = "not:has_stack(mana_potion, 50)"
+
+[[step]]
+kind = "goto_if"
+label = "refill"
+when = "not:has_stack(ultimate_healing_rune, 10)"
+
+# ── Hunt zone (placeholder) ────────────────────────────────────────────────
+[[step]]
+kind = "label"
+name = "hunt_entry"
+
+[[step]]
+kind = "stand"
+until = "mobs_killed(10)"
+max_wait_ms = 300000
+
+[[step]]
+kind = "goto"
+label = "start"
+
+# ── Refill cycle ───────────────────────────────────────────────────────────
+[[step]]
+kind = "label"
+name = "refill"
+
+# Depositar lo que haya
+[[step]]
+kind = "deposit"
+chest_vx     = 1850   # CALIBRAR con GIMP
+chest_vy     = 300
+stow_vx      = 1880
+stow_vy      = 340
+menu_wait_ms = 300
+process_ms   = 800
+
+# Abrir trade con NPC
+[[step]]
+kind = "npc_dialog"
+phrases = ["hi", "trade"]
+wait_prompt_ms = 1500
+
+# Comprar mana potions: 100 clicks (el NPC despacha 1 por click típicamente)
+[[step]]
+kind = "buy_item"
+item_vx    = 120      # CALIBRAR
+item_vy    = 340
+confirm_vx = 300
+confirm_vy = 520
+quantity   = 100
+spacing_ms = 150
+
+# Comprar UH runes
+[[step]]
+kind = "buy_item"
+item_vx    = 120
+item_vy    = 380
+confirm_vx = 300
+confirm_vy = 520
+quantity   = 20
+spacing_ms = 150
+
+# Verificar que realmente recibimos los items (con OCR preciso)
+[[step]]
+kind = "goto_if"
+label = "refill"
+when = "not:has_stack(mana_potion, 50)"
+
+[[step]]
+kind = "npc_dialog"
+phrases = ["bye"]
+wait_prompt_ms = 500
+
+[[step]]
+kind = "goto"
+label = "hunt_entry"

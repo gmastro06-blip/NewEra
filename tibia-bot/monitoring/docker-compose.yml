@@ -1,0 +1,60 @@
+version: "3.8"
+
+# Stack de observabilidad para tibia-bot.
+#
+# Levanta:
+#   - Prometheus en :9090 (scrape de bot:8080/metrics cada 5s)
+#   - Grafana en :3000 (admin/admin) con dashboard pre-cargado
+#
+# Uso:
+#   1. Asegúrate que el bot está corriendo en host:8080 (config http.bind_address)
+#   2. cd monitoring/ && docker-compose up -d
+#   3. Abre http://localhost:3000 → login admin/admin → dashboard "tibia-bot"
+#
+# Notas:
+#   - prometheus.yml usa host.docker.internal:8080 para alcanzar el bot
+#     en el host desde el contenedor (Linux: requiere extra_hosts; Windows
+#     y Mac funciona out-of-the-box).
+#   - El dashboard se monta como provisioning, no necesitas importarlo manualmente.
+#   - Grafana persiste su DB en el volumen `grafana-data`.
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: tibia-bot-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=14d"
+      - "--web.enable-lifecycle"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tibia-bot-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:
+  grafana-data:

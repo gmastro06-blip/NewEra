@@ -1,0 +1,60 @@
+# walk_test_wasd.toml — Test simple de waypoints con WASD.
+#
+# Dibuja un cuadrado de ~3x3 tiles: Norte, Este, Sur, Oeste y loop.
+# Cada paso dura 1.5s con interval 400ms → ~4 pulsaciones por step = ~4 tiles.
+#
+# Ajusta duration_ms / interval_ms según la velocidad de tu char:
+#   - Knight low-level (~170 speed): interval 500ms
+#   - Knight mid-level (~250 speed): interval 400ms (este default)
+#   - Alto level (>300 speed): interval 300ms
+#
+# IMPORTANTE: usa este waypoint en una zona ABIERTA (bosque, depot, etc).
+# Si chocas con paredes o criaturas, el char no se moverá pero el step
+# seguirá contando. El stuck watchdog pausará waypoints a los 60s de
+# no-advance.
+
+loop = true
+
+[[step]]
+label       = "walk_north"
+key         = "W"
+duration_ms = 1500
+interval_ms = 400
+
+[[step]]
+label       = "pause_1"
+key         = ""
+duration_ms = 200
+
+[[step]]
+label       = "walk_east"
+key         = "D"
+duration_ms = 1500
+interval_ms = 400
+
+[[step]]
+label       = "pause_2"
+key         = ""
+duration_ms = 200
+
+[[step]]
+label       = "walk_south"
+key         = "S"
+duration_ms = 1500
+interval_ms = 400
+
+[[step]]
+label       = "pause_3"
+key         = ""
+duration_ms = 200
+
+[[step]]
+label       = "walk_west"
+key         = "A"
+duration_ms = 1500
+interval_ms = 400
+
+[[step]]
+label       = "pause_4"
+key         = ""
+duration_ms = 500

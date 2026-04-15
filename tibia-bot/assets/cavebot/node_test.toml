@@ -1,0 +1,78 @@
+# node_test.toml — Test minimo de Node steps (click en minimap).
+#
+# El primer nodo solo registra la posicion actual (no hace click).
+# Los nodos siguientes hacen click en minimap a +dx,+dy tiles del anterior.
+#
+# Este test hace un cuadrado de 5 tiles:
+#   nodo1 (registro) -> nodo2 (+5 east) -> nodo3 (+5 south) ->
+#   nodo4 (-5 west) -> nodo5 (-5 north) -> loop
+#
+# Las coordenadas absolutas no importan — solo los DELTAS entre nodos.
+# Usa (1000,1000,7) como origen ficticio.
+#
+# Cargar con:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/node_test.toml&enabled=true'
+
+[cavebot]
+loop = true
+
+[[step]]
+kind = "label"
+name = "start"
+
+# Nodo 1: registra posicion actual. No hace click.
+[[step]]
+kind = "node"
+x = 1000
+y = 1000
+z = 7
+
+# Nodo 2: +5 tiles east (click a la derecha del centro del minimap)
+[[step]]
+kind = "node"
+x = 1005
+y = 1000
+z = 7
+
+# Esperar un poco entre nodos
+[[step]]
+kind = "wait"
+duration_ms = 2000
+
+# Nodo 3: +5 tiles south (click abajo del centro del minimap)
+[[step]]
+kind = "node"
+x = 1005
+y = 1005
+z = 7
+
+[[step]]
+kind = "wait"
+duration_ms = 2000
+
+# Nodo 4: -5 tiles west (click a la izquierda del centro del minimap)
+[[step]]
+kind = "node"
+x = 1000
+y = 1005
+z = 7
+
+[[step]]
+kind = "wait"
+duration_ms = 2000
+
+# Nodo 5: -5 tiles north (click arriba del centro del minimap)
+[[step]]
+kind = "node"
+x = 1000
+y = 1000
+z = 7
+
+[[step]]
+kind = "wait"
+duration_ms = 2000
+
+# Loop
+[[step]]
+kind = "goto"
+label = "start"

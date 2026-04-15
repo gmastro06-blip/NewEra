@@ -1,0 +1,91 @@
+# example.toml — Cavebot v2 de ejemplo (Fase C).
+#
+# Este archivo NO está calibrado para un hunt real. Es una plantilla que
+# muestra la sintaxis de todos los step types soportados por el cavebot.
+# Cárgalo con:
+#   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/example.toml&enabled=true'
+#
+# ## Estructura
+#
+# - `[cavebot]` — header global, controla `loop` y otros metadatos.
+# - `[[step]]` — lista plana de steps, ejecutados en orden.
+#   Alternativa: `[[section]]` + `steps = [...]` inline para multi-sección.
+#
+# ## Step types
+#
+# - walk:            tecla direccional repetida durante N ms
+# - wait:            espera N ms sin emitir
+# - hotkey:          pulsa una tecla una vez y avanza
+# - stand:           quédate hasta cumplir condición (mobs_killed/hp_full/etc)
+# - label:           marcador nombrado para goto
+# - goto:            salto incondicional a un label
+# - goto_if:         salto condicional (when = condición)
+# - loot:            click en (vx,vy) para lootear corpse
+# - skip_if_blocked: walk que salta si no hay actividad en max_wait_ms
+
+[cavebot]
+loop = true
+
+# ── Bucle de hunt ────────────────────────────────────────────────────────────
+
+[[step]]
+kind = "label"
+name = "hunt_entry"
+
+# Avanza hacia el spawn.
+[[step]]
+kind = "walk"
+key = "D"
+duration_ms = 3000
+interval_ms = 300
+
+# Quédate atacando hasta matar 3 mobs (máximo 30s).
+[[step]]
+kind = "stand"
+until = "mobs_killed(3)"
+max_wait_ms = 30000
+
+# Si el HP está bajo, ir a refill.
+[[step]]
+kind = "goto_if"
+label = "refill_entry"
+when = "hp_below(0.4)"
+
+# Si no, vuelve al inicio.
+[[step]]
+kind = "goto"
+label = "hunt_entry"
+
+# ── Bucle de refill ──────────────────────────────────────────────────────────
+
+[[step]]
+kind = "label"
+name = "refill_entry"
+
+# Camina de vuelta al depot (en el ejemplo: 5s hacia el oeste).
+[[step]]
+kind = "walk"
+key = "A"
+duration_ms = 5000
+interval_ms = 300
+
+# Espera 1s para animación de puerta.
+[[step]]
+kind = "wait"
+duration_ms = 1000
+
+# Usa una rope/ladder (hotkey F5 de ejemplo).
+[[step]]
+kind = "hotkey"
+key = "F5"
+
+# Espera hasta HP lleno (máximo 60s).
+[[step]]
+kind = "stand"
+until = "hp_full"
+max_wait_ms = 60000
+
+# Vuelve al hunt.
+[[step]]
+kind = "goto"
+label = "hunt_entry"

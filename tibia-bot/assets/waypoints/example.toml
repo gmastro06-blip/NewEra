@@ -1,0 +1,52 @@
+# example.toml — Waypoint list de ejemplo.
+#
+# Un waypoint es un "step" de una secuencia temporal:
+#   - key:         nombre de tecla ("Numpad8", "Up", "F5", ""). Vacío = wait.
+#   - duration_ms: cuánto dura el step. 0 = one-shot (emite y avanza).
+#   - interval_ms: cada cuántos ms re-emitir la tecla. 0 = solo al inicio del step.
+#
+# Mientras el step está activo la FSM puede pausarlo por Emergency/Fighting y
+# luego reiniciarlo desde el principio. Cuando la lista termina:
+#   - loop = true  → vuelve al primer step
+#   - loop = false → el bot queda en Idle
+#
+# ⚠️ LIMITACIÓN CONOCIDA — usa steps cortos en zonas con combate frecuente.
+# Tras un combate, el step actual se REINICIA desde el principio (no se reanuda
+# a mitad de camino) porque el personaje pudo haber drifted durante la pelea.
+# Con duration_ms ≤ 3000 el drift tras cada combate es ≤3 segundos — aceptable.
+# Con duration_ms grandes (>10s) el drift puede hacerte caminar en una dirección
+# equivocada. Mejor partir "walk N 30s" en 10 pasos de 3s.
+#
+# ⚠️ LIMITACIÓN CONOCIDA — sin posicionamiento absoluto.
+# Los steps son TEMPORALES, no ESPACIALES. No puedes decir "ir al tile (1024,512)".
+# Esto es por diseño: implementar navegación por minimap requiere OCR o
+# map-matching que aún no está hecho. Ver CLAUDE.md sección Waypoints.
+
+loop = true
+
+# Camina al norte durante 2 segundos, re-emitiendo la tecla cada 300ms
+# (Tibia procesa un tile por pulsación; 300ms ≈ 3.3 tiles por segundo).
+[[step]]
+label       = "walk_north"
+key         = "Numpad8"
+duration_ms = 2000
+interval_ms = 300
+
+# Espera medio segundo (no emite nada).
+[[step]]
+label       = "pause"
+key         = ""
+duration_ms = 500
+
+# Camina al sur durante 2 segundos.
+[[step]]
+label       = "walk_south"
+key         = "Numpad2"
+duration_ms = 2000
+interval_ms = 300
+
+# Dispara una hotkey de utilidad (por ejemplo pedir supplies) y avanza al instante.
+[[step]]
+label       = "hotkey_supplies"
+key         = "F12"
+duration_ms = 0

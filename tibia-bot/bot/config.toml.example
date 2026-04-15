@@ -1,0 +1,219 @@
+# config.toml — Copiar a config.toml y ajustar valores antes de ejecutar.
+# NUNCA commitear config.toml (tiene IPs locales). Solo commitear este .example.
+
+[ndi]
+# Nombre exacto de la fuente NDI configurada en OBS/DistroAV del PC gaming.
+source_name         = "TIBIA-BOT"
+# Si no encuentra la fuente, reintenta cada N segundos.
+retry_interval_secs = 2.0
+
+[pico]
+# IP del PC gaming y puerto del bridge. Ajustar según tu red.
+bridge_addr         = "192.168.1.100:9000"
+# Timeout para conectar al bridge (ms).
+connect_timeout_ms  = 3000
+# Timeout por comando: si la Pico no responde en 100ms, loggea warning.
+command_timeout_ms  = 100
+# Backoff exponencial máximo entre reintentos de conexión TCP (segundos).
+max_backoff_secs    = 5
+
+[http]
+# El servidor HTTP del bot (panel de control y endpoints de test).
+listen_addr         = "0.0.0.0:8080"
+
+[loop_config]
+# Frecuencia del game loop en Hz. 30 Hz = ~33ms por tick.
+target_fps          = 30
+
+[coords]
+# ──────────────────────────────────────────────────────────────────────────────
+# Geometría del entorno de escritorio del PC gaming.
+# IMPORTANTE: Windows mapea HID absoluto (0-32767) al MONITOR PRIMARIO,
+# no al desktop virtual completo. Usar las dimensiones del monitor donde
+# corre Tibia, no la suma de todos los monitores.
+# ──────────────────────────────────────────────────────────────────────────────
+desktop_total_w           = 1920
+desktop_total_h           = 1080
+
+# Posición y tamaño de la ventana de Tibia dentro del desktop virtual.
+# Ajustar tras ejecutar Tibia en el monitor 1 del PC gaming.
+tibia_window_x            = 0
+tibia_window_y            = 0
+tibia_window_w            = 1920
+tibia_window_h            = 1080
+
+# Offset del viewport de juego relativo a la esquina de la ventana de Tibia.
+# El viewport es el área donde corre el mundo 3D (sin barras de menú/sidebar).
+game_viewport_offset_x    = 0
+game_viewport_offset_y    = 0
+game_viewport_w           = 1920
+game_viewport_h           = 1080
+
+[actions]
+# ──────────────────────────────────────────────────────────────────────────────
+# Hotkeys usadas por la FSM. Los nombres deben coincidir con las hotkeys
+# configuradas dentro de Tibia (F1..F12, A..Z, 0..9, Space, Enter, etc.).
+# También se acepta "0xNN" para códigos HID crudos.
+# ──────────────────────────────────────────────────────────────────────────────
+heal_spell            = "F1"      # Spell instantáneo de curación (Exura / Exura Gran / etc.)
+heal_potion           = "F2"      # Poción de curación (Health Potion / Ultimate Health)
+mana_spell            = "F3"      # Poción o spell de mana
+attack_default        = "Space"   # Atacar siguiente criatura (Next Creature en opciones)
+
+# Cooldowns para evitar spam. 30 Hz → 1 tick ≈ 33ms.
+heal_cooldown_ticks   = 10        # ~333ms entre heals
+attack_cooldown_ticks = 30        # ~1s entre ataques
+
+# ── SPELL PRIORITY TABLE (opcional) ──────────────────────────────────────────
+# Si se definen entradas [[spell]], reemplazan el sistema de [actions] para
+# heal/attack. Cada spell tiene prioridad (menor = más importante), condiciones
+# de HP/mana/enemigos, y cooldown individual.
+#
+# Si NO hay entradas [[spell]], el bot usa [actions] como siempre (backward compat).
+#
+# Ejemplo para un knight con Exura Ico (HP<30%), Exura (HP<60%), mana potion
+# (mana<40%), y ataque con PgDn:
+#
+# [[spell]]
+# key         = "F1"
+# kind        = "heal"
+# priority    = 1
+# max_hp      = 0.30          # solo si HP <= 30%
+# min_mana    = 0.10          # requiere al menos 10% mana
+# cooldown_ms = 1000
+#
+# [[spell]]
+# key         = "F2"
+# kind        = "heal"
+# priority    = 2
+# max_hp      = 0.60          # heal preventivo a HP <= 60%
+# cooldown_ms = 2000
+#
+# [[spell]]
+# key         = "F3"
+# kind        = "heal"
+# priority    = 3
+# max_mana    = 0.40          # solo si mana <= 40% (mana potion)
+# cooldown_ms = 1000
+#
+# [[spell]]
+# key         = "PageDown"
+# kind        = "attack"
+# priority    = 1
+# min_enemies = 1             # requiere al menos 1 enemigo
+# cooldown_ms = 2000
+
+[waypoints]
+# ──────────────────────────────────────────────────────────────────────────────
+# Lista de waypoints (secuencia de steps temporales) cargada al arrancar.
+# Ruta relativa al directorio actual o absoluta. Vacío = no cargar nada al inicio;
+# se puede cargar después vía `POST /waypoints/load?path=assets/waypoints/foo.toml`.
+# ──────────────────────────────────────────────────────────────────────────────
+path    = "assets/waypoints/example.toml"
+enabled = false    # cambia a true para ejecutar al arrancar
+
+# Stuck watchdog: el BotLoop pausa waypoints si el iterador no avanza a un
+# step diferente durante más de N ticks consecutivos. Útil para detectar
+# bot atascado en un bucle de combate infinito o bug de lógica.
+# 0 desactiva el watchdog. Default 1800 ticks ≈ 60s a 30 Hz.
+stuck_threshold_ticks = 1800
+
+[cavebot]
+# ──────────────────────────────────────────────────────────────────────────────
+# Cavebot: hunt automation con labels, goto, condiciones y NPC dialogs.
+# Ruta al archivo TOML del script. Vacío = no cargar al inicio;
+# se puede cargar después vía `POST /cavebot/load?path=assets/cavebot/foo.toml`.
+# ──────────────────────────────────────────────────────────────────────────────
+path    = ""
+enabled = false
+# Node tuning (all optional — defaults shown):
+# pixels_per_tile        = 2     # px/tile en minimap (calibrar con /vision/grab/anchors)
+# displacement_tolerance = 4     # Manhattan px para arrival
+# arrived_idle_ticks     = 10    # ticks idle para confirmar parada
+# reclick_idle_ticks     = 60    # ticks idle antes de re-click
+# max_reclicks           = 3     # re-clicks máximo por nodo
+# timeout_ticks          = 900   # timeout duro (30s @ 30fps)
+
+[game_coords]
+# ──────────────────────────────────────────────────────────────────────────────
+# Posicionamiento absoluto por tile-hashing del minimap.
+# Genera el index con: cargo run --release --bin build_map_index -- \
+#   --map-dir "C:/Users/.../Tibia/minimap" --output assets/map_index.bin
+# ──────────────────────────────────────────────────────────────────────────────
+map_index_path   = ""     # ruta al .bin generado. Vacío = deshabilitado.
+# detect_interval = 15    # frames entre detecciones (default 15 = ~500ms)
+
+[scripting]
+# ──────────────────────────────────────────────────────────────────────────────
+# Motor de scripting Lua 5.4. Los .lua del directorio se cargan en orden
+# alfabético al arrancar; se puede recargar vía `POST /scripts/reload`.
+# Ver assets/scripts/example_healer.lua para un ejemplo trabajado.
+# Hooks soportados: on_tick(ctx), on_low_hp(ratio).
+# ──────────────────────────────────────────────────────────────────────────────
+script_dir     = ""                        # vacío = scripting deshabilitado
+tick_budget_ms = 5.0                       # warning si un hook excede esto
+
+[safety]
+# ──────────────────────────────────────────────────────────────────────────────
+# Humanización + anti-detection behavioral (Fase 5).
+#
+# FILOSOFÍA: la arquitectura del bot (hardware HID + NDI pasivo + PC separado)
+# elimina los vectores de detección client-side. Lo que queda son los patterns
+# estadísticos del input: timing perfecto = bot detectable. Este módulo
+# inyecta ruido estadísticamente realista para parecerse a un humano.
+#
+# Los defaults están calibrados para ser seguros. Solo tocalos si entiendes
+# el trade-off entre velocidad de reacción y parecer humano.
+# ──────────────────────────────────────────────────────────────────────────────
+humanize_timing = true                     # master switch — off = timing fijo (detectable)
+
+# ── Cooldowns con jitter gaussiano (ms) ──────────────────────────────────
+# mean ≈ cooldown deseado, std ≈ 25% de mean es razonable.
+heal_cd_mean_ms     = 333.0
+heal_cd_std_ms      = 83.0
+attack_cd_mean_ms   = 1000.0
+attack_cd_std_ms    = 200.0
+
+# ── Pre-send jitter en el Actuator (ms) ─────────────────────────────────
+# Delay añadido antes de enviar cada key_tap a la Pico.
+# Simula el "lag" entre decisión y acción de una persona.
+presend_jitter_mean_ms = 45.0
+presend_jitter_std_ms  = 15.0
+
+# ── Reaction time (ms) ───────────────────────────────────────────────────
+# Delay humano antes de la PRIMERA acción tras detectar un evento nuevo.
+# Reacción a HP crítico es más rápida que a enemigo (más urgente).
+reaction_hp_mean_ms    = 180.0
+reaction_hp_std_ms     = 40.0
+reaction_enemy_mean_ms = 250.0
+reaction_enemy_std_ms  = 60.0
+
+# ── Rate limiting ────────────────────────────────────────────────────────
+# Hard cap de acciones/segundo. Protege contra bugs del FSM o scripts.
+# Un humano típico emite ≤6 acciones/s en combate; 8 es un margen.
+max_actions_per_sec = 8
+
+# ── Variación de acciones ────────────────────────────────────────────────
+# Alterna heal_spell y heal_potion con pesos relativos.
+heal_variation      = true
+heal_spell_weight   = 70
+heal_potion_weight  = 30
+
+# ── Breaks humanos (opt-in) ──────────────────────────────────────────────
+# Scheduler multi-nivel que pausa el bot con intervalos tipo humano.
+# Micro ~5min (30s), Medium ~30min (3min), Long ~3h (30min).
+breaks_enabled = false
+
+# ── Human noise (opt-in) ─────────────────────────────────────────────────
+# Emite teclas "inocuas" ocasionalmente para imitar micro-interacciones.
+# Las keys listadas deben ser hotkeys que ABREN/CIERRAN UI sin efectos
+# en el mundo (ej: stats, inventory). NUNCA spells ni attack keys.
+human_noise_enabled          = false
+human_noise_keys             = []          # e.g. ["F10", "F11"]
+human_noise_interval_mean_s  = 180.0
+human_noise_interval_std_s   = 60.0
+
+# ── Prompt detection (login/death/captcha) ───────────────────────────────
+# Detecta pantallas del juego que requieren intervención humana y pausa
+# el bot inmediatamente. NUNCA intenta auto-responder — eso es detectable.
+prompt_detection_enabled = true
