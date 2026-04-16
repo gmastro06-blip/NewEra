@@ -163,6 +163,40 @@ PING
 
 Reply is `OK\n` or `PONG\n`. Timeout per command: 100 ms with exponential backoff on reconnect.
 
+## Input modes — sendinput vs serial (Arduino HID)
+
+El bridge soporta dos caminos de inyección de input, configurables via `bridge_config.toml`:
+
+```toml
+[input]
+mode = "sendinput"   # Windows SendInput API, sin hardware extra
+# mode = "serial"    # Arduino Leonardo / Pico via USB HID
+```
+
+### Cuándo usar cada uno
+
+| Caso | Modo recomendado | Razón |
+|------|------------------|-------|
+| Setup single-monitor | sendinput | simple, sin hardware |
+| Multi-monitor + Tibia en primary | serial (Arduino) | hardware input indistinguible de mouse físico — inmune a anti-injection hooks; viewport sigue OK en ambos modos, pero algunos widgets del sidebar pueden rechazar SendInput |
+| Multi-monitor + Tibia en secondary | sendinput (con `MOUSEEVENTF_VIRTUALDESK`) | Arduino HID no llega al secondary (ver abajo) |
+
+### Requisito crítico del modo serial: Tibia en primary monitor
+
+El descriptor HID del Arduino (via librería HID-Project `AbsoluteMouse`) solo targetea el **primary monitor** de Windows. Si Tibia está en un monitor secundario, los clicks nunca llegan a la ventana.
+
+Al boot, el bot hace una safety check: si el centro de la ventana de Tibia cae fuera del vscreen reportado por el bridge, pausa con reason `tibia_off_mapped_screen` y un mensaje indicando que hay que mover Tibia al primary. En modo serial el bridge reporta `vscreen = primary monitor` para que el check natural funcione.
+
+**Cómo mover Tibia a primary**:
+1. Windows → Configuración → Sistema → Pantalla → seleccionar el monitor donde está Tibia → "Convertir en pantalla principal", o
+2. Arrastrar la ventana de Tibia al monitor que ya es primary.
+
+### HID descriptor signed: firmware offset
+
+El firmware `arduino/tibia_hid_bridge/tibia_hid_bridge.ino` aplica offset `x*2 - 32768` en el handler `MOUSE_MOVE` para mapear el rango unsigned `0..32767` del protocolo del bot al rango **signed int16 (`-32768..32767`)** que espera el descriptor HID. Sin este offset, solo cubría el cuadrante inferior-derecho del monitor.
+
+Ver session note `Obsidian/tibia-bot/sessions/2026-04-16-V7-unblocked.md` para el diagnóstico completo.
+
 ## HTTP Diagnostics (port 8080)
 
 ```
