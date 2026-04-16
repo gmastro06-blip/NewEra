@@ -53,7 +53,7 @@ try {
     Write-Host "      Bot OK: $($health | ConvertTo-Json -Compress)"
 } catch {
     Write-Host "      ERROR: el bot no responde en $BotUrl/health" -ForegroundColor Red
-    Write-Host "      Start the bot first: .\target\release\tibia_bot.exe bot\config.toml assets"
+    Write-Host "      Start the bot first: .\target\release\NewEra.exe bot\config.toml assets"
     exit 1
 }
 
@@ -115,8 +115,8 @@ if (Test-Path $OldTemplate) {
     Write-Host ""
     Write-Host "Siguientes pasos:" -ForegroundColor Cyan
     Write-Host "  1. Reiniciar el bot (para re-cargar el template):"
-    Write-Host "       taskkill /F /IM tibia_bot.exe"
-    Write-Host "       .\target\release\tibia_bot.exe bot\config.toml assets"
+    Write-Host "       taskkill /F /IM NewEra.exe"
+    Write-Host "       .\target\release\NewEra.exe bot\config.toml assets"
     Write-Host "  2. Verificar el score del anchor:"
     Write-Host "       curl $BotUrl/vision/perception | jq .anchor"
     Write-Host "     Esperado: score > 0.30, best_pos cerca de (1700, 0)"

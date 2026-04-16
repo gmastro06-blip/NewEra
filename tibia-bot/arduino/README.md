@@ -61,7 +61,7 @@ poll_interval_ms = 100
 
 ```powershell
 cd C:/Users/gmast/Documents/GitHub/NewEra/tibia-bot
-./target/release/pico_bridge.exe bridge/bridge_config.toml
+./target/release/NewEra-bridge.exe bridge/bridge_config.toml
 ```
 
 Si todo está OK, verás en el log:

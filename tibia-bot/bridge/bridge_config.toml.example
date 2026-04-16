@@ -1,5 +1,5 @@
 # bridge_config.toml — Copiar a bridge_config.toml y editar para tu hardware.
-# Colocar en el mismo directorio que pico_bridge.exe antes de ejecutarlo.
+# Colocar en el mismo directorio que NewEra-bridge.exe antes de ejecutarlo.
 
 # ── Modo de input ──────────────────────────────────────────────────────────
 # El bridge soporta 2 backends de actuación HID:

@@ -58,10 +58,10 @@ Use case: sesión de 30-120 min con modo "assist healer" (sin cavebot) o con cav
 cd C:\Users\gmast\Documents\GitHub\NewEra\tibia-bot
 
 # 1. Bridge (console #1)
-.\target\release\pico_bridge.exe bridge\bridge_config.toml
+.\target\release\NewEra-bridge.exe bridge\bridge_config.toml
 
 # 2. Bot (console #2)
-.\target\release\tibia_bot.exe bot\config.toml assets
+.\target\release\NewEra.exe bot\config.toml assets
 
 # 3. Monitoring (opcional, otro console)
 cd monitoring ; docker-compose up -d
@@ -133,7 +133,7 @@ curl http://localhost:8080/scripts/status | jq '.last_errors'
 
 **Escenario 4: Bridge desconectado**
 Síntoma: logs muestran `PicoLink: error de conexión`
-1. Verificar que `pico_bridge.exe` sigue corriendo
+1. Verificar que `NewEra-bridge.exe` sigue corriendo
 2. Si cayó: relanzarlo. El bot reconnectará automáticamente (backoff exponencial)
 3. Si COM port cambió (post flash de Arduino, etc): actualizar `bridge/bridge_config.toml`
    y relanzar bridge
@@ -151,8 +151,8 @@ curl -X POST http://localhost:8080/recording/stop
 .\scripts\postmortem.ps1 sessions\<latest>.jsonl
 
 # 4. Kill processes
-taskkill /F /IM tibia_bot.exe
-taskkill /F /IM pico_bridge.exe
+taskkill /F /IM NewEra.exe
+taskkill /F /IM NewEra-bridge.exe
 
 # O con script:
 .\scripts\stop_session.ps1
@@ -186,10 +186,10 @@ Si solo querés validar el stack rápidamente sin pasar por todo el runbook:
 cargo build --release && cargo test --release
 
 # 2. Bridge arriba (PC gaming) — Arduino Leonardo en COM8
-.\target\release\pico_bridge.exe bridge\bridge_config.toml
+.\target\release\NewEra-bridge.exe bridge\bridge_config.toml
 
 # 3. Bot arriba (PC bot)
-./target/release/tibia_bot bot/config.toml assets
+./target/release/NewEra bot/config.toml assets
 
 # 4. Health check
 curl -s http://localhost:8080/health | jq .
@@ -289,7 +289,7 @@ window_title = "Tibia"
 
 ```powershell
 # Windows
-.\target\release\pico_bridge.exe bridge\bridge_config.toml
+.\target\release\NewEra-bridge.exe bridge\bridge_config.toml
 ```
 
 **Pass**: Log muestra:
@@ -305,7 +305,7 @@ window_title = "Tibia"
 
 ```bash
 cd tibia-bot
-./target/release/tibia_bot bot/config.toml assets
+./target/release/NewEra bot/config.toml assets
 ```
 
 **Pass**: Log muestra:
@@ -527,7 +527,7 @@ Busca slots con diferentes stack counts hasta tener los 10:
 ```bash
 # Parar bot (Ctrl+C en su terminal)
 # Re-arrancar
-./target/release/tibia_bot bot/config.toml assets
+./target/release/NewEra bot/config.toml assets
 
 # Verificar que los templates se cargan
 grep "InventoryReader" logs.txt    # o consola del bot
@@ -820,8 +820,8 @@ Durante operación 2h/día, si hay que abortar una sesión inmediatamente:
 curl -X POST http://localhost:8080/pause
 
 # Option 2: kill proceso (si HTTP no responde)
-taskkill /F /IM tibia_bot.exe
-taskkill /F /IM pico_bridge.exe
+taskkill /F /IM NewEra.exe
+taskkill /F /IM NewEra-bridge.exe
 
 # Option 3: alt-tab fuera de Tibia (el bot detecta focus:tibia_not_foreground
 # y pausa automáticamente dentro de 100ms). Esto NO mata el bot, solo lo frena

@@ -26,10 +26,10 @@ All code is Rust in a Cargo workspace with two members: `bot/` and `bridge/`.
 cargo build --release
 
 # Run the bot (from tibia-bot/)
-cd tibia-bot && ./target/release/tibia_bot bot/config.toml assets
+cd tibia-bot && ./target/release/NewEra bot/config.toml assets
 
 # Run the bridge (on Windows gaming PC)
-./target/release/pico_bridge bridge/bridge_config.toml
+./target/release/NewEra-bridge bridge/bridge_config.toml
 
 # Lint / format
 cargo clippy

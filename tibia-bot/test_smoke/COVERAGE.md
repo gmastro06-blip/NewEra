@@ -100,7 +100,7 @@ Tras la infra de test añadida en esta iteración, la lista de verificaciones "h
 ### 3.1 Pico 2 + Bridge — conectividad física
 | # | Verificación | Estimación |
 |---|---|---|
-| 1 | Pico 2 flasheado con firmware HID correcto, COM port abierto, `pico_bridge.exe` arranca | 10 min primera vez |
+| 1 | Pico 2 flasheado con firmware HID correcto, COM port abierto, `NewEra-bridge.exe` arranca | 10 min primera vez |
 | 2 | `KEY_TAP 0x3A` → Pico → Windows recibe F1 físico (verificar con cualquier app que muestre keystrokes) | 5 min |
 | 3 | `MOUSE_MOVE` + `MOUSE_CLICK` llegan al desktop dual-monitor 3840×1080 con coordenadas correctas | 10 min |
 

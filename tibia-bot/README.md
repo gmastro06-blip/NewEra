@@ -8,7 +8,7 @@ PC GAMING (Windows 11)                        PC PROCESADOR (Linux x86_64)
 │  Tibia                       │              │  tibia-bot (Rust)            │
 │  OBS + DistroAV ─────NDI LAN─┼─────────────▶│    sense/ndi_receiver        │
 │                              │              │    core/loop (30 Hz)         │
-│  pico_bridge.exe             │              │    act/pico_link ────────────┼──┐
+│  NewEra-bridge.exe             │              │    act/pico_link ────────────┼──┐
 │    TCP :9000 ◀───────────────┼─────────────┤                              │  │
 │    ↕ serial CDC              │              │  HTTP :8080                  │  │
 │                              │              └──────────────────────────────┘  │
@@ -94,7 +94,7 @@ rustup toolchain install stable
 cd tibia-bot\bridge
 cargo build --release
 ```
-El binario quedará en `target\release\pico_bridge.exe`.
+El binario quedará en `target\release\NewEra-bridge.exe`.
 
 ### B3. Configurar bridge_config.toml
 
@@ -117,7 +117,7 @@ listen_addr = "0.0.0.0:9000"
 
 ```cmd
 cd tibia-bot\bridge
-target\release\pico_bridge.exe
+target\release\NewEra-bridge.exe
 ```
 
 ### B5. Verificar log de arranque
@@ -181,7 +181,7 @@ Anotar el número `COMx`.
 port = "COM7"   # <- el número que apareció en el paso anterior
 ```
 
-Reiniciar `pico_bridge.exe`.
+Reiniciar `NewEra-bridge.exe`.
 
 ### C9. Test manual desde otro PC
 
