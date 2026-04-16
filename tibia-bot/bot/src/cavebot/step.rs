@@ -140,6 +140,10 @@ pub enum StepKind {
     // ── Depot / trading ────────────────────────────────────────────────
     /// Right-click en depot chest, esperar menú, click en "Stow all".
     /// Usado para depositar contenido del backpack tras una hunt session.
+    ///
+    /// **NOTA 2026-04-16**: En Tibia 12 el workflow moderno es via "Stash"
+    /// (Supply Stash del Locker), NO el Depot Chest directo. Este step queda
+    /// como legacy para servers antiguos. Para Tibia oficial usar `StowBag`.
     Deposit {
         chest_vx:     i32,
         chest_vy:     i32,
@@ -147,6 +151,38 @@ pub enum StepKind {
         stow_vy:      i32,
         menu_wait_ms: u64,  // tiempo para que aparezca el menu
         process_ms:   u64,  // tiempo tras click para procesar stow
+    },
+    /// Right-click en el icono del bag (en la UI inventory) → click en
+    /// "Stow container's content" del menu contextual. Deposita todos los
+    /// items stackables del bag al Supply Stash del depot.
+    ///
+    /// **Prerequisito**: el char debe estar al lado del depot locker
+    /// (proximity) para que la opción "Stow" aparezca en el menu.
+    ///
+    /// **Comportamiento**:
+    /// - Items stackables (gold, potions, runes, loot) → Stash (10k max)
+    /// - Items non-stackables (gear con imbue, rares) → quedan en el bag
+    ///
+    /// **Calibración**: capturar frame con el bag abierto, medir en GIMP
+    /// `bag_vx/vy` (icono del bag arriba-derecha de la UI) y `menu_offset_y`
+    /// (distancia del menu item "Stow container's content" desde el click
+    /// inicial — típicamente 60-80 px).
+    ///
+    /// Referencias: [TibiaWiki Supply Stash](https://tibia.fandom.com/wiki/Your_Supply_Stash),
+    /// [Depot Locker](https://tibia.fandom.com/wiki/Locker_(Depot)).
+    StowBag {
+        /// X del icono del bag en la UI inventory (absolute viewport coord).
+        bag_vx:            i32,
+        /// Y del icono del bag.
+        bag_vy:            i32,
+        /// Offset vertical desde el click inicial hasta la opción "Stow
+        /// container's content" del menu contextual. Típicamente 60-80 px.
+        menu_offset_y:     i32,
+        /// Tiempo de espera para que el menu contextual se renderice.
+        menu_wait_ms:      u64,
+        /// Tiempo para que el Stash procese los items (puede ser largo si
+        /// hay muchos stackables).
+        process_ms:        u64,
     },
     /// Comprar N unidades de un item en la trade window abierta.
     /// Emite: left-click en item → wait → N left-clicks en confirm.

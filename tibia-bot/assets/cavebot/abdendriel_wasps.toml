@@ -22,28 +22,37 @@
 # CALIBRACIÓN PRE-RUN (obligatoria antes del primer hunt)
 # ═══════════════════════════════════════════════════════════════════════
 #
-# Hay 4 coords de click a calibrar (marcadas "CALIBRAR:" en el archivo):
-#   - (chest_vx, chest_vy): centro del depot chest en el frame
-#   - (stow_vx,  stow_vy):  opción "Stow all" en el context menu del chest
-#   - (item_vx,  item_vy):  mana potion en la trade window
+# Hay 3 coords de click a calibrar (marcadas "CALIBRAR:" en el archivo):
+#   - (bag_vx, bag_vy): icono del bag abierto en inventory (right-click aquí
+#     para abrir context menu con "Stow container's content")
+#   - (item_vx, item_vy): mana potion en la trade window
 #   - (confirm_vx, confirm_vy): botón confirm/buy en la trade window
 #
-# Procedimiento (3-5 min por par):
+# NOTA 2026-04-16: se reemplazó el viejo step "deposit" (right-click chest
+# → "Stow all") por "stow_bag" que usa el workflow moderno del Supply Stash
+# (right-click bag icon → "Stow container's content"). Referencias:
+#   https://tibia.fandom.com/wiki/Your_Supply_Stash
+#   https://tibia.fandom.com/wiki/Locker_(Depot)
+#
+# Procedimiento calibración (3-5 min por par):
 #
 #   1. Arrancar bot + bridge + tener el char en el juego
-#   2. Caminar char a 1-sqm del depot chest en Ab'dendriel
-#   3. curl http://localhost:8080/test/grab -o depot_frame.png
-#   4. Abrir depot_frame.png en GIMP (u otro viewer con cursor crosshair)
-#   5. Medir coord del chest: hover el cursor sobre el centro del chest, leer
-#      "x: 1XXX  y: YYY" en la barra inferior de GIMP. Anotar chest_vx/vy.
-#   6. Right-click manualmente el chest en el cliente para abrir el context menu
-#   7. curl http://localhost:8080/test/grab -o depot_menu_frame.png
-#   8. Medir coord de "Stow all" en el menú. Anotar stow_vx/vy.
-#   9. Repetir para el NPC: caminar al NPC, trigger trade manualmente, capture
-#      frames, medir item_vx/vy y confirm_vx/vy.
-#  10. Editar los 4 pares de coords en este archivo (líneas con "CALIBRAR:")
-#  11. Validar: ./target/release/lint_cavebot.exe assets/cavebot/abdendriel_wasps.toml
-#      Esperado: "0 errors, 0 warnings"
+#   2. Caminar char a 1-sqm del depot locker
+#   3. Abrir el bag con loot (ya debería estar abierto en la UI)
+#   4. curl http://localhost:8080/test/grab -o depot_frame.png
+#   5. Abrir depot_frame.png en GIMP (u otro viewer con cursor crosshair)
+#   6. Medir coord del icono del bag: hover el cursor sobre el icono
+#      (top-right UI, ~1598, 128 default). Leer "x: YYY y: ZZZ" en GIMP.
+#      Anotar bag_vx/vy.
+#   7. Right-click manualmente en el icono del bag para abrir menu context.
+#   8. curl http://localhost:8080/test/grab -o bag_menu_frame.png
+#   9. Medir la Y del item "Stow container's content" en el menu.
+#      menu_offset_y = menu_item_y - bag_vy (típicamente 60-80 px).
+#  10. Repetir para el NPC: caminar al NPC, trigger trade manualmente,
+#      capture frames, medir item_vx/vy y confirm_vx/vy.
+#  11. Editar los 3 pares de coords en este archivo (líneas con "CALIBRAR:")
+#  12. Validar: ./target/release/lint_cavebot.exe assets/cavebot/abdendriel_wasps.toml
+#      Esperado: "0 errors, 0 warnings" (warnings de orphan labels OK).
 #
 # Pro-tip: medir con GIMP garantiza precisión píxel-a-píxel. Evitar el
 # "ojímetro". Los clicks del bot son absolutos, un error de 10 px puede
@@ -85,15 +94,18 @@ y = 31686
 z = 6
 max_wait_ms = 30000
 
-# Deposit: right-click depot chest → "Stow all"
+# Stow: right-click en el icono del bag → "Stow container's content"
+# Modern Tibia 12: los items stackables van al Supply Stash automáticamente.
+# Items non-stackables (gear con imbue, rares) quedan en el bag — OK para
+# sesión supervisada, el operador los deposita manualmente entre sesiones.
+# Ver TibiaWiki: https://tibia.fandom.com/wiki/Your_Supply_Stash
 [[step]]
-kind = "deposit"
-chest_vx     = 1850   # CALIBRAR: centro del depot chest visible en el frame
-chest_vy     = 300
-stow_vx      = 1880   # CALIBRAR: opción "Stow all" del context menu
-stow_vy      = 340
-menu_wait_ms = 300
-process_ms   = 800
+kind = "stow_bag"
+bag_vx        = 1598   # CALIBRAR: icono del bag abierto en inventory (top-right UI)
+bag_vy        = 128
+menu_offset_y = 70     # offset del item "Stow container's content" desde el click
+menu_wait_ms  = 300
+process_ms    = 2000
 
 # Walk to NPC shopkeeper (intermediate nodes para evitar stuck en pillars)
 [[step]]

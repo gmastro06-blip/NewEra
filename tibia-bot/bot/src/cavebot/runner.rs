@@ -215,6 +215,11 @@ pub struct Cavebot {
     buy_clicks_done: u32,
     /// Tick del último click de confirm (para spacing).
     buy_last_click_tick: u64,
+    // ── Estado de StowBag step ───────────────────────────────────────
+    /// 0=right-click bag, 1=wait menu, 2=left-click "Stow container's content", 3=wait process
+    stow_bag_phase: u8,
+    /// Tick de entrada a la fase actual de stow_bag.
+    stow_bag_phase_start: u64,
 }
 
 impl Cavebot {
@@ -256,6 +261,8 @@ impl Cavebot {
             tuning,
             deposit_phase: 0,
             deposit_phase_start: 0,
+            stow_bag_phase: 0,
+            stow_bag_phase_start: 0,
             buy_phase: 0,
             buy_clicks_done: 0,
             buy_last_click_tick: 0,
@@ -512,6 +519,57 @@ impl Cavebot {
                         _ => {
                             tracing::warn!("Deposit[{}] invalid phase {}, resetting", idx, self.deposit_phase);
                             self.deposit_phase = 0;
+                            self.advance(ctx.tick);
+                            continue;
+                        }
+                    }
+                }
+
+                // ── StowBag (right-click bag → wait menu → click Stow content → wait process)
+                // Modern Tibia 12: deposita stackables del bag al Supply Stash.
+                // Referencias: TibiaWiki Supply Stash / Locker (Depot).
+                StepKind::StowBag { bag_vx, bag_vy, menu_offset_y, menu_wait_ms, process_ms } => {
+                    let menu_ticks = ms_to_ticks(menu_wait_ms, self.fps);
+                    let process_ticks = ms_to_ticks(process_ms, self.fps);
+                    match self.stow_bag_phase {
+                        0 => {
+                            // Phase 0: right-click en el icono del bag.
+                            tracing::info!(
+                                "StowBag[{}] phase 0: right-click bag at ({}, {}). Si posición incorrecta, editar: bag_vx={}, bag_vy={}",
+                                idx, bag_vx, bag_vy, bag_vx, bag_vy
+                            );
+                            self.stow_bag_phase = 1;
+                            self.stow_bag_phase_start = ctx.tick;
+                            return CavebotAction::RightClick { vx: bag_vx, vy: bag_vy };
+                        }
+                        1 => {
+                            // Phase 1: esperar a que aparezca el context menu.
+                            if ctx.tick.saturating_sub(self.stow_bag_phase_start) >= menu_ticks {
+                                let menu_vx = bag_vx;
+                                let menu_vy = bag_vy + menu_offset_y;
+                                tracing::info!(
+                                    "StowBag[{}] phase 2: click 'Stow container's content' at ({}, {}). Si posición incorrecta, editar: menu_offset_y={}",
+                                    idx, menu_vx, menu_vy, menu_offset_y
+                                );
+                                self.stow_bag_phase = 2;
+                                self.stow_bag_phase_start = ctx.tick;
+                                return CavebotAction::Click { vx: menu_vx, vy: menu_vy };
+                            }
+                            return CavebotAction::Idle;
+                        }
+                        2 => {
+                            // Phase 2: esperar a que el Stash procese los items.
+                            if ctx.tick.saturating_sub(self.stow_bag_phase_start) >= process_ticks {
+                                tracing::info!("StowBag[{}] complete, advancing", idx);
+                                self.stow_bag_phase = 0;
+                                self.advance(ctx.tick);
+                                continue;
+                            }
+                            return CavebotAction::Idle;
+                        }
+                        _ => {
+                            tracing::warn!("StowBag[{}] invalid phase {}, resetting", idx, self.stow_bag_phase);
+                            self.stow_bag_phase = 0;
                             self.advance(ctx.tick);
                             continue;
                         }
