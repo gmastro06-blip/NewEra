@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::act::{pico_link, Actuator, PresendJitter};
@@ -92,7 +92,54 @@ async fn main() -> Result<()> {
     sense::ndi_receiver::spawn(config.ndi.clone(), Arc::clone(&frame_buffer));
     info!("NDI receiver lanzado, buscando fuente '{}'...", config.ndi.source_name);
 
-    // ── 6. Actuator ────────────────────────────────────────────────────────
+    // ── 6. Coords auto-detect via bridge (WinAPI) ──────────────────────────
+    // Espera a que pico_link establezca conexión + query la geometría real
+    // del virtual desktop y ventana Tibia. Elimina la necesidad de calibrar
+    // manual `desktop_total_w/h` y `tibia_window_x/y` en setups multi-monitor
+    // (el config es solo un fallback por si el bridge no soporta GET_GEOMETRY
+    // o no encuentra la ventana).
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut coords_cfg = config.coords.clone();
+    match pico_handle.query_geometry("Tibia").await {
+        Some(geom) => {
+            info!(
+                "Geometry auto-detect: vscreen=origin({},{}) {}x{}, tibia={:?}",
+                geom.vscreen_x, geom.vscreen_y, geom.vscreen_w, geom.vscreen_h, geom.tibia
+            );
+            // Aplicar virtual screen real (puede tener origen negativo si
+            // hay monitores a la izquierda/arriba del primario).
+            coords_cfg.vscreen_origin_x = geom.vscreen_x;
+            coords_cfg.vscreen_origin_y = geom.vscreen_y;
+            coords_cfg.desktop_total_w = geom.vscreen_w.max(1) as u32;
+            coords_cfg.desktop_total_h = geom.vscreen_h.max(1) as u32;
+            if let Some(t) = geom.tibia {
+                coords_cfg.tibia_window_x = t.x;
+                coords_cfg.tibia_window_y = t.y;
+                coords_cfg.tibia_window_w = t.w.max(1) as u32;
+                coords_cfg.tibia_window_h = t.h.max(1) as u32;
+                info!(
+                    "Auto-config: tibia_window=({},{},{}x{}), vscreen=origin({},{}) {}x{}",
+                    t.x, t.y, t.w, t.h,
+                    geom.vscreen_x, geom.vscreen_y, geom.vscreen_w, geom.vscreen_h
+                );
+            } else {
+                warn!(
+                    "Geometry auto-detect: ventana Tibia no encontrada. \
+                     Usando config manual tibia_window_*={},{},{}x{}",
+                    coords_cfg.tibia_window_x, coords_cfg.tibia_window_y,
+                    coords_cfg.tibia_window_w, coords_cfg.tibia_window_h
+                );
+            }
+        }
+        None => {
+            warn!(
+                "Geometry auto-detect falló (bridge no disponible o \
+                 protocolo antiguo). Usando config manual."
+            );
+        }
+    }
+
+    // ── 7. Actuator ────────────────────────────────────────────────────────
     // El Actuator toma ownership del PicoHandle; cualquier código que
     // necesite enviar comandos debe pasar por el Actuator compartido.
     // Si safety está activo, inyectamos pre-send jitter gaussiano.
@@ -105,9 +152,9 @@ async fn main() -> Result<()> {
             "Safety: pre-send jitter ON ({:.0}±{:.0}ms)",
             jitter.mean_ms, jitter.std_ms
         );
-        Arc::new(Actuator::with_jitter(pico_handle, &config.coords, jitter))
+        Arc::new(Actuator::with_jitter(pico_handle, &coords_cfg, jitter))
     } else {
-        Arc::new(Actuator::new(pico_handle, &config.coords))
+        Arc::new(Actuator::new(pico_handle, &coords_cfg))
     };
 
     // ── 7. Vision (carga calibration.toml y templates desde assets/) ───────

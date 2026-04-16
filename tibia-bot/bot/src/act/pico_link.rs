@@ -73,6 +73,88 @@ impl PicoHandle {
     pub fn is_focus_lost(&self) -> bool {
         self.focus_lost.load(Ordering::Relaxed)
     }
+
+    /// Pide al bridge (via WinAPI) la geometría actual del virtual desktop y
+    /// de la ventana Tibia. Retorna `None` si no hay respuesta, timeout, o
+    /// parsing falló. Debe llamarse al boot del bot para auto-configurar
+    /// las coords sin calibración manual.
+    ///
+    /// Formato de respuesta esperado:
+    ///   "GEOMETRY <vx> <vy> <vw> <vh> <tx> <ty> <tw> <th>\n"
+    /// O en caso de error del window lookup:
+    ///   "GEOMETRY <vx> <vy> <vw> <vh> ERR <reason>\n"
+    pub async fn query_geometry(&self, title_pattern: &str) -> Option<Geometry> {
+        let cmd = if title_pattern.is_empty() {
+            "GET_GEOMETRY".to_string()
+        } else {
+            format!("GET_GEOMETRY {}", title_pattern)
+        };
+        let reply = match self.send(cmd).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("PicoLink: query_geometry send failed: {}", e);
+                return None;
+            }
+        };
+        if !reply.ok {
+            warn!("PicoLink: query_geometry reply not ok: {:?}", reply.body);
+            return None;
+        }
+        Geometry::parse(&reply.body)
+    }
+}
+
+/// Geometría reportada por el bridge (via WinAPI).
+///
+/// - `vscreen_*`: virtual desktop bounding box (puede tener origen negativo
+///   si hay monitores a la izquierda/arriba del primario).
+/// - `tibia_*`: RECT de la ventana de Tibia, o `None` si el bridge no pudo
+///   encontrarla (window closed, title mismatch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Geometry {
+    pub vscreen_x: i32,
+    pub vscreen_y: i32,
+    pub vscreen_w: i32,
+    pub vscreen_h: i32,
+    pub tibia: Option<TibiaRect>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TibiaRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl Geometry {
+    /// Parsea "GEOMETRY vx vy vw vh tx ty tw th" o
+    /// "GEOMETRY vx vy vw vh ERR <reason>".
+    fn parse(body: &str) -> Option<Self> {
+        let body = body.trim();
+        let rest = body.strip_prefix("GEOMETRY")?.trim();
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() < 4 {
+            return None;
+        }
+        let vscreen_x: i32 = parts[0].parse().ok()?;
+        let vscreen_y: i32 = parts[1].parse().ok()?;
+        let vscreen_w: i32 = parts[2].parse().ok()?;
+        let vscreen_h: i32 = parts[3].parse().ok()?;
+
+        let tibia = if parts.len() >= 8 && parts[4] != "ERR" {
+            Some(TibiaRect {
+                x: parts[4].parse().ok()?,
+                y: parts[5].parse().ok()?,
+                w: parts[6].parse().ok()?,
+                h: parts[7].parse().ok()?,
+            })
+        } else {
+            None // bridge returned ERR or no RECT
+        };
+
+        Some(Geometry { vscreen_x, vscreen_y, vscreen_w, vscreen_h, tibia })
+    }
 }
 
 /// Lanza la task tokio de PicoLink y retorna un handle para enviar comandos.
@@ -521,5 +603,66 @@ mod tests {
         assert!(!handle.is_focus_lost(),
             "focus_lost debe ser false antes del primer heartbeat");
         // Los otros escenarios de heartbeat se validan manualmente en vivo.
+    }
+
+    // ── Geometry::parse tests ─────────────────────────────────────────────
+
+    #[test]
+    fn geometry_parse_full_response() {
+        // Formato completo: "GEOMETRY vx vy vw vh tx ty tw th"
+        let body = "GEOMETRY 0 0 3840 1080 0 0 1920 1080";
+        let g = Geometry::parse(body).expect("parse ok");
+        assert_eq!(g.vscreen_x, 0);
+        assert_eq!(g.vscreen_y, 0);
+        assert_eq!(g.vscreen_w, 3840);
+        assert_eq!(g.vscreen_h, 1080);
+        let t = g.tibia.expect("tibia present");
+        assert_eq!((t.x, t.y, t.w, t.h), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn geometry_parse_negative_vscreen_origin() {
+        // Setup real usuario session 2026-04-16: monitor 2 a la izquierda.
+        let body = "GEOMETRY -1920 0 3840 1080 0 0 1920 1080";
+        let g = Geometry::parse(body).expect("parse ok");
+        assert_eq!(g.vscreen_x, -1920);
+        assert_eq!(g.vscreen_y, 0);
+        assert_eq!(g.vscreen_w, 3840);
+    }
+
+    #[test]
+    fn geometry_parse_err_branch_no_tibia() {
+        // Bridge no encontró la ventana Tibia.
+        let body = "GEOMETRY 0 0 3840 1080 ERR window_not_found";
+        let g = Geometry::parse(body).expect("parse ok even with err");
+        assert_eq!(g.vscreen_w, 3840);
+        assert!(g.tibia.is_none());
+    }
+
+    #[test]
+    fn geometry_parse_with_trailing_newline() {
+        // Bridge termina con \n; parse debe tolerarlo.
+        let body = "GEOMETRY 0 0 1920 1080 10 20 1900 1060\n";
+        let g = Geometry::parse(body).expect("parse ok");
+        let t = g.tibia.unwrap();
+        assert_eq!((t.x, t.y, t.w, t.h), (10, 20, 1900, 1060));
+    }
+
+    #[test]
+    fn geometry_parse_invalid_prefix_returns_none() {
+        assert!(Geometry::parse("PONG").is_none());
+        assert!(Geometry::parse("").is_none());
+        assert!(Geometry::parse("OK").is_none());
+    }
+
+    #[test]
+    fn geometry_parse_truncated_returns_none() {
+        // Muy pocos campos — no parseable.
+        assert!(Geometry::parse("GEOMETRY 0 0 3840").is_none());
+    }
+
+    #[test]
+    fn geometry_parse_non_numeric_fields_returns_none() {
+        assert!(Geometry::parse("GEOMETRY abc def ghi jkl").is_none());
     }
 }

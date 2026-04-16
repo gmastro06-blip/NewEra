@@ -85,8 +85,16 @@ impl Default for LoopConfig {
 /// Geometría del entorno de escritorio del PC gaming.
 /// Necesaria para convertir coords del viewport a coords HID absolutas.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 #[allow(dead_code)] // extension point: tibia_window_w/h
 pub struct CoordsConfig {
+    /// Origen X del virtual desktop. Puede ser NEGATIVO si hay monitores
+    /// a la izquierda del primario. Default 0 (backward compat).
+    /// Auto-configurado desde el bridge via GET_GEOMETRY al boot.
+    pub vscreen_origin_x:       i32,
+    /// Origen Y del virtual desktop. Puede ser NEGATIVO si hay monitores
+    /// arriba del primario. Default 0.
+    pub vscreen_origin_y:       i32,
     pub desktop_total_w:        u32,
     pub desktop_total_h:        u32,
     pub tibia_window_x:         i32,
@@ -97,6 +105,25 @@ pub struct CoordsConfig {
     pub game_viewport_offset_y: i32,
     pub game_viewport_w:        u32,
     pub game_viewport_h:        u32,
+}
+
+impl Default for CoordsConfig {
+    fn default() -> Self {
+        Self {
+            vscreen_origin_x:       0,
+            vscreen_origin_y:       0,
+            desktop_total_w:        1920,
+            desktop_total_h:        1080,
+            tibia_window_x:         0,
+            tibia_window_y:         0,
+            tibia_window_w:         1920,
+            tibia_window_h:         1080,
+            game_viewport_offset_x: 0,
+            game_viewport_offset_y: 0,
+            game_viewport_w:        1920,
+            game_viewport_h:        1080,
+        }
+    }
 }
 
 /// Hotkeys configurables para las acciones del bot.

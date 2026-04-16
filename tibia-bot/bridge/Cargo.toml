@@ -36,10 +36,11 @@ tracing-subscriber = { workspace = true }
 rdev               = "0.5"
 chrono             = "0.4"
 
-# ── Focus detection (Windows only) ──────────────────────────────
+# ── Focus detection + geometry query (Windows only) ──────────────
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",         # MonitorFromWindow for multi-display
 ] }

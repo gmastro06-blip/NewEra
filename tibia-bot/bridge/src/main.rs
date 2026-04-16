@@ -152,6 +152,90 @@ fn check_tibia_focused(_title_pattern: &str) -> bool {
     true // Non-Windows: siempre asume foco (no-op)
 }
 
+// ── Geometry query (WinAPI) ──────────────────────────────────────────────────
+//
+// Responde con las coords del virtual screen + la posición actual de la
+// ventana de Tibia. Formato ASCII línea:
+//
+//   "GEOMETRY <vscreen_x> <vscreen_y> <vscreen_w> <vscreen_h> \
+//             <tibia_x> <tibia_y> <tibia_w> <tibia_h>\n"
+//
+// Donde vscreen_x/y pueden ser NEGATIVOS (si hay monitores a la izquierda/
+// arriba del primario). El bot usa estos valores para auto-configurar el
+// mapeo viewport → HID absoluto sin necesidad de calibración manual.
+//
+// Si Tibia no se encuentra (ventana cerrada, título no matches), retorna:
+//   "GEOMETRY <vx> <vy> <vw> <vh> ERR window_not_found\n"
+
+#[cfg(windows)]
+fn query_geometry(title_pattern: &str) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetSystemMetrics, GetWindowRect, GetWindowTextW, IsWindowVisible,
+        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+
+    unsafe {
+        // Virtual screen bbox: puede tener origen negativo si hay monitores
+        // a la izquierda/arriba del primario.
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        // Buscar HWND por título conteniendo el pattern via EnumWindows
+        // (FindWindow solo matchea exact title; necesitamos "contains").
+        struct SearchCtx {
+            pattern: String,
+            found:   Option<HWND>,
+        }
+        unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let ctx = &mut *(lparam.0 as *mut SearchCtx);
+            if !IsWindowVisible(hwnd).as_bool() {
+                return BOOL(1); // continue
+            }
+            let mut buf = [0u16; 512];
+            let len = GetWindowTextW(hwnd, &mut buf);
+            if len > 0 {
+                let title = String::from_utf16_lossy(&buf[..len as usize]);
+                if title.contains(&ctx.pattern) {
+                    ctx.found = Some(hwnd);
+                    return BOOL(0); // stop
+                }
+            }
+            BOOL(1)
+        }
+
+        let mut ctx = SearchCtx { pattern: title_pattern.to_string(), found: None };
+        let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut _ as isize));
+
+        match ctx.found {
+            Some(hwnd) => {
+                let mut rect = RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok() {
+                    let tx = rect.left;
+                    let ty = rect.top;
+                    let tw = rect.right - rect.left;
+                    let th = rect.bottom - rect.top;
+                    format!(
+                        "GEOMETRY {} {} {} {} {} {} {} {}\n",
+                        vx, vy, vw, vh, tx, ty, tw, th
+                    )
+                } else {
+                    format!("GEOMETRY {} {} {} {} ERR getwindowrect_failed\n", vx, vy, vw, vh)
+                }
+            }
+            None => format!("GEOMETRY {} {} {} {} ERR window_not_found\n", vx, vy, vw, vh),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn query_geometry(_title_pattern: &str) -> String {
+    // Non-Windows: retornar valores dummy para tests/CI.
+    "GEOMETRY 0 0 1920 1080 0 0 1920 1080\n".to_string()
+}
+
 async fn focus_poll_task(
     pattern: String,
     interval_ms: u64,
@@ -380,10 +464,27 @@ fn is_passthrough_command(line: &[u8]) -> bool {
     line.starts_with(b"PING") || line.starts_with(b"RESET")
 }
 
+/// Documenta el protocolo ASCII del bridge TCP (puerto 9000).
+///
+/// Comandos locales (manejados por el bridge, no llegan al serial/sendinput):
+///   FOCUS_CHECK       → "FOCUSED\n" o "NOFOCUS\n" según estado del FocusGate
+///   GET_GEOMETRY      → "GEOMETRY vx vy vw vh tx ty tw th\n" via WinAPI
+///   GET_GEOMETRY <t>  → ... usando pattern `<t>` en lugar de "Tibia"
+///
+/// Comandos passthrough (al serial/Arduino):
+///   PING              → "PONG\n"
+///   MOUSE_MOVE X Y    → "OK\n" (X, Y en HID absoluto 0-32767)
+///   MOUSE_CLICK       → "OK\n" (left click default)
+///   MOUSE_CLICK L/R/M → "OK\n" (left/right/middle click)
+///   KEY_TAP 0xNN      → "OK\n" (HID usage ID)
+///   RESET             → "OK\n" (release all keys + buttons)
+#[allow(dead_code)]
+const PROTOCOL_DOC: () = ();
+
 /// Retorna `true` si el comando es manejado localmente por el bridge
 /// (no se reenvía al serial).
 fn is_bridge_local_command(line: &[u8]) -> bool {
-    line.starts_with(b"FOCUS_CHECK")
+    line.starts_with(b"FOCUS_CHECK") || line.starts_with(b"GET_GEOMETRY")
 }
 
 /// Proxy SendInput: recibe comandos TCP y los ejecuta localmente via Windows SendInput.
@@ -423,12 +524,25 @@ async fn run_proxy_sendinput(
                         let line_str = String::from_utf8_lossy(&line_buf).to_string();
                         let trimmed = line_str.trim();
 
-                        // FOCUS_CHECK: local
+                        // Local bridge commands (FOCUS_CHECK, GET_GEOMETRY)
                         if is_bridge_local_command(&line_buf) {
-                            let focused = !focus_enabled
-                                || tibia_focused.load(Ordering::Relaxed);
-                            let resp = if focused { b"FOCUSED\n" } else { b"NOFOCUS\n" };
-                            if let Err(e) = tcp_writer.write_all(resp).await {
+                            let resp: Vec<u8> = if trimmed.starts_with("FOCUS_CHECK") {
+                                let focused = !focus_enabled
+                                    || tibia_focused.load(Ordering::Relaxed);
+                                if focused { b"FOCUSED\n".to_vec() } else { b"NOFOCUS\n".to_vec() }
+                            } else if trimmed.starts_with("GET_GEOMETRY") {
+                                // Accept: "GET_GEOMETRY" or "GET_GEOMETRY <pattern>"
+                                // Default pattern is "Tibia" (matches the client title).
+                                let pattern = trimmed
+                                    .strip_prefix("GET_GEOMETRY")
+                                    .unwrap_or("")
+                                    .trim();
+                                let pattern = if pattern.is_empty() { "Tibia" } else { pattern };
+                                query_geometry(pattern).into_bytes()
+                            } else {
+                                b"ERR unknown_local_cmd\n".to_vec()
+                            };
+                            if let Err(e) = tcp_writer.write_all(&resp).await {
                                 warn!("SendInput proxy: write error: {}", e);
                                 return ProxyExit::ClientDisconnected;
                             }
@@ -546,13 +660,25 @@ async fn run_proxy(
                             // Línea completa — decidir si reenviar o bloquear.
                             // Comandos locales del bridge (no van al serial).
                             if is_bridge_local_command(&line_buf) {
-                                let focused = !focus_enabled
-                                    || tibia_focused.load(Ordering::Relaxed);
-                                let resp = if focused { b"FOCUSED\n".as_slice() }
-                                           else       { b"NOFOCUS\n".as_slice() };
+                                let line_str = String::from_utf8_lossy(&line_buf).to_string();
+                                let trimmed = line_str.trim();
+                                let resp: Vec<u8> = if trimmed.starts_with("FOCUS_CHECK") {
+                                    let focused = !focus_enabled
+                                        || tibia_focused.load(Ordering::Relaxed);
+                                    if focused { b"FOCUSED\n".to_vec() } else { b"NOFOCUS\n".to_vec() }
+                                } else if trimmed.starts_with("GET_GEOMETRY") {
+                                    let pattern = trimmed
+                                        .strip_prefix("GET_GEOMETRY")
+                                        .unwrap_or("")
+                                        .trim();
+                                    let pattern = if pattern.is_empty() { "Tibia" } else { pattern };
+                                    query_geometry(pattern).into_bytes()
+                                } else {
+                                    b"ERR unknown_local_cmd\n".to_vec()
+                                };
                                 let mut w = tcp_writer.lock().await;
-                                if let Err(e) = w.write_all(resp).await {
-                                    warn!("TCP→serial: error escribiendo respuesta FOCUS_CHECK: {}", e);
+                                if let Err(e) = w.write_all(&resp).await {
+                                    warn!("TCP→serial: error escribiendo respuesta comando local: {}", e);
                                     return ProxyExit::ClientDisconnected;
                                 }
                                 line_buf.clear();
