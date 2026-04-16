@@ -117,21 +117,21 @@ max_wait_ms = 30000
 #
 # Ver TibiaWiki: https://tibia.fandom.com/wiki/Your_Supply_Stash
 #
-# Calibración 2026-04-16 v2 (corregido: panel backpack empieza en y=21, no y=0):
-#   - Panel backpack: origin (1568, 21), size 172×1013 (medido en GIMP)
-#   - bag stack tops reales: [21, 77, 137, 197, 257] (bag_h=60, title_h=~22)
-#   - icon centroids primer slot:
-#       Bag 1 "Backpack"        (XP Boost)      (1585, 61)   NO TOCAR
-#       Bag 2 "Golden Backpack"                 (1585, 117)  NO TOCAR
-#       Bag 3 "Green Backpack"                  (1586, 177)  STOW ✓
-#       Bag 4 "Bag"                             (1585, 237)  STOW ✓
-#   - menu_offset_x=92, menu_offset_y=190 (pendiente re-medir con V7 live)
+# Calibración 2026-04-16 v3 (V7 desbloqueado, cavebot via Arduino HID):
+#   - Detección automática via análisis del frame actual:
+#     Bag 1 title top y=0,   slot icon center y=30  (Backpack)
+#     Bag 2 title top y=60,  slot icon center y=90  (Golden Backpack)
+#     Bag 3 title top y=120, slot icon center y=150 (Green Backpack) STOW ✓
+#     Bag 4 title top y=185, slot icon center y=215 (Bag) STOW ✓
+#   - bag_h ≈ 60 entre bags (excepto bag4 que tiene +5 por layout)
+#   - Validado live: RC (1585,150) abre context menu con "Stow all items of this type"
+#   - menu_offset re-medir con V7 live ahora que el click produce menu
 
 # Stow Green Backpack (bag 3)
 [[step]]
 kind = "stow_all_items"
-slot_vx         = 1586
-slot_vy         = 177
+slot_vx         = 1585
+slot_vy         = 150
 menu_offset_x   = 92
 menu_offset_y   = 190
 menu_wait_ms    = 300
@@ -142,7 +142,7 @@ max_iterations  = 6
 [[step]]
 kind = "stow_all_items"
 slot_vx         = 1585
-slot_vy         = 237
+slot_vy         = 215
 menu_offset_x   = 92
 menu_offset_y   = 190
 menu_wait_ms    = 300

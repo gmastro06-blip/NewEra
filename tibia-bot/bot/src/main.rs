@@ -122,6 +122,38 @@ async fn main() -> Result<()> {
                     t.x, t.y, t.w, t.h,
                     geom.vscreen_x, geom.vscreen_y, geom.vscreen_w, geom.vscreen_h
                 );
+
+                // Safety check (V7 blocker root cause): verificar que el
+                // centro de Tibia cae dentro del vscreen reportado.
+                //
+                // En modo serial, el bridge reporta vscreen = primary monitor
+                // porque Arduino HID solo targetea primary. Si Tibia está en
+                // un monitor secundario, su centro cae FUERA de este rango y
+                // los clicks HID nunca llegarán. Pausamos el bot con un
+                // reason claro en lugar de fallar silencioso.
+                //
+                // En modo sendinput (vscreen = full virtual desktop), este
+                // check solo dispararía si Tibia está fuera de TODOS los
+                // monitores — situación imposible en práctica.
+                let cx = t.x + t.w / 2;
+                let cy = t.y + t.h / 2;
+                let vx_min = geom.vscreen_x;
+                let vy_min = geom.vscreen_y;
+                let vx_max = geom.vscreen_x + geom.vscreen_w;
+                let vy_max = geom.vscreen_y + geom.vscreen_h;
+                if cx < vx_min || cx >= vx_max || cy < vy_min || cy >= vy_max {
+                    let reason = format!(
+                        "tibia_off_mapped_screen: center=({cx},{cy}) \
+                         vscreen=[{vx_min}..{vx_max},{vy_min}..{vy_max}]. \
+                         Con mode=serial, Tibia debe estar en PRIMARY monitor \
+                         (HID Arduino solo targetea primary). Mové la ventana \
+                         de Tibia al primary y reinicia el bot."
+                    );
+                    warn!("SAFETY: {}", reason);
+                    let mut g = shared_state.write();
+                    g.is_paused = true;
+                    g.safety_pause_reason = Some(reason);
+                }
             } else {
                 warn!(
                     "Geometry auto-detect: ventana Tibia no encontrada. \
