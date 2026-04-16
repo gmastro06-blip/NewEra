@@ -343,6 +343,16 @@ The output is a sequence of cavebot `node` steps. Floor changes are commented in
 - Detección de rope/hole por color queda fuera de scope. Para esos casos usa overrides manuales.
 - Cuando A* genera un path "raro" que cambia de piso innecesariamente, casi siempre es un falso positivo en bridges → añadir entry en `remove`.
 
+## Cavebot — navegación y requisitos
+
+**Navegación relativa por nodes**: cada `node` es una coord absoluta `(x, y, z)` pero internamente el cavebot computa `dx/dy` desde el node ANTERIOR para saber qué clicks emitir al minimap. Implicación: todo el cavebot es una cadena de desplazamientos relativos — si la baseline es incorrecta, todo descarrila.
+
+**Seed inicial** (commit `9cc5ab8`): al activar el cavebot, el primer Node intenta semillar `prev_node` desde `ctx.game_coords` (tile-hashing real). Requiere map index cargado (`[game_coords].map_index_path` en config). Si tile-hashing no produce match tras ~2s, fallback legacy: registra target como baseline (el char DEBE estar ahí) y advance. Con map index cargado, el cavebot puede arrancar desde cualquier posición — el primer Node camina al target.
+
+**Validación de z** (commit `9cc5ab8`): cada branch de "arrived" en Node compara `ctx.game_coords.z` contra `target.z`. Si mismatch, el cavebot emite `CavebotAction::SafetyPause { reason: "node_z_mismatch: ..." }` que el game loop traduce a `is_paused=true` con reason explícita. Previene cadenas de acciones fantasma en piso equivocado (ej 12 right-clicks de stow en z=7 cuando depot está en z=6).
+
+**Cross-floor navigation**: el minimap-click de Node hace auto-pathfind via Tibia (incluyendo ladders visibles en el path). Pero ladders NO visibles en minimap (holes, ropes, parches) requieren steps explícitos `ladder`/`rope`. Si el cavebot llega a arrival pero z no matchea, el SafetyPause dispara.
+
 ## Cavebot — hunt automation
 
 `bot/src/cavebot/` is the structured hunt system. Unlike waypoints (flat temporal sequences), cavebot scripts support control flow:
