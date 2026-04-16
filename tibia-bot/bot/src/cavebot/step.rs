@@ -152,37 +152,61 @@ pub enum StepKind {
         menu_wait_ms: u64,  // tiempo para que aparezca el menu
         process_ms:   u64,  // tiempo tras click para procesar stow
     },
-    /// Right-click en el icono del bag (en la UI inventory) → click en
-    /// "Stow container's content" del menu contextual. Deposita todos los
-    /// items stackables del bag al Supply Stash del depot.
+    /// Deposita TODOS los items stackables del bag al Supply Stash iterando
+    /// N veces sobre el slot 0 del bag. Cada iteración hace:
+    ///   1. Right-click al slot 0 del bag (el item que esté ahí)
+    ///   2. Espera menu_wait_ms
+    ///   3. Click en "Stow all items of this type" del menu (offset x/y)
+    ///   4. Espera stow_process_ms — bag se reacomoda, siguiente tipo
+    ///      de item aparece en slot 0
+    ///   5. Repite hasta `max_iterations`
     ///
     /// **Prerequisito**: el char debe estar al lado del depot locker
     /// (proximity) para que la opción "Stow" aparezca en el menu.
     ///
+    /// **Comportamiento correcto en Tibia moderno**:
+    /// El menu context del CONTAINER no tiene "Stow container's content"
+    /// en Tibia oficial. En cambio, se hace right-click sobre un ITEM del
+    /// bag y el menu ofrece:
+    ///   - "Stow" (stow solo ese item)
+    ///   - "Stow all items of this type" (stow todos los del mismo tipo)
+    ///
     /// **Comportamiento**:
     /// - Items stackables (gold, potions, runes, loot) → Stash (10k max)
-    /// - Items non-stackables (gear con imbue, rares) → quedan en el bag
+    /// - Items non-stackables (gear con imbue, rares) → quedan en el bag,
+    ///   el right-click genera menu sin opción "Stow" → iteración no avanza.
+    ///   Por eso tenemos `max_iterations` como safety.
     ///
-    /// **Calibración**: capturar frame con el bag abierto, medir en GIMP
-    /// `bag_vx/vy` (icono del bag arriba-derecha de la UI) y `menu_offset_y`
-    /// (distancia del menu item "Stow container's content" desde el click
-    /// inicial — típicamente 60-80 px).
+    /// **Calibración**:
+    /// - `slot_vx/vy`: coord del primer slot del bag (típico arriba-izquierda
+    ///   del bag panel). Medir con GIMP sobre un frame capturado.
+    /// - `menu_offset_x/y`: offset desde el click hasta la línea "Stow all
+    ///   items of this type" del menu. El menu aparece a la DERECHA del
+    ///   click. Típico: `offset_x=+90` (centro del menu, ~180 px wide),
+    ///   `offset_y=+197` (~11 líneas de 18 px cada una).
+    /// - `max_iterations`: 4-8 suficiente para loot típico (2-4 tipos
+    ///   stackables post-hunt).
     ///
     /// Referencias: [TibiaWiki Supply Stash](https://tibia.fandom.com/wiki/Your_Supply_Stash),
     /// [Depot Locker](https://tibia.fandom.com/wiki/Locker_(Depot)).
-    StowBag {
-        /// X del icono del bag en la UI inventory (absolute viewport coord).
-        bag_vx:            i32,
-        /// Y del icono del bag.
-        bag_vy:            i32,
-        /// Offset vertical desde el click inicial hasta la opción "Stow
-        /// container's content" del menu contextual. Típicamente 60-80 px.
-        menu_offset_y:     i32,
-        /// Tiempo de espera para que el menu contextual se renderice.
-        menu_wait_ms:      u64,
-        /// Tiempo para que el Stash procese los items (puede ser largo si
-        /// hay muchos stackables).
-        process_ms:        u64,
+    StowAllItems {
+        /// X del primer slot del bag en la UI (absolute viewport coord).
+        slot_vx:         i32,
+        /// Y del primer slot del bag.
+        slot_vy:         i32,
+        /// Offset lateral desde el click al menu item "Stow all items of
+        /// this type". El menu aparece a la derecha del click. Típico +90.
+        menu_offset_x:   i32,
+        /// Offset vertical al menu item. Típico +197 (línea ~10 del menu).
+        menu_offset_y:   i32,
+        /// Tiempo para que el menu context se renderice (~300 ms).
+        menu_wait_ms:    u64,
+        /// Tiempo entre stow iterations para que el bag se reacomode (~800 ms).
+        stow_process_ms: u64,
+        /// Número máximo de iteraciones. Si los items se acaban antes,
+        /// las iteraciones restantes no hacen nada (menu sin "Stow all" para
+        /// non-stackables). Default 8.
+        max_iterations:  u8,
     },
     /// Comprar N unidades de un item en la trade window abierta.
     /// Emite: left-click en item → wait → N left-clicks en confirm.

@@ -141,13 +141,19 @@ struct StepToml {
     menu_wait_ms: Option<u64>,
     #[serde(default)]
     process_ms: Option<u64>,
-    // StowBag (modern Tibia 12 Supply Stash)
+    // StowAllItems (Tibia 12 Supply Stash — iterativo per-item)
     #[serde(default)]
-    bag_vx: Option<i32>,
+    slot_vx: Option<i32>,
     #[serde(default)]
-    bag_vy: Option<i32>,
+    slot_vy: Option<i32>,
+    #[serde(default)]
+    menu_offset_x: Option<i32>,
     #[serde(default)]
     menu_offset_y: Option<i32>,
+    #[serde(default)]
+    stow_process_ms: Option<u64>,
+    #[serde(default)]
+    max_iterations: Option<u8>,
     // BuyItem
     #[serde(default)]
     item_vx: Option<i32>,
@@ -263,7 +269,7 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
         chest_vx, chest_vy, stow_vx, stow_vy, menu_wait_ms, process_ms,
         item_vx, item_vy, confirm_vx, confirm_vy, quantity, spacing_ms,
         on_fail, requirements,
-        bag_vx, bag_vy, menu_offset_y,
+        slot_vx, slot_vy, menu_offset_x, menu_offset_y, stow_process_ms, max_iterations,
     } = st;
 
     let kind_lower = kind.to_lowercase();
@@ -366,12 +372,14 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
             menu_wait_ms: menu_wait_ms.unwrap_or(300),
             process_ms:   process_ms.unwrap_or(500),
         },
-        "stow_bag" => StepKind::StowBag {
-            bag_vx:         bag_vx.context("stow_bag: falta 'bag_vx' (icono del bag en UI)")?,
-            bag_vy:         bag_vy.context("stow_bag: falta 'bag_vy'")?,
-            menu_offset_y:  menu_offset_y.unwrap_or(70),
-            menu_wait_ms:   menu_wait_ms.unwrap_or(300),
-            process_ms:     process_ms.unwrap_or(2000),
+        "stow_all_items" => StepKind::StowAllItems {
+            slot_vx:         slot_vx.context("stow_all_items: falta 'slot_vx' (primer slot del bag)")?,
+            slot_vy:         slot_vy.context("stow_all_items: falta 'slot_vy'")?,
+            menu_offset_x:   menu_offset_x.unwrap_or(90),
+            menu_offset_y:   menu_offset_y.unwrap_or(197),
+            menu_wait_ms:    menu_wait_ms.unwrap_or(300),
+            stow_process_ms: stow_process_ms.unwrap_or(800),
+            max_iterations:  max_iterations.unwrap_or(8),
         },
         "buy_item" => StepKind::BuyItem {
             item_vx:    item_vx.context("buy_item: falta 'item_vx'")?,
@@ -924,74 +932,85 @@ mod tests {
         assert!(r.is_err(), "wrong type debe ser error");
     }
 
-    // ── StowBag step parser tests ────────────────────────────────────────
+    // ── StowAllItems step parser tests ───────────────────────────────────
 
     #[test]
-    fn parse_stow_bag_with_all_fields() {
+    fn parse_stow_all_items_with_all_fields() {
         let src = r#"
             [[step]]
-            kind = "stow_bag"
-            bag_vx = 1598
-            bag_vy = 128
-            menu_offset_y = 70
+            kind = "stow_all_items"
+            slot_vx = 1595
+            slot_vy = 140
+            menu_offset_x = 90
+            menu_offset_y = 197
             menu_wait_ms = 300
-            process_ms = 2000
+            stow_process_ms = 800
+            max_iterations = 8
         "#;
         let cb = parse(src).unwrap();
         assert_eq!(cb.steps.len(), 1);
         match &cb.steps[0].kind {
-            StepKind::StowBag { bag_vx, bag_vy, menu_offset_y, menu_wait_ms, process_ms } => {
-                assert_eq!(*bag_vx, 1598);
-                assert_eq!(*bag_vy, 128);
-                assert_eq!(*menu_offset_y, 70);
+            StepKind::StowAllItems {
+                slot_vx, slot_vy, menu_offset_x, menu_offset_y,
+                menu_wait_ms, stow_process_ms, max_iterations,
+            } => {
+                assert_eq!(*slot_vx, 1595);
+                assert_eq!(*slot_vy, 140);
+                assert_eq!(*menu_offset_x, 90);
+                assert_eq!(*menu_offset_y, 197);
                 assert_eq!(*menu_wait_ms, 300);
-                assert_eq!(*process_ms, 2000);
+                assert_eq!(*stow_process_ms, 800);
+                assert_eq!(*max_iterations, 8);
             }
-            _ => panic!("expected StowBag kind"),
+            _ => panic!("expected StowAllItems kind"),
         }
     }
 
     #[test]
-    fn parse_stow_bag_uses_defaults_for_optional_fields() {
-        // Solo bag_vx y bag_vy requeridos. menu_offset_y=70, menu_wait_ms=300,
-        // process_ms=2000 son defaults razonables.
+    fn parse_stow_all_items_uses_defaults() {
+        // Solo slot_vx y slot_vy requeridos. Resto usa defaults.
         let src = r#"
             [[step]]
-            kind = "stow_bag"
-            bag_vx = 1598
-            bag_vy = 128
+            kind = "stow_all_items"
+            slot_vx = 1595
+            slot_vy = 140
         "#;
         let cb = parse(src).unwrap();
         match &cb.steps[0].kind {
-            StepKind::StowBag { menu_offset_y, menu_wait_ms, process_ms, .. } => {
-                assert_eq!(*menu_offset_y, 70);
+            StepKind::StowAllItems {
+                menu_offset_x, menu_offset_y, menu_wait_ms,
+                stow_process_ms, max_iterations, ..
+            } => {
+                assert_eq!(*menu_offset_x, 90);
+                assert_eq!(*menu_offset_y, 197);
                 assert_eq!(*menu_wait_ms, 300);
-                assert_eq!(*process_ms, 2000);
+                assert_eq!(*stow_process_ms, 800);
+                assert_eq!(*max_iterations, 8);
             }
-            _ => panic!("expected StowBag kind"),
+            _ => panic!("expected StowAllItems kind"),
         }
     }
 
     #[test]
-    fn parse_stow_bag_missing_bag_vx_returns_err() {
+    fn parse_stow_all_items_missing_slot_vx_returns_err() {
         let src = r#"
             [[step]]
-            kind = "stow_bag"
-            bag_vy = 128
+            kind = "stow_all_items"
+            slot_vy = 140
         "#;
         let r = parse(src);
-        assert!(r.is_err(), "stow_bag sin bag_vx debe ser error");
+        assert!(r.is_err(), "stow_all_items sin slot_vx debe ser error");
     }
 
     #[test]
-    fn parse_stow_bag_missing_bag_vy_returns_err() {
+    fn parse_stow_all_items_missing_slot_vy_returns_err() {
         let src = r#"
             [[step]]
-            kind = "stow_bag"
-            bag_vx = 1598
+            kind = "stow_all_items"
+            slot_vx = 1595
         "#;
         let r = parse(src);
-        assert!(r.is_err(), "stow_bag sin bag_vy debe ser error");
+        assert!(r.is_err(), "stow_all_items sin slot_vy debe ser error");
     }
 
     /// Smoke test: los 3 scripts MINOR completados en R10 deben parsear OK.
