@@ -36,6 +36,18 @@ frame.png
 raw.png
 *_frame.png
 test_frames/
+# Session artifacts (per-run diagnostic zooms, crops, annotations)
+/menu_*.png
+/seq_*.png
+/stow_*.png
+/rc_*.png
+/pre_*.png
+/after_*.png
+/desktop_*.png
+/sidebar_*.png
+/slot_*.png
+/clean.png
+/current.png
 
 # Debug captures que el bot escribe al CWD del proceso
 tibia-bot/grab_*.png
