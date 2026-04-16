@@ -96,8 +96,15 @@ impl PicoHandle {
                 return None;
             }
         };
-        if !reply.ok {
-            warn!("PicoLink: query_geometry reply not ok: {:?}", reply.body);
+        // Nota: `reply.ok` es false para respuestas que NO son "OK" o "PONG".
+        // El bridge responde "GEOMETRY ..." como body que NO empieza con OK.
+        // Entonces no rechazamos por ok=false; parsemos el body directamente.
+        // Solo rechazamos si body es "timeout" o "connection closed" (errores
+        // reales de transport).
+        if reply.body == "timeout" || reply.body.starts_with("connection")
+            || reply.body.starts_with("read error")
+        {
+            warn!("PicoLink: query_geometry transport error: {:?}", reply.body);
             return None;
         }
         Geometry::parse(&reply.body)
@@ -603,6 +610,99 @@ mod tests {
         assert!(!handle.is_focus_lost(),
             "focus_lost debe ser false antes del primer heartbeat");
         // Los otros escenarios de heartbeat se validan manualmente en vivo.
+    }
+
+    // ── query_geometry end-to-end tests (con mock bridge) ─────────────────
+
+    /// E2E: bot → TCP → mock bridge → respond → parse Geometry.
+    /// Valida que el comando "GET_GEOMETRY Tibia" es enviado correctamente
+    /// y la respuesta parseada sin fallos de framing o serialization.
+    #[tokio::test]
+    async fn query_geometry_e2e_parses_mock_bridge_response() {
+        // Mock bridge: PONG al PING inicial, luego GEOMETRY válida.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = sock.set_nodelay(true);
+                    let (reader, mut writer) = sock.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let trimmed = line.trim();
+                        let resp: &[u8] = if trimmed == "PING" {
+                            b"PONG\n"
+                        } else if trimmed.starts_with("GET_GEOMETRY") {
+                            // Simula setup multi-monitor real del usuario session 2026-04-16:
+                            // monitor 2 a la izquierda (virtual X=-1920..0), monitor 1
+                            // primary con Tibia en X=0..1920.
+                            b"GEOMETRY -1920 0 3840 1080 0 0 1920 1080\n"
+                        } else {
+                            b"OK\n"
+                        };
+                        if writer.write_all(resp).await.is_err() { break; }
+                    }
+                });
+            }
+        });
+
+        let handle = spawn(test_config(addr));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let geom = handle.query_geometry("Tibia").await.expect("geometry Some");
+        assert_eq!(geom.vscreen_x, -1920);
+        assert_eq!(geom.vscreen_y, 0);
+        assert_eq!(geom.vscreen_w, 3840);
+        assert_eq!(geom.vscreen_h, 1080);
+        let t = geom.tibia.expect("tibia present");
+        assert_eq!((t.x, t.y, t.w, t.h), (0, 0, 1920, 1080));
+    }
+
+    /// E2E: bridge retorna ERR cuando la ventana Tibia no se encuentra.
+    /// El bot debe parsear vscreen correcto y tibia=None sin panic.
+    #[tokio::test]
+    async fn query_geometry_e2e_handles_err_window_not_found() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = sock.set_nodelay(true);
+                    let (reader, mut writer) = sock.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let trimmed = line.trim();
+                        let resp: &[u8] = if trimmed == "PING" {
+                            b"PONG\n"
+                        } else if trimmed.starts_with("GET_GEOMETRY") {
+                            b"GEOMETRY 0 0 1920 1080 ERR window_not_found\n"
+                        } else {
+                            b"OK\n"
+                        };
+                        if writer.write_all(resp).await.is_err() { break; }
+                    }
+                });
+            }
+        });
+
+        let handle = spawn(test_config(addr));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let geom = handle.query_geometry("Tibia").await.expect("geometry Some aunque ERR");
+        assert_eq!(geom.vscreen_w, 1920);
+        assert!(geom.tibia.is_none(), "tibia debe ser None cuando ERR");
+    }
+
+    /// E2E: si el bridge responde con body malformado ("OK" en lugar de
+    /// "GEOMETRY ..."), el bot retorna None sin panic.
+    #[tokio::test]
+    async fn query_geometry_e2e_malformed_response_returns_none() {
+        let (addr, _srv) = start_stub_bridge(vec!["PONG".into(), "OK".into()]).await;
+        let handle = spawn(test_config(addr));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let geom = handle.query_geometry("Tibia").await;
+        assert!(geom.is_none(), "body 'OK' no parsea como Geometry, debe ser None");
     }
 
     // ── Geometry::parse tests ─────────────────────────────────────────────

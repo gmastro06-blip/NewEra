@@ -573,6 +573,23 @@ impl MinimapMatcher {
         }
     }
 
+    /// Inyecta un ReferenceSector directamente en el matcher. Solo para
+    /// tests de integración (evita dependencia de archivos PNG en disk).
+    ///
+    /// # Uso
+    ///
+    /// ```ignore
+    /// let mut matcher = MinimapMatcher::new();
+    /// let reference = image::GrayImage::new(256, 256);
+    /// matcher.push_sector_for_test(32000, 31000, 7, reference);
+    /// ```
+    pub fn push_sector_for_test(&mut self, file_x: i32, file_y: i32, z: i32, image: GrayImage) {
+        self.sectors_by_floor
+            .entry(z)
+            .or_default()
+            .push(ReferenceSector { file_x, file_y, z, image });
+    }
+
     /// Retorna un snapshot de las stats para diagnóstico.
     /// Safe de llamar desde cualquier thread (usa atomic loads).
     ///

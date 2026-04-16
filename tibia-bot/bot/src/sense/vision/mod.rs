@@ -328,6 +328,26 @@ impl Vision {
         self.minimap_matcher.stats_snapshot()
     }
 
+    /// Mut accessor al MinimapMatcher para integration tests (inyectar
+    /// reference sectors sin pasar por disk).
+    ///
+    /// # Safety
+    /// Solo debe usarse desde tests. No hay invariantes que romper (matcher
+    /// es simplemente un atlas de sectores), pero modificar durante operación
+    /// normal puede causar inconsistencias de stats.
+    #[doc(hidden)]
+    pub fn matcher_mut_for_test(&mut self) -> &mut game_coords::MinimapMatcher {
+        &mut self.minimap_matcher
+    }
+
+    /// Inyecta last_game_coords directamente, para tests de integración que
+    /// necesitan bootstrap sin pasar por detect().
+    #[doc(hidden)]
+    pub fn set_last_game_coords_for_test(&mut self, coords: Option<(i32, i32, i32)>) {
+        self.last_game_coords = coords;
+        self.tracked_sub_tile_px = (0, 0);
+    }
+
     /// Retorna el centro del minimap en coordenadas del viewport, ajustado
     /// por el anchor tracker. Usado por el cavebot Node para calcular clicks.
     /// `None` si el minimap no está calibrado.
