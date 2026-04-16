@@ -91,6 +91,13 @@ pub enum CavebotAction {
     /// El cavebot terminó (lista no-loop completada). El loop puede
     /// desactivarlo y caer a Idle del FSM.
     Finished,
+    /// El cavebot detectó una condición inválida que no puede auto-resolver
+    /// (e.g. char en piso equivocado tras un Node). El loop debe setear
+    /// `shared_state.is_paused = true` con `safety_pause_reason = reason`.
+    ///
+    /// Previene cadenas de acciones inútiles (clicks fantasma en piso
+    /// equivocado, drags imposibles) cuando la navegación rompe invariantes.
+    SafetyPause { reason: String },
 }
 
 /// Parámetros tunables de navegación por nodos.
@@ -201,6 +208,10 @@ pub struct Cavebot {
     node_reclick_count: u8,
     /// Retries del click inicial de phase 0 (F6).
     node_initial_click_retries: u8,
+    /// Ticks esperando que tile-hashing produzca un `game_coords` válido
+    /// para semillar `prev_node` en el primer Node después de activar el
+    /// cavebot. Ver `tick_node` Fase 0 para el fallback tras timeout.
+    node_seed_wait: u64,
     /// Parámetros tunables de navegación.
     tuning: NodeTuning,
     // ── Estado de Deposit step ───────────────────────────────────────
@@ -260,6 +271,7 @@ impl Cavebot {
             node_none_moving_ticks: 0,
             node_reclick_count: 0,
             node_initial_click_retries: 0,
+            node_seed_wait: 0,
             tuning,
             deposit_phase: 0,
             deposit_phase_start: 0,
@@ -831,6 +843,28 @@ impl Cavebot {
         Some((prev.0 + tiles_dx, prev.1 + tiles_dy, prev.2))
     }
 
+    /// Valida que el z real del char (via tile-hashing) coincide con el z del
+    /// target del node. Si no coincide, emite `SafetyPause` para que el FSM
+    /// pause el bot y evite cadenas de acciones inútiles en piso equivocado
+    /// (ej stow clicks fantasma en z=7 cuando el depot está en z=6).
+    ///
+    /// Si `game_coords` no está disponible (map index no cargado / matcher
+    /// degradado), no bloquea — retorna None.
+    fn validate_z_arrival(&self, ctx: &TickContext, x: i32, y: i32, z: i32) -> Option<CavebotAction> {
+        let (rx, ry, rz) = ctx.game_coords?;
+        if rz == z {
+            return None;
+        }
+        let reason = format!(
+            "node_z_mismatch: target=({},{},{}) real=({},{},{}) — char en piso equivocado \
+             tras navegación. Revisar ladders/ropes/pathfinding. Cavebot pausado para evitar \
+             cadena de acciones inválidas.",
+            x, y, z, rx, ry, rz
+        );
+        tracing::error!("Cavebot: {}", reason);
+        Some(CavebotAction::SafetyPause { reason })
+    }
+
     /// Lógica de Node: click en minimap para auto-walk con pathfinding A*.
     /// Detección de llegada por displacement acumulado + re-click automático.
     fn tick_node(
@@ -842,16 +876,64 @@ impl Cavebot {
     ) -> Option<CavebotAction> {
         // ── Fase 0: setup + click ───────────────────────────────────
         if self.node_phase == 0 {
-            let Some(prev) = self.prev_node else {
-                tracing::info!("Node: primer nodo ({},{},{}), registrando posición", x, y, z);
-                self.prev_node = Some((x, y, z));
-                return None;
+            let prev = match self.prev_node {
+                Some(p) => p,
+                None => {
+                    // Primer Node de esta activación: intentamos semillar
+                    // `prev_node` desde la posición real del char via
+                    // tile-hashing. Permite arrancar el cavebot desde
+                    // cualquier lugar — el bot camina hacia el target en
+                    // vez de asumir que ya está allí.
+                    //
+                    // Si tile-hashing aún no produjo match (corre cada ~15
+                    // frames), esperamos devolviendo Idle (sin advance).
+                    // Tras `SEED_WAIT_TICKS` caemos al comportamiento legacy
+                    // (registrar target como baseline + advance) para
+                    // evitar quedar bloqueado si el map index no está cargado.
+                    const SEED_WAIT_TICKS: u64 = 60; // ~2s @ 30Hz
+                    if let Some(seed) = ctx.game_coords {
+                        tracing::info!(
+                            "Node: semillando prev_node desde game_coords real ({},{},{}) — \
+                             target ({},{},{})",
+                            seed.0, seed.1, seed.2, x, y, z
+                        );
+                        self.prev_node = Some(seed);
+                        self.node_seed_wait = 0;
+                        // Idle: nos quedamos en este step en phase 0, próximo
+                        // tick re-entra con prev_node Some y computa dx/dy.
+                        return Some(CavebotAction::Idle);
+                    }
+                    // Sin game_coords: esperar (Idle) o fallback.
+                    self.node_seed_wait = self.node_seed_wait.saturating_add(1);
+                    if self.node_seed_wait >= SEED_WAIT_TICKS {
+                        tracing::warn!(
+                            "Node ({},{},{}): tile-hashing no disponible tras {} ticks — \
+                             fallback legacy (registrando target como baseline). \
+                             El char DEBE estar en esa posición o la navegación falla.",
+                            x, y, z, SEED_WAIT_TICKS
+                        );
+                        self.prev_node = Some((x, y, z));
+                        self.node_seed_wait = 0;
+                        // Fallback: advance al siguiente step (comportamiento legacy).
+                        return None;
+                    }
+                    // Aún esperando: Idle sin advance.
+                    return Some(CavebotAction::Idle);
+                }
             };
 
             let dx = x - prev.0;
             let dy = y - prev.1;
 
             if dx == 0 && dy == 0 {
+                // Mismo XY que prev_node: no hay que caminar. Pero si el z real
+                // difiere del target, el char está en el piso equivocado (caso
+                // típico: seed coincide en XY pero cavebot espera z distinto).
+                // El minimap click NO se emite porque dx=dy=0, asi que no hay
+                // auto-pathfind a ladders — tenemos que pausar explícitamente.
+                if let Some(pause) = self.validate_z_arrival(ctx, x, y, z) {
+                    return Some(pause);
+                }
                 self.prev_node = Some((x, y, z));
                 return None;
             }
@@ -918,6 +1000,9 @@ impl Cavebot {
                     "Node ({},{},{}): timeout ({}s) — pos estimada ({},{},{}) — avanzando",
                     x, y, z, elapsed / 30, est.0, est.1, est.2
                 );
+                if let Some(pause) = self.validate_z_arrival(ctx, x, y, z) {
+                    return Some(pause);
+                }
                 self.prev_node = Some(est);
                 self.node_phase = 0;
                 return None;
@@ -964,6 +1049,9 @@ impl Cavebot {
                         x, y, z, self.node_accum_dx, self.node_accum_dy,
                         self.node_expect_dx, self.node_expect_dy, manhattan
                     );
+                    if let Some(pause) = self.validate_z_arrival(ctx, x, y, z) {
+                        return Some(pause);
+                    }
                     self.prev_node = Some((x, y, z));
                     self.node_phase = 0;
                     return None;
@@ -1010,6 +1098,9 @@ impl Cavebot {
                         "Node ({},{},{}): max re-clicks — pos estimada ({},{},{}) — avanzando",
                         x, y, z, est.0, est.1, est.2
                     );
+                    if let Some(pause) = self.validate_z_arrival(ctx, x, y, z) {
+                        return Some(pause);
+                    }
                     self.prev_node = Some(est);
                     self.node_phase = 0;
                     return None;
@@ -1055,6 +1146,9 @@ impl Cavebot {
                     // F2: usar estimated_position en vez de asumir target.
                     let est = self.estimated_position().unwrap_or((x, y, z));
                     tracing::info!("Node ({},{},{}): arrived (fallback, reclicks={})", x, y, z, self.node_reclick_count);
+                    if let Some(pause) = self.validate_z_arrival(ctx, x, y, z) {
+                        return Some(pause);
+                    }
                     self.prev_node = Some(est);
                     self.node_phase = 0;
                     return None;
@@ -1068,6 +1162,9 @@ impl Cavebot {
                         "Node ({},{},{}): sensor-degraded fallback (is_moving=None {}t)",
                         x, y, z, self.node_none_moving_ticks
                     );
+                    if let Some(pause) = self.validate_z_arrival(ctx, x, y, z) {
+                        return Some(pause);
+                    }
                     self.prev_node = Some((x, y, z));
                     self.node_phase = 0;
                     return None;
@@ -1745,8 +1842,12 @@ mod tests {
         }
     }
 
+    /// Sin `game_coords` disponible, el primer Node espera tile-hashing
+    /// durante SEED_WAIT_TICKS (60) y tras timeout cae al comportamiento
+    /// legacy: registra target como baseline y avanza. Test simula los
+    /// 60 ticks de wait + 1 para que advance.
     #[test]
-    fn node_first_registers_and_advances() {
+    fn node_first_fallback_when_no_game_coords() {
         let mut cb = Cavebot::new(
             vec![
                 step(StepKind::Node { x: 100, y: 200, z: 7, max_wait_ms: 30_000 }),
@@ -1754,8 +1855,62 @@ mod tests {
             ],
             false, 30,
         );
-        assert_eq!(cb.tick(&mut ctx_mm(0, None, None)), CavebotAction::KeyTap(0xCC));
+        // SEED_WAIT_TICKS=60: los primeros 59 ticks (seed_wait=1..59) devuelven
+        // Idle sin avanzar. En el tick 60 (seed_wait=60), el threshold se
+        // alcanza y cae al fallback que registra target como baseline + advance.
+        for t in 0..59 {
+            assert_eq!(cb.tick(&mut ctx_mm(t, None, None)), CavebotAction::Idle);
+        }
+        // Tick 59 = 60th iteration: threshold reached → fallback + advance.
+        assert_eq!(cb.tick(&mut ctx_mm(59, None, None)), CavebotAction::KeyTap(0xCC));
         assert_eq!(cb.prev_node, Some((100, 200, 7)));
+    }
+
+    /// Con `game_coords` real disponible, el primer Node semilla desde ahí
+    /// en vez de saltar — lo que permite que el cavebot CAMINE al target
+    /// en vez de asumir que ya está en esa posición.
+    #[test]
+    fn node_first_seeds_from_game_coords() {
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::Node { x: 110, y: 205, z: 7, max_wait_ms: 30_000 }),
+                step(StepKind::Hotkey { hidcode: 0xCC }),
+            ],
+            false, 30,
+        );
+        // Char está realmente en (100, 200, 7). Seed debe usar esto, no el target.
+        let ctx_with_coords = |tick: u64| {
+            let mut c = ctx_mm(tick, Some(false), None);
+            c.game_coords = Some((100, 200, 7));
+            c
+        };
+        // Tick 0: seed desde (100,200,7) — Idle (return None en phase 0).
+        assert_eq!(cb.tick(&mut ctx_with_coords(0)), CavebotAction::Idle);
+        assert_eq!(cb.prev_node, Some((100, 200, 7)));
+        // Tick 1: prev_node existe, dx=10 dy=5 → emite Click al minimap.
+        let action = cb.tick(&mut ctx_with_coords(1));
+        assert!(matches!(action, CavebotAction::Click { .. }),
+                "expected Click, got {:?}", action);
+    }
+
+    /// Z mismatch al arrival emite SafetyPause con reason explícito.
+    #[test]
+    fn node_arrival_z_mismatch_triggers_safety_pause() {
+        // Cavebot con prev_node ya seteado al XY del target pero en z distinto.
+        // Target z=7 (lo que el cavebot espera), prev.z=6 (char estaba en
+        // otro piso antes). dx==dy==0 → branch de zero-offset. Ahí validamos z.
+        // cavebot_with_prev_node(target, prev):
+        let mut cb = cavebot_with_prev_node((100, 200, 7), (100, 200, 6));
+        // Char real reporta z=6 (un piso abajo del target z=7)
+        let mut ctx = ctx_mm(0, Some(false), None);
+        ctx.game_coords = Some((100, 200, 6));
+        let action = cb.tick(&mut ctx);
+        match action {
+            CavebotAction::SafetyPause { reason } => {
+                assert!(reason.contains("node_z_mismatch"), "reason: {}", reason);
+            }
+            other => panic!("expected SafetyPause, got {:?}", other),
+        }
     }
 
     #[test]

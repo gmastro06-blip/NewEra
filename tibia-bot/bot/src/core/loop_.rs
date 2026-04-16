@@ -557,6 +557,20 @@ impl BotLoop {
                                 self.cavebot_enabled = false;
                                 WaypointHint::Inactive
                             }
+                            CavebotAction::SafetyPause { reason } => {
+                                // El cavebot detectó una condición inválida (e.g. char
+                                // en piso equivocado tras navegación). Pausamos el bot
+                                // con reason explícito y desactivamos cavebot para evitar
+                                // cadena de acciones inútiles.
+                                warn!("Cavebot SafetyPause: {}", reason);
+                                {
+                                    let mut g = self.state.write();
+                                    g.is_paused = true;
+                                    g.safety_pause_reason = Some(reason);
+                                }
+                                self.cavebot_enabled = false;
+                                WaypointHint::Inactive
+                            }
                         }
                     }
                 } else {
