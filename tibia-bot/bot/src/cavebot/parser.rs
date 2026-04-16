@@ -286,8 +286,10 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
         }
         "label" => {
             // El nombre del label viene en `name`.
-            if name.is_none() {
-                bail!("label: falta 'name'");
+            match &name {
+                None => bail!("label: falta 'name'"),
+                Some(n) if n.is_empty() => bail!("label: 'name' no puede ser string vacío"),
+                Some(_) => {}
             }
             StepKind::Label
         }
@@ -759,6 +761,152 @@ mod tests {
         }
         let cb = load(path, 30).expect("example.toml debe parsearse");
         assert!(cb.steps.len() >= 8);
+    }
+
+    // ── Fuzzing: malformed inputs no deben crashear el parser ────────────
+    //
+    // El parser es público: cualquier TOML que el usuario ponga en
+    // assets/cavebot/ debe ser procesable. Si hay errores, deben reportarse
+    // como Result::Err, NUNCA como panic. Estos tests aseguran esa propiedad.
+
+    #[test]
+    fn fuzz_empty_toml_returns_ok_or_err_not_panic() {
+        // Empty string → válido pero sin steps.
+        let r = parse("");
+        // Puede retornar Ok con 0 steps o Err; lo importante es no panic.
+        // Si retorna Ok, steps vacío es válido (cavebot sin script).
+        match r {
+            Ok(cb) => assert_eq!(cb.steps.len(), 0),
+            Err(_) => {} // también OK
+        }
+    }
+
+    #[test]
+    fn fuzz_malformed_toml_syntax_returns_err() {
+        // TOML syntácticamente inválido: sin closing quote.
+        let r = parse(r#"[[step]] kind = "walk"#);
+        assert!(r.is_err(), "TOML malformed debe retornar Err, no panic");
+    }
+
+    #[test]
+    fn fuzz_step_without_kind_field_returns_err() {
+        let src = r#"
+            [[step]]
+            key = "F1"
+            duration_ms = 500
+        "#;
+        let r = parse(src);
+        assert!(r.is_err(), "step sin kind debe ser error");
+    }
+
+    #[test]
+    fn fuzz_walk_without_key_returns_err() {
+        let src = r#"
+            [[step]]
+            kind = "walk"
+            duration_ms = 1000
+        "#;
+        let r = parse(src);
+        assert!(r.is_err(), "walk sin key debe ser error");
+    }
+
+    #[test]
+    fn fuzz_walk_invalid_key_returns_err() {
+        let src = r#"
+            [[step]]
+            kind = "walk"
+            key = "NOTAKEY123"
+            duration_ms = 1000
+        "#;
+        let r = parse(src);
+        assert!(r.is_err(), "walk con key inválida debe ser error");
+    }
+
+    #[test]
+    fn fuzz_wait_missing_duration_returns_err() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+        "#;
+        let r = parse(src);
+        assert!(r.is_err(), "wait sin duration_ms debe ser error");
+    }
+
+    #[test]
+    fn fuzz_label_with_empty_name_returns_err() {
+        let src = r#"
+            [[step]]
+            kind = "label"
+            name = ""
+        "#;
+        let r = parse(src);
+        assert!(r.is_err(), "label con name vacío debe ser error");
+    }
+
+    #[test]
+    fn fuzz_goto_without_label_field_returns_err() {
+        let src = r#"
+            [[step]]
+            kind = "goto"
+        "#;
+        let r = parse(src);
+        assert!(r.is_err(), "goto sin label debe ser error");
+    }
+
+    #[test]
+    fn fuzz_very_long_label_name_parses_or_rejects_cleanly() {
+        // Stress test: label name de 10000 chars. No importa si acepta
+        // o rechaza, solo no panic.
+        let name: String = std::iter::repeat('a').take(10000).collect();
+        let src = format!(
+            r#"
+            [[step]]
+            kind = "label"
+            name = "{}"
+            "#,
+            name
+        );
+        let r = parse(&src);
+        // Ambos resultados son OK (acepta o rechaza cleanly).
+        let _ = r;
+    }
+
+    #[test]
+    fn fuzz_deeply_nested_structure_doesnt_stack_overflow() {
+        // Stress test: 1000 labels + 1000 gotos anidados no deben hacer
+        // stack overflow ni tardar más de ~1 seg.
+        let mut src = String::with_capacity(50000);
+        for i in 0..500 {
+            src.push_str(&format!(
+                "[[step]]\nkind = \"label\"\nname = \"L{}\"\n\n[[step]]\nkind = \"goto\"\nlabel = \"L{}\"\n\n",
+                i,
+                (i + 1) % 500, // ciclo, todos los labels existen
+            ));
+        }
+        let start = std::time::Instant::now();
+        let r = parse(&src);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "parser tardó {:?}, límite 1s",
+            elapsed
+        );
+        // 1000 steps debe parsear OK.
+        if let Ok(cb) = r {
+            assert_eq!(cb.steps.len(), 1000);
+        }
+    }
+
+    #[test]
+    fn fuzz_wrong_type_field_returns_err() {
+        // duration_ms como string en vez de int.
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = "not a number"
+        "#;
+        let r = parse(src);
+        assert!(r.is_err(), "wrong type debe ser error");
     }
 
     /// Smoke test: los 3 scripts MINOR completados en R10 deben parsear OK.

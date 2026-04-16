@@ -86,6 +86,16 @@ pub struct Vision {
     /// `COORDS_REVALIDATE_INTERVAL`, la próxima detección usa brute force
     /// full en lugar de narrow — evita "stuck in false positive".
     coords_detects_since_full_search: u32,
+    /// Último game_coords observado (para detectar cambio entre ticks).
+    prev_game_coords: Option<(i32, i32, i32)>,
+    /// Ticks desde el último cambio de game_coords. Crece si el char NO
+    /// se mueve O si el matcher está stuck. Combinado con is_moving permite
+    /// distinguir ambos casos (ver `is_game_coords_stale_while_moving`).
+    game_coords_stale_ticks: u32,
+    /// Flag que se setea una vez cuando detectamos "coords stale mientras
+    /// is_moving=true" por >N ticks. Evita log spam (una sola alerta por
+    /// incidente, se clearea cuando vuelve a moverse).
+    reported_coords_stale: bool,
     /// Intervalo de frames entre detecciones de coords (default 15).
     coords_detect_interval: u32,
     /// Pixels por tile en el minimap NDI (default 5). Usado para downsamplear
@@ -241,6 +251,9 @@ impl Vision {
             frame_count: 0,
             minimap_matcher: game_coords::MinimapMatcher::new(),
             coords_detects_since_full_search: 0,
+            prev_game_coords: None,
+            game_coords_stale_ticks: 0,
+            reported_coords_stale: false,
             coords_detect_interval: 15,
             ndi_tile_scale: 5,
             last_game_coords: None,
@@ -299,6 +312,12 @@ impl Vision {
                 tracing::info!("MinimapMatcher threshold = {:.4}", cfg.matcher_threshold);
             }
         }
+    }
+
+    /// Retorna un snapshot de las stats del MinimapMatcher.
+    /// Safe de llamar desde cualquier contexto (usa atomic loads internamente).
+    pub fn matcher_stats(&self) -> game_coords::MatcherStatsSnapshot {
+        self.minimap_matcher.stats_snapshot()
     }
 
     /// Retorna el centro del minimap en coordenadas del viewport, ajustado
@@ -571,6 +590,51 @@ impl Vision {
             }
         }
         let game_coords = self.last_game_coords;
+
+        // ── Stuck detection: game_coords stale + char intentando caminar ─
+        //
+        // Si el char está en combate, paused, o parado, es normal que
+        // game_coords no cambie. PERO si is_moving=true (minimap viene
+        // shifting = el char camina) AND game_coords NO actualiza por N
+        // segundos, hay un problema: matcher stuck en false positive, o el
+        // char está caminando contra una pared, o el path está bloqueado.
+        //
+        // Threshold: 1800 ticks = 60 seg a 30 Hz. Lo suficientemente largo
+        // para absorber pausas normales de combate + transiciones de piso.
+        //
+        // Side-effect: log warn una sola vez por incidente (reset al
+        // recuperarse). NO fuerza safety pause — es informativo solo.
+        const COORDS_STALE_THRESHOLD_TICKS: u32 = 1800;
+
+        if game_coords.is_some() && game_coords != self.prev_game_coords {
+            // Coord cambió → reset
+            self.game_coords_stale_ticks = 0;
+            self.prev_game_coords = game_coords;
+            if self.reported_coords_stale {
+                tracing::info!(
+                    "game_coords stale recovered: new coord {:?}",
+                    game_coords
+                );
+                self.reported_coords_stale = false;
+            }
+        } else if game_coords.is_some() {
+            // Mismo coord que antes: stale si is_moving.
+            self.game_coords_stale_ticks = self.game_coords_stale_ticks.saturating_add(1);
+            if !self.reported_coords_stale
+                && self.game_coords_stale_ticks > COORDS_STALE_THRESHOLD_TICKS
+                && is_moving == Some(true)
+            {
+                tracing::warn!(
+                    "game_coords stale: {} ticks sin cambio (~{}s) pero is_moving=true. \
+                     Posibles causas: matcher stuck, char bloqueado, path roto. \
+                     coord actual: {:?}",
+                    self.game_coords_stale_ticks,
+                    self.game_coords_stale_ticks / 30,
+                    game_coords,
+                );
+                self.reported_coords_stale = true;
+            }
+        }
 
         // Inventory: contar items + leer stack counts via OCR cada N frames.
         if let Some(ref reader) = self.inventory_reader {

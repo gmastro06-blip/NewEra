@@ -210,6 +210,10 @@ pub struct GameState {
     pub target_debug:  TargetDebug,
     /// Snapshot del cavebot.
     pub cavebot_status: CavebotSnapshot,
+    /// Snapshot de stats del MinimapMatcher (CCORR template matching).
+    /// Actualizado por Vision::tick cada `coords_detect_interval` frames.
+    /// `None` hasta la primera detection.
+    pub matcher_stats: Option<crate::sense::vision::game_coords::MatcherStatsSnapshot>,
 }
 
 /// Alias conveniente — todo el código usa este tipo.

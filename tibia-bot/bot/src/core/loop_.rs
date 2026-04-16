@@ -988,6 +988,7 @@ impl BotLoop {
             let fsm_debug_snapshot       = fsm.debug_snapshot();
             let fsm_state_for_event      = format!("{:?}", fsm_state_snapshot);
             let now_ms_for_event         = now_ms();
+            let matcher_stats_snapshot   = self.vision.matcher_stats();
             {
                 let mut g = self.state.write();
                 g.tick += 1;
@@ -998,6 +999,7 @@ impl BotLoop {
                 g.script_status    = script_status_snapshot;
                 g.safety_pause_reason = pause_reason_snapshot;
                 g.safety_rate_dropped = rate_dropped_snapshot;
+                g.matcher_stats       = Some(matcher_stats_snapshot);
 
                 // ── Observability (Fase B) ──────────────────────────────
                 g.fsm_debug = fsm_debug_snapshot;

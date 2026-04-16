@@ -75,6 +75,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/vision/grab/debug",     get(handle_vision_grab_debug))
         .route("/vision/grab/inventory", get(handle_vision_grab_inventory))
         .route("/vision/inventory",      get(handle_vision_inventory))
+        .route("/vision/matcher/stats",  get(handle_vision_matcher_stats))
         .route("/vision/battle/debug",   get(handle_vision_battle_debug))
         .route("/vision/target/debug",   get(handle_vision_target_debug))
         .route("/vision/loot/debug",     get(handle_vision_loot_debug))
@@ -1191,6 +1192,27 @@ async fn handle_vision_inventory(State(s): State<AppState>) -> Response {
 // Permite diagnosticar "¿por qué el FSM está en este estado?" sin recompilar.
 //   curl http://localhost:8080/fsm/debug | jq .
 
+// ── /vision/matcher/stats ─────────────────────────────────────────────────────
+
+async fn handle_vision_matcher_stats(State(s): State<AppState>) -> Response {
+    let g = s.game_state.read();
+    let stats = g.matcher_stats.clone();
+    drop(g);
+
+    match stats {
+        Some(s) => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&s).unwrap_or_else(|_| "{}".into()),
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MinimapMatcher no ha corrido ninguna detección todavía",
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Serialize)]
 struct FsmDebugResponse {
     state:                  String,
@@ -1635,6 +1657,30 @@ async fn handle_prometheus_metrics(State(s): State<AppState>) -> Response {
         writeln!(out, "# HELP tibia_bot_safety_pause Active safety pause reason").ok();
         writeln!(out, "# TYPE tibia_bot_safety_pause gauge").ok();
         writeln!(out, "tibia_bot_safety_pause{{reason=\"{}\"}} 1", safe_reason).ok();
+    }
+
+    // ── MinimapMatcher stats ─────────────────────────────────────────────
+    if let Some(ref ms) = g.matcher_stats {
+        writeln!(out, "# HELP tibia_matcher_detects_total Total MinimapMatcher detect calls").ok();
+        writeln!(out, "# TYPE tibia_matcher_detects_total counter").ok();
+        writeln!(out, "tibia_matcher_detects_total{{mode=\"narrow\"}} {}", ms.narrow_searches).ok();
+        writeln!(out, "tibia_matcher_detects_total{{mode=\"full\"}} {}", ms.full_searches).ok();
+
+        writeln!(out, "# HELP tibia_matcher_misses_total Detects that returned None (score above threshold)").ok();
+        writeln!(out, "# TYPE tibia_matcher_misses_total counter").ok();
+        writeln!(out, "tibia_matcher_misses_total {}", ms.misses).ok();
+
+        writeln!(out, "# HELP tibia_matcher_last_duration_ms Last detect duration (milliseconds)").ok();
+        writeln!(out, "# TYPE tibia_matcher_last_duration_ms gauge").ok();
+        writeln!(out, "tibia_matcher_last_duration_ms {:.3}", ms.last_duration_ms).ok();
+
+        writeln!(out, "# HELP tibia_matcher_last_score Last SSD match score (lower=better)").ok();
+        writeln!(out, "# TYPE tibia_matcher_last_score gauge").ok();
+        writeln!(out, "tibia_matcher_last_score {:.6}", ms.last_score).ok();
+
+        writeln!(out, "# HELP tibia_matcher_sectors_loaded Reference sectors in RAM").ok();
+        writeln!(out, "# TYPE tibia_matcher_sectors_loaded gauge").ok();
+        writeln!(out, "tibia_matcher_sectors_loaded {}", ms.sectors_loaded).ok();
     }
 
     drop(g);

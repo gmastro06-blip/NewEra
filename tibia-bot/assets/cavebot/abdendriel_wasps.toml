@@ -18,13 +18,45 @@
 # Hotkeys usadas:
 #   F6 = Rope (coincide con tu hotbar, item count "1")
 #
-# CALIBRACIÓN PENDIENTE (antes del primer run):
-#   - chest_vx/vy, stow_vx/vy : click coords del depot chest y su menu
-#   - item_vx/vy, confirm_vx/vy : click coords del item y botón buy en trade
-#   Cuando estés frente al depot/NPC, abre GIMP sobre el frame NDI y mide.
+# ═══════════════════════════════════════════════════════════════════════
+# CALIBRACIÓN PRE-RUN (obligatoria antes del primer hunt)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Hay 4 coords de click a calibrar (marcadas "CALIBRAR:" en el archivo):
+#   - (chest_vx, chest_vy): centro del depot chest en el frame
+#   - (stow_vx,  stow_vy):  opción "Stow all" en el context menu del chest
+#   - (item_vx,  item_vy):  mana potion en la trade window
+#   - (confirm_vx, confirm_vy): botón confirm/buy en la trade window
+#
+# Procedimiento (3-5 min por par):
+#
+#   1. Arrancar bot + bridge + tener el char en el juego
+#   2. Caminar char a 1-sqm del depot chest en Ab'dendriel
+#   3. curl http://localhost:8080/test/grab -o depot_frame.png
+#   4. Abrir depot_frame.png en GIMP (u otro viewer con cursor crosshair)
+#   5. Medir coord del chest: hover el cursor sobre el centro del chest, leer
+#      "x: 1XXX  y: YYY" en la barra inferior de GIMP. Anotar chest_vx/vy.
+#   6. Right-click manualmente el chest en el cliente para abrir el context menu
+#   7. curl http://localhost:8080/test/grab -o depot_menu_frame.png
+#   8. Medir coord de "Stow all" en el menú. Anotar stow_vx/vy.
+#   9. Repetir para el NPC: caminar al NPC, trigger trade manualmente, capture
+#      frames, medir item_vx/vy y confirm_vx/vy.
+#  10. Editar los 4 pares de coords en este archivo (líneas con "CALIBRAR:")
+#  11. Validar: ./target/release/lint_cavebot.exe assets/cavebot/abdendriel_wasps.toml
+#      Esperado: "0 errors, 0 warnings"
+#
+# Pro-tip: medir con GIMP garantiza precisión píxel-a-píxel. Evitar el
+# "ojímetro". Los clicks del bot son absolutos, un error de 10 px puede
+# caer en un item adyacente o fuera del botón.
 #
 # Cargar con:
 #   curl -X POST 'http://localhost:8080/cavebot/load?path=assets/cavebot/abdendriel_wasps.toml&enabled=true'
+#
+# Monitoring durante la sesión:
+#   curl -s http://localhost:8080/cavebot/status | jq .
+#   curl -s http://localhost:8080/vision/matcher/stats | jq .
+#
+# ═══════════════════════════════════════════════════════════════════════
 
 [cavebot]
 loop = true

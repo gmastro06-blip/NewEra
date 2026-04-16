@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use image::GrayImage;
 use imageproc::template_matching::{match_template_parallel, MatchTemplateMethod};
@@ -411,8 +412,81 @@ pub struct ReferenceSector {
     pub image:   GrayImage,
 }
 
+/// Stats runtime del matcher, con interior mutability para que detect()
+/// pueda actualizarlos con `&self` desde Vision::tick sin lock.
+///
+/// Accesibles vía `MinimapMatcher::stats_snapshot()` para diagnósticos
+/// (HTTP endpoint, Prometheus export).
+#[derive(Default)]
+pub struct MatcherStats {
+    /// Cantidad de narrow searches completados (con last_known, 9 sectores).
+    pub narrow_searches: AtomicU64,
+    /// Cantidad de full brute force completados (cold start + re-validations).
+    pub full_searches:   AtomicU64,
+    /// Cantidad de llamadas a detect() que retornaron None (no match).
+    pub misses:          AtomicU64,
+    /// Última duración del detect, en microsegundos (para gauge).
+    pub last_duration_us: AtomicU64,
+    /// Último score SSD del match (bits de f32). 0 si nunca detectó.
+    pub last_score_bits: AtomicU32,
+}
+
+/// Snapshot serializable de stats para exponer vía HTTP/Prometheus.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MatcherStatsSnapshot {
+    pub narrow_searches:  u64,
+    pub full_searches:    u64,
+    pub misses:           u64,
+    pub total_detects:    u64,
+    pub last_duration_ms: f64,
+    pub last_score:       f32,
+    pub sectors_loaded:   usize,
+    pub floors_loaded:    Vec<i32>,
+    pub match_threshold:  f32,
+}
+
 /// Atlas de reference PNGs indexado por piso. Para cada piso, mantiene la
 /// lista de sectores (cada sector = 1 PNG del minimap de Tibia).
+///
+/// # Uso básico
+///
+/// ```no_run
+/// use std::path::Path;
+/// use tibia_bot::sense::vision::game_coords::MinimapMatcher;
+/// use tibia_bot::sense::perception::MinimapSnapshot;
+///
+/// let mut matcher = MinimapMatcher::new();
+///
+/// // Cargar reference PNGs para los pisos 6, 7, 8 (Ab'dendriel area).
+/// // Cada piso consume ~15 MB de RAM.
+/// matcher.load_dir(
+///     Path::new("assets/minimap/minimap"),
+///     &[6, 7, 8],
+/// ).expect("load reference PNGs");
+///
+/// // En runtime (cada detect_interval frames), detectar posición.
+/// // snap es un MinimapSnapshot capturado del NDI frame.
+/// # let snap = MinimapSnapshot { width: 107, height: 110, data: vec![0; 107*110*4] };
+/// # let last_known = None;
+/// # let force_full = false;
+/// let ndi_tile_scale = 2; // empírico para Tibia 12
+/// if let Some((x, y, z)) = matcher.detect(&snap, ndi_tile_scale, last_known, force_full) {
+///     println!("char at ({}, {}, {})", x, y, z);
+/// }
+/// ```
+///
+/// # Narrow vs Full search
+///
+/// - **Narrow** (fast, ~80-160ms): solo matchea contra el sector del
+///   `last_known` y sus 8 vecinos. Usa `force_full=false` + `last_known=Some(...)`.
+/// - **Full** (slow, ~1-4s): brute force sobre todos los sectores cargados.
+///   Se usa en cold boot (`last_known=None`) y en re-validación periódica
+///   (`force_full=true`) para recuperar falsos positivos.
+///
+/// # Observabilidad
+///
+/// Los contadores internos (narrow/full/misses/last_duration) se exponen via
+/// [`MinimapMatcher::stats_snapshot`] para diagnostics y Prometheus.
 #[derive(Default)]
 #[allow(dead_code)]
 pub struct MinimapMatcher {
@@ -421,6 +495,8 @@ pub struct MinimapMatcher {
     /// Threshold SSD (CCORR_NORMED lower=better). Default 0.05 = match muy fuerte.
     /// Si no hay matches bajo este threshold, retornamos None.
     pub match_threshold: f32,
+    /// Stats con interior mutability para tracking durante detect().
+    pub stats: MatcherStats,
 }
 
 impl MinimapMatcher {
@@ -428,6 +504,44 @@ impl MinimapMatcher {
         Self {
             sectors_by_floor: HashMap::new(),
             match_threshold: 0.05,
+            stats: MatcherStats::default(),
+        }
+    }
+
+    /// Retorna un snapshot de las stats para diagnóstico.
+    /// Safe de llamar desde cualquier thread (usa atomic loads).
+    ///
+    /// # Ejemplo
+    ///
+    /// ```
+    /// use tibia_bot::sense::vision::game_coords::MinimapMatcher;
+    ///
+    /// let matcher = MinimapMatcher::new();
+    /// let stats = matcher.stats_snapshot();
+    /// assert_eq!(stats.narrow_searches, 0);
+    /// assert_eq!(stats.full_searches, 0);
+    /// assert_eq!(stats.misses, 0);
+    /// assert_eq!(stats.sectors_loaded, 0);
+    /// ```
+    pub fn stats_snapshot(&self) -> MatcherStatsSnapshot {
+        let narrow = self.stats.narrow_searches.load(Ordering::Relaxed);
+        let full = self.stats.full_searches.load(Ordering::Relaxed);
+        let misses = self.stats.misses.load(Ordering::Relaxed);
+        let dur_us = self.stats.last_duration_us.load(Ordering::Relaxed);
+        let score_bits = self.stats.last_score_bits.load(Ordering::Relaxed);
+        let mut floors: Vec<i32> = self.sectors_by_floor.keys().copied().collect();
+        floors.sort();
+        let sectors: usize = self.sectors_by_floor.values().map(|v| v.len()).sum();
+        MatcherStatsSnapshot {
+            narrow_searches:  narrow,
+            full_searches:    full,
+            misses,
+            total_detects:    narrow + full,
+            last_duration_ms: dur_us as f64 / 1000.0,
+            last_score:       f32::from_bits(score_bits),
+            sectors_loaded:   sectors,
+            floors_loaded:    floors,
+            match_threshold:  self.match_threshold,
         }
     }
 
@@ -598,6 +712,8 @@ impl MinimapMatcher {
             return None;
         }
 
+        let detect_start = std::time::Instant::now();
+
         // Use narrow search only when we have last_known AND force_full=false.
         // Otherwise: full brute force over all loaded floors.
         let use_narrow = !force_full && last_known.is_some();
@@ -651,9 +767,21 @@ impl MinimapMatcher {
             }
         }
 
+        // Update stats (interior mutability via atomics).
+        let elapsed_us = detect_start.elapsed().as_micros() as u64;
+        self.stats.last_duration_us.store(elapsed_us, Ordering::Relaxed);
+        if use_narrow {
+            self.stats.narrow_searches.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.stats.full_searches.fetch_add(1, Ordering::Relaxed);
+        }
+
         if global_best <= self.match_threshold {
+            self.stats.last_score_bits.store(global_best.to_bits(), Ordering::Relaxed);
             global_best_world
         } else {
+            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            // No updatear last_score cuando es miss — preservamos el último bueno.
             tracing::debug!(
                 "MinimapMatcher: best SSD {:.4} > threshold {:.4}, no match",
                 global_best, self.match_threshold
@@ -1078,6 +1206,94 @@ mod tests {
             "luma esperada ~{}, obtenida {}",
             expected, actual
         );
+    }
+
+    #[test]
+    fn matcher_stats_track_narrow_vs_full() {
+        // Verify stats are incremented correctly per detection mode.
+        let mut matcher = MinimapMatcher::new();
+        let reference = make_synthetic_reference();
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![ReferenceSector { file_x: 32000, file_y: 31000, z: 7, image: reference.clone() }],
+        );
+        matcher.match_threshold = 0.15;
+
+        let snap = make_synthetic_minimap_from_ref(&reference, 64, 64, 60, 60);
+
+        // Initial: stats all zero.
+        let s0 = matcher.stats_snapshot();
+        assert_eq!(s0.narrow_searches, 0);
+        assert_eq!(s0.full_searches, 0);
+        assert_eq!(s0.misses, 0);
+
+        // Full search (last_known=None forces full).
+        let _ = matcher.detect(&snap, 1, None, false);
+        let s1 = matcher.stats_snapshot();
+        assert_eq!(s1.full_searches, 1);
+        assert_eq!(s1.narrow_searches, 0);
+
+        // Narrow search (last_known provided, force_full=false).
+        let _ = matcher.detect(&snap, 1, Some((32064, 31064, 7)), false);
+        let s2 = matcher.stats_snapshot();
+        assert_eq!(s2.full_searches, 1);
+        assert_eq!(s2.narrow_searches, 1);
+
+        // Force full override.
+        let _ = matcher.detect(&snap, 1, Some((32064, 31064, 7)), true);
+        let s3 = matcher.stats_snapshot();
+        assert_eq!(s3.full_searches, 2);
+        assert_eq!(s3.narrow_searches, 1);
+    }
+
+    #[test]
+    fn matcher_stats_track_misses() {
+        // Snap unrelated al reference → miss incrementa.
+        let mut matcher = MinimapMatcher::new();
+        let reference = make_synthetic_reference();
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![ReferenceSector { file_x: 32000, file_y: 31000, z: 7, image: reference }],
+        );
+        matcher.match_threshold = 0.0001; // imposible de matchear
+
+        let mut data = vec![255u8; 60 * 60 * 4];
+        for i in 0..(60 * 60) {
+            let v = (i * 11 % 256) as u8;
+            data[i * 4]     = v;
+            data[i * 4 + 1] = v;
+            data[i * 4 + 2] = v;
+            data[i * 4 + 3] = 255;
+        }
+        let snap = MinimapSnapshot { width: 60, height: 60, data };
+
+        let r = matcher.detect(&snap, 1, None, true);
+        assert_eq!(r, None);
+        let s = matcher.stats_snapshot();
+        assert_eq!(s.misses, 1);
+        assert_eq!(s.full_searches, 1, "aún cuenta el search aunque haya fallado");
+    }
+
+    #[test]
+    fn matcher_stats_snapshot_reflects_loaded_sectors() {
+        let mut matcher = MinimapMatcher::new();
+        assert_eq!(matcher.stats_snapshot().sectors_loaded, 0);
+
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![
+                ReferenceSector { file_x: 0,   file_y: 0, z: 7, image: GrayImage::new(256, 256) },
+                ReferenceSector { file_x: 256, file_y: 0, z: 7, image: GrayImage::new(256, 256) },
+            ],
+        );
+        matcher.sectors_by_floor.insert(
+            8,
+            vec![ReferenceSector { file_x: 0, file_y: 0, z: 8, image: GrayImage::new(256, 256) }],
+        );
+
+        let snap = matcher.stats_snapshot();
+        assert_eq!(snap.sectors_loaded, 3);
+        assert_eq!(snap.floors_loaded, vec![7, 8]);
     }
 
     #[test]

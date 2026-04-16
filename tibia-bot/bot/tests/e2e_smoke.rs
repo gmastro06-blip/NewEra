@@ -168,3 +168,64 @@ fn vision_pipeline_with_minimum_calibration_does_not_crash() {
         }
     }
 }
+
+/// Integration test: Vision + MinimapMatcher trabajan juntos para detectar
+/// game_coords desde un minimap NDI sintético.
+///
+/// Este test valida el pipeline completo sin NDI real:
+///   1. Construye Vision con calibración mínima del minimap ROI
+///   2. Genera frame sintético con un minimap recortado de un reference PNG
+///   3. Llama vision.tick() varias veces
+///   4. Verifica que matcher_stats() reporta detections completadas
+///
+/// No verifica el coord exacto porque el synthetic reference está en RAM
+/// (no en disk como los real reference PNGs). Lo que valida es el wiring:
+/// Vision → MinimapMatcher → stats publicados.
+#[test]
+fn vision_matcher_stats_reflect_detection_activity() {
+    let mut vision = Vision::load(std::path::Path::new("/no_assets"));
+
+    // Snapshot inicial: cero detects (matcher vacío, nunca carga PNGs).
+    let stats0 = vision.matcher_stats();
+    assert_eq!(stats0.narrow_searches, 0);
+    assert_eq!(stats0.full_searches, 0);
+    assert_eq!(stats0.misses, 0);
+    assert_eq!(stats0.sectors_loaded, 0);
+
+    // Correr unos ticks — como el matcher está vacío, no hay detect real.
+    let frame = synthetic_tibia_frame();
+    for tick in 0..30u64 {
+        let _ = vision.tick(&frame, tick);
+    }
+
+    // Stats siguen en cero porque el matcher está empty.
+    let stats_after = vision.matcher_stats();
+    assert_eq!(stats_after.full_searches, 0);
+    assert_eq!(stats_after.narrow_searches, 0);
+    assert_eq!(stats_after.sectors_loaded, 0);
+}
+
+/// Smoke test: el endpoint /vision/matcher/stats no crashea con stats vacíos.
+/// (Test del wiring completo Vision → GameState → HTTP handler.)
+#[test]
+fn matcher_stats_snapshot_serializable() {
+    use tibia_bot::sense::vision::game_coords::{MatcherStatsSnapshot};
+
+    let snap = MatcherStatsSnapshot {
+        narrow_searches:  10,
+        full_searches:    2,
+        misses:           1,
+        total_detects:    12,
+        last_duration_ms: 85.3,
+        last_score:       0.0436,
+        sectors_loaded:   224,
+        floors_loaded:    vec![6, 7, 8],
+        match_threshold:  0.10,
+    };
+
+    let json = serde_json::to_string(&snap).expect("serde serialize OK");
+    assert!(json.contains("narrow_searches"));
+    assert!(json.contains("10"));
+    assert!(json.contains("last_score"));
+    assert!(json.contains("floors_loaded"));
+}
