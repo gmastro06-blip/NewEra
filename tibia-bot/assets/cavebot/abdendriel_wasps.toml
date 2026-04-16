@@ -128,23 +128,28 @@ max_wait_ms = 30000
 #   - menu_offset re-medir con V7 live ahora que el click produce menu
 
 # Stow Green Backpack (bag 3)
+# menu_offset calibrados 2026-04-16 via brightness detection del menu abierto:
+#   RC @ (1585, 150) → menu "Stow all items of this type" en (1650, 395)
+#   offset_x = 1650-1585 = +65 (x al centro del menu text)
+#   offset_y = 395-150  = +245 (row del menu; 11 items × 18px + separators)
 [[step]]
 kind = "stow_all_items"
 slot_vx         = 1585
 slot_vy         = 150
-menu_offset_x   = 92
-menu_offset_y   = 190
+menu_offset_x   = 65
+menu_offset_y   = 245
 menu_wait_ms    = 300
 stow_process_ms = 800
 max_iterations  = 6
 
-# Stow Bag (bag 4)
+# Stow Bag (bag 4) — mismos offsets de menu (click x similar, menu aparece
+# debajo con layout constante).
 [[step]]
 kind = "stow_all_items"
 slot_vx         = 1585
 slot_vy         = 215
-menu_offset_x   = 92
-menu_offset_y   = 190
+menu_offset_x   = 65
+menu_offset_y   = 245
 menu_wait_ms    = 300
 stow_process_ms = 800
 max_iterations  = 6
