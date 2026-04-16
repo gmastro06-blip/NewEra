@@ -12,7 +12,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_TYPE,
     KEYBDINPUT, MOUSEINPUT,
     KEYEVENTF_SCANCODE, KEYEVENTF_KEYUP, KEYEVENTF_EXTENDEDKEY,
-    MOUSE_EVENT_FLAGS, MOUSEEVENTF_MOVE, MOUSEEVENTF_ABSOLUTE,
+    MOUSE_EVENT_FLAGS, MOUSEEVENTF_MOVE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_VIRTUALDESK,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
     MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
@@ -122,7 +122,17 @@ fn make_key_input(scan: u16, flags: windows::Win32::UI::Input::KeyboardAndMouse:
     }
 }
 
-/// Mover el mouse a posición absoluta (0-65535).
+/// Mover el mouse a posición absoluta (0-65535) en el **virtual desktop**.
+///
+/// CRÍTICO: usa MOUSEEVENTF_VIRTUALDESK para que las coords 0..65535
+/// mapeen al virtual desktop COMPLETO (todos los monitores), NO solo al
+/// primario. Sin este flag, Windows interpreta las coords en el monitor
+/// primary, causando que clicks caigan al monitor equivocado en setups
+/// multi-monitor.
+///
+/// Bug fix 2026-04-16: la sesión live descubrió que sin VIRTUALDESK los
+/// clicks con coords "correctas" (virtual X=2872) caían en monitor Claude
+/// porque Windows los interpretaba como relativos al primary solamente.
 #[cfg(windows)]
 fn mouse_move_abs(x: i32, y: i32) {
     let input = INPUT {
@@ -132,7 +142,7 @@ fn mouse_move_abs(x: i32, y: i32) {
                 dx: x,
                 dy: y,
                 mouseData: 0,
-                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
                 time: 0,
                 dwExtraInfo: 0,
             },
@@ -143,6 +153,13 @@ fn mouse_move_abs(x: i32, y: i32) {
 }
 
 /// Click de un botón del mouse.
+///
+/// IMPORTANTE: SendInput con down+up juntos en un solo batch lo envía demasiado
+/// rápido y Tibia NO registra el click en widgets pequeños (inventory slots,
+/// context menu items). Viewport center tolera sin hold; sidebar slots NO.
+///
+/// Fix 2026-04-16: separar down y up en 2 SendInput calls con hold de 30ms
+/// entre ambos. Similar al CLICK_HOLD_MS del Arduino HID firmware.
 #[cfg(windows)]
 fn mouse_click(button: &str) {
     let (down_flag, up_flag) = match button.to_uppercase().as_str() {
@@ -155,12 +172,16 @@ fn mouse_click(button: &str) {
         }
     };
 
-    let inputs = [
-        make_mouse_input(down_flag),
-        make_mouse_input(up_flag),
-    ];
-    unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32); }
-    debug!("SendInput: MOUSE_CLICK {}", button);
+    // Settling delay: MOUSE_MOVE dispatch via SendInput es async en user-space;
+    // el renderer del cliente (y hit-test) puede aún ver cursor en posición previa
+    // cuando DOWN llega. 25ms da 1-2 frames al client para actualizarse.
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    let down = [make_mouse_input(down_flag)];
+    let up   = [make_mouse_input(up_flag)];
+    unsafe { SendInput(&down, std::mem::size_of::<INPUT>() as i32); }
+    std::thread::sleep(std::time::Duration::from_millis(45));
+    unsafe { SendInput(&up, std::mem::size_of::<INPUT>() as i32); }
+    debug!("SendInput: MOUSE_CLICK {} (25ms pre, 45ms hold)", button);
 }
 
 #[cfg(windows)]

@@ -170,10 +170,12 @@ fn check_tibia_focused(_title_pattern: &str) -> bool {
 #[cfg(windows)]
 fn query_geometry(title_pattern: &str) -> String {
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetSystemMetrics, GetWindowRect, GetWindowTextW, IsWindowVisible,
-        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        EnumWindows, GetClientRect, GetSystemMetrics, GetWindowRect, GetWindowTextW,
+        IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
     };
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 
     unsafe {
         // Virtual screen bbox: puede tener origen negativo si hay monitores
@@ -198,7 +200,21 @@ fn query_geometry(title_pattern: &str) -> String {
             let len = GetWindowTextW(hwnd, &mut buf);
             if len > 0 {
                 let title = String::from_utf16_lossy(&buf[..len as usize]);
-                if title.contains(&ctx.pattern) {
+                // Exclude OBS Projector / StreamLabs Projector / recording tools
+                // whose titles often contain "Tibia" as the SOURCE name (not
+                // the actual game window). These are NOT the Tibia client.
+                //
+                // Fix 2026-04-16: la sesión live descubrió que OBS Projector
+                // "Proyector - Fuente: Tibia_Fuente" matcheaba y se tomaba
+                // su RECT en lugar del cliente real.
+                let title_lower = title.to_lowercase();
+                let is_excluded = title_lower.contains("proyector")
+                    || title_lower.contains("projector")
+                    || title_lower.contains("obs ")
+                    || title_lower.starts_with("obs")
+                    || title_lower.contains("streamlabs")
+                    || title_lower.contains("xsplit");
+                if !is_excluded && title.contains(&ctx.pattern) {
                     ctx.found = Some(hwnd);
                     return BOOL(0); // stop
                 }
@@ -211,18 +227,38 @@ fn query_geometry(title_pattern: &str) -> String {
 
         match ctx.found {
             Some(hwnd) => {
-                let mut rect = RECT::default();
-                if GetWindowRect(hwnd, &mut rect).is_ok() {
-                    let tx = rect.left;
-                    let ty = rect.top;
-                    let tw = rect.right - rect.left;
-                    let th = rect.bottom - rect.top;
+                // Fix 2026-04-16: GetWindowRect incluye bordes invisibles en
+                // ventanas maximizadas (típicamente 8px cada lado + titlebar).
+                // GetClientRect + ClientToScreen devuelven el area de dibujado
+                // REAL que coincide con lo que NDI/OBS captura. Sin este fix,
+                // clicks en sidebar caían ~8px off.
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client).is_ok() {
+                    let mut origin = POINT { x: 0, y: 0 };
+                    let _ = ClientToScreen(hwnd, &mut origin);
+                    let tx = origin.x;
+                    let ty = origin.y;
+                    let tw = client.right - client.left;
+                    let th = client.bottom - client.top;
                     format!(
                         "GEOMETRY {} {} {} {} {} {} {} {}\n",
                         vx, vy, vw, vh, tx, ty, tw, th
                     )
                 } else {
-                    format!("GEOMETRY {} {} {} {} ERR getwindowrect_failed\n", vx, vy, vw, vh)
+                    // Fallback: usa GetWindowRect si GetClientRect falla.
+                    let mut rect = RECT::default();
+                    if GetWindowRect(hwnd, &mut rect).is_ok() {
+                        let tx = rect.left;
+                        let ty = rect.top;
+                        let tw = rect.right - rect.left;
+                        let th = rect.bottom - rect.top;
+                        format!(
+                            "GEOMETRY {} {} {} {} {} {} {} {}\n",
+                            vx, vy, vw, vh, tx, ty, tw, th
+                        )
+                    } else {
+                        format!("GEOMETRY {} {} {} {} ERR getwindowrect_failed\n", vx, vy, vw, vh)
+                    }
                 }
             }
             None => format!("GEOMETRY {} {} {} {} ERR window_not_found\n", vx, vy, vw, vh),

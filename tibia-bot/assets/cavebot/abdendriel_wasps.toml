@@ -116,15 +116,38 @@ max_wait_ms = 30000
 # sesión supervisada, el operador los deposita manualmente entre sesiones.
 #
 # Ver TibiaWiki: https://tibia.fandom.com/wiki/Your_Supply_Stash
+#
+# Calibración 2026-04-16 v2 (corregido: panel backpack empieza en y=21, no y=0):
+#   - Panel backpack: origin (1568, 21), size 172×1013 (medido en GIMP)
+#   - bag stack tops reales: [21, 77, 137, 197, 257] (bag_h=60, title_h=~22)
+#   - icon centroids primer slot:
+#       Bag 1 "Backpack"        (XP Boost)      (1585, 61)   NO TOCAR
+#       Bag 2 "Golden Backpack"                 (1585, 117)  NO TOCAR
+#       Bag 3 "Green Backpack"                  (1586, 177)  STOW ✓
+#       Bag 4 "Bag"                             (1585, 237)  STOW ✓
+#   - menu_offset_x=92, menu_offset_y=190 (pendiente re-medir con V7 live)
+
+# Stow Green Backpack (bag 3)
 [[step]]
 kind = "stow_all_items"
-slot_vx         = 1595   # CALIBRAR: primer slot del bag (arriba-izq del bag panel)
-slot_vy         = 140
-menu_offset_x   = 90     # CALIBRAR: menu abre a la derecha, ~+90 px centro
-menu_offset_y   = 197    # CALIBRAR: línea "Stow all items of this type", ~+197 px
+slot_vx         = 1586
+slot_vy         = 177
+menu_offset_x   = 92
+menu_offset_y   = 190
 menu_wait_ms    = 300
 stow_process_ms = 800
-max_iterations  = 6      # típico loot Ab'dendriel: 2-4 tipos stackables
+max_iterations  = 6
+
+# Stow Bag (bag 4)
+[[step]]
+kind = "stow_all_items"
+slot_vx         = 1585
+slot_vy         = 237
+menu_offset_x   = 92
+menu_offset_y   = 190
+menu_wait_ms    = 300
+stow_process_ms = 800
+max_iterations  = 6
 
 # Walk to NPC shopkeeper (intermediate nodes para evitar stuck en pillars)
 [[step]]
