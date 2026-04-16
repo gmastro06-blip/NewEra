@@ -127,14 +127,31 @@ void process_command(const char* cmd) {
         Serial.print(F("PONG\n"));
     }
     // MOUSE_MOVE X Y
+    //
+    // Bug fix 2026-04-16 (V7 blocker): el descriptor HID de HID-Project
+    // AbsoluteMouse es SIGNED int16 (-32768..32767), donde el valor 0 =
+    // CENTRO del monitor. El bot manda el rango unsigned 0..32767 del
+    // protocolo, que interpretado como signed solo cubre desde el centro
+    // hasta el bottom-right — la mitad izquierda/superior del monitor
+    // queda inalcanzable.
+    //
+    // Fix: offseteamos el valor unsigned del bot al rango signed del HID:
+    //   signed_val = bot_val * 2 - 32768
+    //   bot 0     → signed -32768 (pixel 0 = top/left)
+    //   bot 16384 → signed 0      (pixel half = center)
+    //   bot 32767 → signed 32766  (pixel full = bottom/right)
+    //
+    // Verificado con cursor tracking post-reflash: cubre monitor completo.
     else if (strncmp(cmd, "MOUSE_MOVE ", 11) == 0) {
         long x, y;
         if (sscanf(cmd + 11, "%ld %ld", &x, &y) == 2) {
-            // AbsoluteMouse usa rango 0-32767 (= int16 unsigned).
             if (x < 0 || x > 32767 || y < 0 || y > 32767) {
                 Serial.print(F("ERR mouse_out_of_range\n"));
             } else {
-                AbsoluteMouse.moveTo((int)x, (int)y);
+                // Offset a rango signed via aritmética long (evita overflow int16).
+                int16_t sx = (int16_t)(x * 2L - 32768L);
+                int16_t sy = (int16_t)(y * 2L - 32768L);
+                AbsoluteMouse.moveTo(sx, sy);
                 Serial.print(F("OK\n"));
             }
         } else {
