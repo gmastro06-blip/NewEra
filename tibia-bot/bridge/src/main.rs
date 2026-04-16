@@ -167,23 +167,52 @@ fn check_tibia_focused(_title_pattern: &str) -> bool {
 // Si Tibia no se encuentra (ventana cerrada, título no matches), retorna:
 //   "GEOMETRY <vx> <vy> <vw> <vh> ERR window_not_found\n"
 
+/// Query de geometría que el bot usa para auto-configurar sus Coords.
+///
+/// `hid_is_primary_only`: cuando true, reporta vscreen = primary monitor dims.
+/// Esto es necesario en modo serial (Arduino HID) porque el descriptor del
+/// AbsoluteMouse targetea SOLO el primary monitor (rango 0..primary_w, 0..primary_h)
+/// — no el virtual desktop completo. Si el bot usa el vscreen real (multi-monitor),
+/// calcula HID coords contra una extensión mayor y el cursor cae escalado a la
+/// mitad (o cuadrante, si también mismatchea Y).
+///
+/// Fix 2026-04-16 V7: sin este flag, con Tibia en primary y mode=serial, clicks
+/// del bot caían en primary_w/2 de la coord esperada, haciendo inalcanzable la
+/// mitad izquierda del monitor.
 #[cfg(windows)]
 fn query_geometry(title_pattern: &str) -> String {
+    query_geometry_ex(title_pattern, false)
+}
+
+#[cfg(windows)]
+fn query_geometry_ex(title_pattern: &str, hid_is_primary_only: bool) -> String {
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClientRect, GetSystemMetrics, GetWindowRect, GetWindowTextW,
-        IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN,
+        IsWindowVisible, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     };
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 
     unsafe {
-        // Virtual screen bbox: puede tener origen negativo si hay monitores
-        // a la izquierda/arriba del primario.
-        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        // Virtual screen bbox real (todos los monitores).
+        let real_vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let real_vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let real_vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let real_vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        // Primary monitor dims (siempre en origen 0,0 per Windows).
+        let pw = GetSystemMetrics(SM_CXSCREEN);
+        let ph = GetSystemMetrics(SM_CYSCREEN);
+
+        // Reporta PRIMARY como vscreen cuando HID solo targetea primary (mode=serial).
+        // Esto hace que el bot compute HID coords contra primary_w/h (el rango real
+        // del AbsoluteMouse descriptor), no contra el vscreen completo.
+        let (vx, vy, vw, vh) = if hid_is_primary_only {
+            (0, 0, pw, ph)
+        } else {
+            (real_vx, real_vy, real_vw, real_vh)
+        };
 
         // Buscar HWND por título conteniendo el pattern via EnumWindows
         // (FindWindow solo matchea exact title; necesitamos "contains").
@@ -708,7 +737,14 @@ async fn run_proxy(
                                         .unwrap_or("")
                                         .trim();
                                     let pattern = if pattern.is_empty() { "Tibia" } else { pattern };
-                                    query_geometry(pattern).into_bytes()
+                                    // Modo serial: Arduino HID targetea primary only.
+                                    // Reportamos vscreen = primary para que el bot compute
+                                    // HID coords contra el rango real del HID descriptor.
+                                    #[cfg(windows)]
+                                    let reply = query_geometry_ex(pattern, true);
+                                    #[cfg(not(windows))]
+                                    let reply = query_geometry(pattern);
+                                    reply.into_bytes()
                                 } else {
                                     b"ERR unknown_local_cmd\n".to_vec()
                                 };
