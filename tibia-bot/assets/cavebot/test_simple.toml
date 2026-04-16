@@ -47,45 +47,44 @@ loop = true
 kind = "label"
 name = "start"
 
-# Node 1: Punto inicial (CENTER)
-# EDITAR: poner el coord actual del char
+# Node 1: Punto inicial CENTER (Ab'dendriel ciudad, coord real del char)
 [[step]]
 kind = "node"
-x = 32659         # EDITAR con curl /vision/perception .game_coords[0]
-y = 31684         # EDITAR con curl /vision/perception .game_coords[1]
-z = 7             # EDITAR con curl /vision/perception .game_coords[2]
+x = 32660         # CENTER_X (user actual en ciudad)
+y = 31683         # CENTER_Y
+z = 7             # CENTER_Z (Ab'dendriel piso 7)
 max_wait_ms = 15000
 
 # Node 2: 3 tiles al este
 [[step]]
 kind = "node"
-x = 32662         # CENTER_X + 3
-y = 31684         # CENTER_Y
-z = 7             # CENTER_Z
+x = 32663         # CENTER_X + 3
+y = 31683
+z = 7
 max_wait_ms = 15000
 
 # Node 3: 3 tiles al este Y 3 al sur
 [[step]]
 kind = "node"
-x = 32662         # CENTER_X + 3
-y = 31687         # CENTER_Y + 3
-z = 7             # CENTER_Z
+x = 32663         # CENTER_X + 3
+y = 31686         # CENTER_Y + 3
+z = 7
 max_wait_ms = 15000
 
-# Node 4: 3 tiles al sur (center_x, center_y+3)
+# Node 4: 3 tiles al sur
 [[step]]
 kind = "node"
-x = 32659         # CENTER_X
-y = 31687         # CENTER_Y + 3
-z = 7             # CENTER_Z
+x = 32660         # CENTER_X
+y = 31686         # CENTER_Y + 3
+z = 7
 max_wait_ms = 15000
 
 # Node 5: regreso a CENTER
 [[step]]
 kind = "node"
-x = 32659         # CENTER_X
-y = 31684         # CENTER_Y
-z = 7             # CENTER_Z
+x = 32660         # CENTER_X
+y = 31683         # CENTER_Y
+z = 7
 max_wait_ms = 15000
 
 # Pause 2 segundos en el centro antes de reloopear

@@ -96,6 +96,13 @@ pub struct Vision {
     /// is_moving=true" por >N ticks. Evita log spam (una sola alerta por
     /// incidente, se clearea cuando vuelve a moverse).
     reported_coords_stale: bool,
+    /// Acumulador de displacement del minimap en pixels, usado para actualizar
+    /// `last_game_coords` incrementalmente entre template matches.
+    /// El template match corre cada 500ms (lento, ~80-160ms) mientras que el
+    /// displacement frame-a-frame es barato (~1ms). Sumando los displacements
+    /// entre matches, conseguimos tracking tile-perfect en tiempo real sin
+    /// esperar al próximo template match.
+    tracked_sub_tile_px: (i32, i32),
     /// Intervalo de frames entre detecciones de coords (default 15).
     coords_detect_interval: u32,
     /// Pixels por tile en el minimap NDI (default 5). Usado para downsamplear
@@ -254,6 +261,7 @@ impl Vision {
             prev_game_coords: None,
             game_coords_stale_ticks: 0,
             reported_coords_stale: false,
+            tracked_sub_tile_px: (0, 0),
             coords_detect_interval: 15,
             ndi_tile_scale: 5,
             last_game_coords: None,
@@ -556,6 +564,54 @@ impl Vision {
         // pendiente mover a background thread para prod.
         const COORDS_REVALIDATE_INTERVAL: u32 = 30;
 
+        // ── TRACKING HÍBRIDO game_coords ────────────────────────────────────
+        //
+        // Arquitectura en 2 niveles:
+        //   1. **Template matching** (cada `coords_detect_interval` frames =
+        //      500ms @ 30Hz): MinimapMatcher establece ground truth absoluta.
+        //      Lento (~80-160ms narrow, ~3-4s full) pero preciso hasta 1 tile.
+        //   2. **Displacement incremental** (cada frame = 33ms): acumula el
+        //      shift del minimap frame-a-frame en pixels. Convierte a tiles
+        //      cuando acumula >= ndi_tile_scale pixels en algún axis.
+        //
+        // Esto permite tracking tile-perfect en tiempo real SIN esperar al
+        // próximo template match. Antes del fix, el matcher siempre daba el
+        // mismo coord durante ~15s porque el best SSD global no cambiaba con
+        // shifts de 1-2 tiles (patches casi idénticos). El cavebot clickeaba
+        // al mismo pixel del minimap y el char caminaba sin que el bot
+        // supiera que había llegado.
+        //
+        // El displacement corrige esto: cada frame el minimap se desplaza al
+        // mover el char, y acumulamos el delta hasta completar 1 tile,
+        // actualizando last_game_coords inmediatamente.
+        //
+        // Cuando llega un template match fresh, trusteamos absolutamente el
+        // nuevo coord (ground truth) y reseteamos el acumulador.
+
+        // PASO 1: actualizar coord incrementalmente con displacement (cada frame).
+        if let (Some(last_coord), Some(disp_px)) =
+            (self.last_game_coords, minimap_displacement)
+        {
+            // Ignorar displacements triviales (ruido)
+            if disp_px.0 != 0 || disp_px.1 != 0 {
+                let (new_coord, new_accum) = game_coords::apply_displacement(
+                    last_coord,
+                    self.tracked_sub_tile_px,
+                    disp_px,
+                    self.ndi_tile_scale,
+                );
+                if new_coord != last_coord {
+                    tracing::debug!(
+                        "game_coords tracked: {:?} → {:?} via displacement ({}, {})",
+                        last_coord, new_coord, disp_px.0, disp_px.1
+                    );
+                    self.last_game_coords = Some(new_coord);
+                }
+                self.tracked_sub_tile_px = new_accum;
+            }
+        }
+
+        // PASO 2: template match periódico (ground truth), override displacement tracking.
         if self.frame_count % self.coords_detect_interval as u64 == 0 {
             if let Some(ref snap) = minimap {
                 if !self.minimap_matcher.is_empty() {
@@ -584,7 +640,9 @@ impl Vision {
                         );
                     }
                     if detected.is_some() {
+                        // Ground truth: override displacement tracking.
                         self.last_game_coords = detected;
+                        self.tracked_sub_tile_px = (0, 0);
                     }
                 }
             }

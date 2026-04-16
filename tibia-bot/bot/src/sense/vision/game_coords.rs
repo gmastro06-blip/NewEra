@@ -383,6 +383,71 @@ pub fn detect_position(
     Some((center_x, center_y, pos.z))
 }
 
+// ── Tracking híbrido helpers ─────────────────────────────────────────────────
+
+/// Aplica un displacement (en pixels del minimap NDI) a un coord de mundo,
+/// usando un acumulador sub-tile para precisión cuando el displacement es
+/// menor que `ndi_tile_scale` pixels.
+///
+/// Retorna `(new_coord, new_accum_px)` donde:
+/// - `new_coord` es el coord actualizado (solo cambia al completar 1+ tiles)
+/// - `new_accum_px` es el remainder pixel-offset que NO completó 1 tile
+///
+/// # Ejemplos
+///
+/// ```
+/// use tibia_bot::sense::vision::game_coords::apply_displacement;
+///
+/// // scale=2 px/tile, shift de 2 px al este → +1 tile east
+/// let (coord, accum) = apply_displacement(
+///     (100, 200, 7),
+///     (0, 0),
+///     (2, 0),
+///     2,
+/// );
+/// assert_eq!(coord, (101, 200, 7));
+/// assert_eq!(accum, (0, 0));
+///
+/// // scale=2, shift de solo 1 px → no cambia coord, acumula
+/// let (coord, accum) = apply_displacement(
+///     (100, 200, 7),
+///     (0, 0),
+///     (1, 0),
+///     2,
+/// );
+/// assert_eq!(coord, (100, 200, 7));
+/// assert_eq!(accum, (1, 0));
+///
+/// // Accumulated de 1 + nuevo shift 1 = 2 → +1 tile east
+/// let (coord, accum) = apply_displacement(
+///     (100, 200, 7),
+///     (1, 0),
+///     (1, 0),
+///     2,
+/// );
+/// assert_eq!(coord, (101, 200, 7));
+/// assert_eq!(accum, (0, 0));
+/// ```
+pub fn apply_displacement(
+    last_coord: (i32, i32, i32),
+    accum_px: (i32, i32),
+    displacement_px: (i32, i32),
+    ndi_tile_scale: u32,
+) -> ((i32, i32, i32), (i32, i32)) {
+    let scale = ndi_tile_scale.max(1) as i32;
+    let new_accum_x = accum_px.0 + displacement_px.0;
+    let new_accum_y = accum_px.1 + displacement_px.1;
+    let delta_tiles_x = new_accum_x / scale;
+    let delta_tiles_y = new_accum_y / scale;
+    let new_coord = (
+        last_coord.0 + delta_tiles_x,
+        last_coord.1 + delta_tiles_y,
+        last_coord.2,
+    );
+    let remainder = (new_accum_x % scale, new_accum_y % scale);
+    (new_coord, remainder)
+}
+
 // ── MinimapMatcher (CCORR fallback) ───────────────────────────────────────────
 //
 // dHash-based detection falla con el cliente Tibia 12 porque el anti-aliasing
@@ -1294,6 +1359,102 @@ mod tests {
         let snap = matcher.stats_snapshot();
         assert_eq!(snap.sectors_loaded, 3);
         assert_eq!(snap.floors_loaded, vec![7, 8]);
+    }
+
+    // ── apply_displacement tests ──────────────────────────────────────────
+
+    #[test]
+    fn apply_displacement_zero_shift_does_not_change_coord() {
+        let (c, a) = apply_displacement((100, 200, 7), (0, 0), (0, 0), 2);
+        assert_eq!(c, (100, 200, 7));
+        assert_eq!(a, (0, 0));
+    }
+
+    #[test]
+    fn apply_displacement_exact_tile_shift_updates_coord() {
+        // scale=2, shift 2px east → +1 tile east
+        let (c, a) = apply_displacement((100, 200, 7), (0, 0), (2, 0), 2);
+        assert_eq!(c, (101, 200, 7));
+        assert_eq!(a, (0, 0));
+    }
+
+    #[test]
+    fn apply_displacement_sub_tile_accumulates() {
+        // scale=2, shift 1px → accum=1, coord no cambia
+        let (c, a) = apply_displacement((100, 200, 7), (0, 0), (1, 0), 2);
+        assert_eq!(c, (100, 200, 7));
+        assert_eq!(a, (1, 0));
+    }
+
+    #[test]
+    fn apply_displacement_accumulator_completes_tile() {
+        // accum=1, new shift=1 → total=2 → +1 tile, accum reset
+        let (c, a) = apply_displacement((100, 200, 7), (1, 0), (1, 0), 2);
+        assert_eq!(c, (101, 200, 7));
+        assert_eq!(a, (0, 0));
+    }
+
+    #[test]
+    fn apply_displacement_multi_tile_shift() {
+        // scale=2, shift 5px east → 2 tiles east + 1px accum
+        let (c, a) = apply_displacement((100, 200, 7), (0, 0), (5, 0), 2);
+        assert_eq!(c, (102, 200, 7));
+        assert_eq!(a, (1, 0));
+    }
+
+    #[test]
+    fn apply_displacement_negative_shift_works() {
+        // scale=2, shift -4px west → -2 tiles west
+        let (c, a) = apply_displacement((100, 200, 7), (0, 0), (-4, 0), 2);
+        assert_eq!(c, (98, 200, 7));
+        assert_eq!(a, (0, 0));
+    }
+
+    #[test]
+    fn apply_displacement_diagonal_shift() {
+        // scale=2, shift (2, 4) → +1 east, +2 south
+        let (c, a) = apply_displacement((100, 200, 7), (0, 0), (2, 4), 2);
+        assert_eq!(c, (101, 202, 7));
+        assert_eq!(a, (0, 0));
+    }
+
+    #[test]
+    fn apply_displacement_preserves_z() {
+        // z no cambia con displacement (solo template match puede cambiar piso)
+        let (c, _) = apply_displacement((100, 200, 14), (0, 0), (2, 0), 2);
+        assert_eq!(c.2, 14);
+    }
+
+    #[test]
+    fn apply_displacement_multi_frame_walk_simulation() {
+        // Simula caminar 5 tiles al este a 30 Hz con scale=2 (shift 2px/tile).
+        // Durante 5 frames consecutivos, cada uno con +2 px displacement.
+        let scale = 2u32;
+        let mut coord = (100, 200, 7);
+        let mut accum = (0, 0);
+        for _ in 0..5 {
+            let (c, a) = apply_displacement(coord, accum, (2, 0), scale);
+            coord = c;
+            accum = a;
+        }
+        assert_eq!(coord, (105, 200, 7), "5 shifts de 2px deben dar +5 tiles");
+        assert_eq!(accum, (0, 0));
+    }
+
+    #[test]
+    fn apply_displacement_scale_1_every_shift_is_a_tile() {
+        // scale=1 (1 px/tile): cada pixel de shift = 1 tile
+        let (c, a) = apply_displacement((100, 200, 7), (0, 0), (3, -2), 1);
+        assert_eq!(c, (103, 198, 7));
+        assert_eq!(a, (0, 0));
+    }
+
+    #[test]
+    fn apply_displacement_handles_scale_zero() {
+        // scale=0 debe tratarse como 1 (max prevención)
+        let (c, _) = apply_displacement((100, 200, 7), (0, 0), (1, 0), 0);
+        // No panic, coord cambia por 1 tile (como scale=1)
+        assert_eq!(c, (101, 200, 7));
     }
 
     #[test]
