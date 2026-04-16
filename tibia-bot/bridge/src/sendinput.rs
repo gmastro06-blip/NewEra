@@ -18,7 +18,22 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
 };
 
+use std::sync::Mutex;
 use tracing::{debug, warn};
+
+/// Última posición absoluta (0-65535, rango SendInput) del cursor enviada por
+/// `MOUSE_MOVE`. Se usa para que `MOUSE_CLICK` posterior empaquete en el mismo
+/// evento SendInput los flags `MOVE|ABSOLUTE|VIRTUALDESK|BUTTON_DOWN` con esta
+/// posición, garantizando que el botón se dispara EXACTAMENTE donde queríamos.
+///
+/// Bug fix 2026-04-16 (V7 blocker): sin esto, MOUSE_MOVE y MOUSE_CLICK viajan
+/// como 2 comandos TCP separados. Entre ambos el cursor puede derivar (mouse
+/// físico en otro monitor, input ajeno en la cola de Windows) o Tibia puede
+/// no haber actualizado su hit-test interno. En el viewport el margen tolera
+/// el drift pero los slots del sidebar (32×32 px) NO — el right-click cae en
+/// el borde y no produce context menu. Atomic MOVE+BUTTON en un solo SendInput
+/// batch elimina ambos problemas.
+static LAST_MOVE_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
 /// Resultado de un comando ejecutado.
 pub struct SendInputResult {
@@ -133,6 +148,9 @@ fn make_key_input(scan: u16, flags: windows::Win32::UI::Input::KeyboardAndMouse:
 /// Bug fix 2026-04-16: la sesión live descubrió que sin VIRTUALDESK los
 /// clicks con coords "correctas" (virtual X=2872) caían en monitor Claude
 /// porque Windows los interpretaba como relativos al primary solamente.
+///
+/// Además cachea la posición en `LAST_MOVE_POS` para que `MOUSE_CLICK`
+/// posterior pueda hacer atomic MOVE+BUTTON en el mismo SendInput batch.
 #[cfg(windows)]
 fn mouse_move_abs(x: i32, y: i32) {
     let input = INPUT {
@@ -149,17 +167,33 @@ fn mouse_move_abs(x: i32, y: i32) {
         },
     };
     unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32); }
+    // Cachear para que el próximo MOUSE_CLICK use atomic MOVE+BUTTON.
+    if let Ok(mut pos) = LAST_MOVE_POS.lock() {
+        *pos = Some((x, y));
+    }
     debug!("SendInput: MOUSE_MOVE ({}, {})", x, y);
 }
 
 /// Click de un botón del mouse.
 ///
-/// IMPORTANTE: SendInput con down+up juntos en un solo batch lo envía demasiado
-/// rápido y Tibia NO registra el click en widgets pequeños (inventory slots,
-/// context menu items). Viewport center tolera sin hold; sidebar slots NO.
+/// Si hay una posición cacheada por un `MOUSE_MOVE` previo, empaqueta en cada
+/// evento SendInput los flags `MOVE|ABSOLUTE|VIRTUALDESK|BUTTON_*` con esa
+/// posición. Esto garantiza que el botón se dispara EXACTAMENTE donde
+/// queríamos, sin importar si otro input ajeno movió el cursor entre el
+/// MOUSE_MOVE y el MOUSE_CLICK.
 ///
-/// Fix 2026-04-16: separar down y up en 2 SendInput calls con hold de 30ms
-/// entre ambos. Similar al CLICK_HOLD_MS del Arduino HID firmware.
+/// Si no hay posición cacheada (ej. cliente mandó MOUSE_CLICK sin MOVE
+/// previo), cae al comportamiento legacy: down/up sin posición en el
+/// evento, usando cursor position actual.
+///
+/// Timing:
+///   - Settling pre-DOWN: 25ms (permite a Tibia procesar el WM_MOUSEMOVE
+///     que dispara MOVE|... antes del WM_*BUTTONDOWN, actualizando hit-test).
+///   - Hold DOWN→UP: 80ms (antes 45ms; era corto para que Tibia registre
+///     el right-click como context-menu en widgets pequeños del sidebar).
+///
+/// Fix 2026-04-16 (V7 blocker): antes MOVE y CLICK viajaban en eventos
+/// separados y drift del cursor entre ambos rompía clicks en slots de 32×32.
 #[cfg(windows)]
 fn mouse_click(button: &str) {
     let (down_flag, up_flag) = match button.to_uppercase().as_str() {
@@ -172,16 +206,47 @@ fn mouse_click(button: &str) {
         }
     };
 
-    // Settling delay: MOUSE_MOVE dispatch via SendInput es async en user-space;
-    // el renderer del cliente (y hit-test) puede aún ver cursor en posición previa
-    // cuando DOWN llega. 25ms da 1-2 frames al client para actualizarse.
-    std::thread::sleep(std::time::Duration::from_millis(25));
-    let down = [make_mouse_input(down_flag)];
-    let up   = [make_mouse_input(up_flag)];
+    let pos = LAST_MOVE_POS.lock().ok().and_then(|p| *p);
+    let pos_flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+
+    // Pre-settle: SOLO en flujo legacy (sin atomic). En legacy, el MOUSE_MOVE
+    // previo fue un evento separado y el renderer del cliente puede aún no
+    // haber procesado el WM_MOUSEMOVE cuando llega el WM_*BUTTONDOWN. 25ms da
+    // 1-2 frames al client para actualizar hit-test.
+    //
+    // En flujo atómico la posición va empaquetada en el mismo evento que el
+    // BUTTON_DOWN, así que Tibia procesa WM_MOUSEMOVE → hit-test update →
+    // WM_*BUTTONDOWN en orden en un solo frame. Pre-settle innecesario y, más
+    // crítico, rompía el timeout de 100ms del bot: 25 + 80 = 105ms > timeout.
+    let pre_settle_ms = if pos.is_some() { 0 } else { 25 };
+    if pre_settle_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(pre_settle_ms));
+    }
+
+    let (down, up) = match pos {
+        Some((x, y)) => (
+            [make_mouse_input_pos(x, y, pos_flags | down_flag)],
+            [make_mouse_input_pos(x, y, pos_flags | up_flag)],
+        ),
+        None => (
+            [make_mouse_input(down_flag)],
+            [make_mouse_input(up_flag)],
+        ),
+    };
+
     unsafe { SendInput(&down, std::mem::size_of::<INPUT>() as i32); }
-    std::thread::sleep(std::time::Duration::from_millis(45));
+    std::thread::sleep(std::time::Duration::from_millis(80));
     unsafe { SendInput(&up, std::mem::size_of::<INPUT>() as i32); }
-    debug!("SendInput: MOUSE_CLICK {} (25ms pre, 45ms hold)", button);
+    match pos {
+        Some((x, y)) => debug!(
+            "SendInput: MOUSE_CLICK {} atomic @ ({},{}) (0ms pre, 80ms hold, total ~80ms)",
+            button, x, y
+        ),
+        None => debug!(
+            "SendInput: MOUSE_CLICK {} legacy (sin MOVE previo, cursor actual)",
+            button
+        ),
+    }
 }
 
 #[cfg(windows)]
@@ -192,6 +257,26 @@ fn make_mouse_input(flags: MOUSE_EVENT_FLAGS) -> INPUT {
             mi: MOUSEINPUT {
                 dx: 0,
                 dy: 0,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// Crea un evento MOUSEINPUT con posición absoluta + flags (útil para atomic
+/// MOVE+BUTTON donde queremos que la posición se reafirme en el mismo evento
+/// que el BUTTON_DOWN/UP).
+#[cfg(windows)]
+fn make_mouse_input_pos(dx: i32, dy: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
+    INPUT {
+        r#type: INPUT_TYPE(0), // INPUT_MOUSE
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
                 mouseData: 0,
                 dwFlags: flags,
                 time: 0,
@@ -305,4 +390,60 @@ fn mouse_move_abs(_x: i32, _y: i32) {
 #[cfg(not(windows))]
 fn mouse_click(_button: &str) {
     warn!("SendInput: no disponible fuera de Windows");
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_accepts_0x_prefix() {
+        assert_eq!(parse_hex("0x3A"), Some(0x3A));
+        assert_eq!(parse_hex("0X3a"), Some(0x3A));
+    }
+
+    #[test]
+    fn parse_hex_accepts_decimal() {
+        assert_eq!(parse_hex("58"), Some(58));
+        assert_eq!(parse_hex("255"), Some(255));
+    }
+
+    #[test]
+    fn parse_hex_rejects_garbage() {
+        assert_eq!(parse_hex("xyz"), None);
+        assert_eq!(parse_hex(""), None);
+    }
+
+    /// Regresión V7: verifica que un MOUSE_MOVE seguido de MOUSE_CLICK
+    /// deja la posición cacheada en LAST_MOVE_POS para el click atómico.
+    /// Sin esto, el right-click en sidebar slots (32×32) no producía
+    /// context menu por drift del cursor entre MOVE y CLICK.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "mueve el cursor real del usuario — correr manualmente con --ignored"]
+    fn mouse_move_abs_updates_last_pos_cache() {
+        // Reset
+        *LAST_MOVE_POS.lock().unwrap() = None;
+        // Call
+        mouse_move_abs(12345, 6789);
+        // Verify
+        let cached = LAST_MOVE_POS.lock().unwrap();
+        assert_eq!(*cached, Some((12345, 6789)));
+    }
+
+    /// Verifica que execute_command rechaza comandos malformados sin panic.
+    #[test]
+    fn execute_command_rejects_malformed() {
+        assert!(!execute_command("MOUSE_MOVE bad").ok);
+        assert!(!execute_command("KEY_TAP xyz").ok);
+        assert!(!execute_command("UNKNOWN_CMD").ok);
+    }
+
+    /// RESET es noop (no hay teclas held en SendInput mode).
+    #[test]
+    fn execute_command_reset_is_ok() {
+        assert!(execute_command("RESET").ok);
+    }
 }
