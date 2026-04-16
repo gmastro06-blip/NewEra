@@ -24,7 +24,10 @@
 //   PING\n              → responde "PONG\n"
 //   MOUSE_MOVE X Y\n    → mueve mouse a (X,Y) en HID absoluto 0-32767
 //                         responde "OK\n"
-//   MOUSE_CLICK\n       → click izquierdo (down + up con 30ms de gap)
+//   MOUSE_CLICK\n       → click izquierdo (default, mismo que "MOUSE_CLICK L")
+//   MOUSE_CLICK L\n     → click izquierdo
+//   MOUSE_CLICK R\n     → click derecho (context menu en Tibia)
+//   MOUSE_CLICK M\n     → click medio (scroll wheel click)
 //                         responde "OK\n"
 //   KEY_TAP 0xNN\n      → press + release de la HID usage ID 0xNN
 //                         responde "OK\n"
@@ -138,11 +141,34 @@ void process_command(const char* cmd) {
             Serial.print(F("ERR mouse_parse\n"));
         }
     }
-    // MOUSE_CLICK
-    else if (strcmp(cmd, "MOUSE_CLICK") == 0) {
+    // MOUSE_CLICK [L|R|M]  (default L si no hay argumento)
+    //
+    // Acepta 3 variantes:
+    //   "MOUSE_CLICK"     → left click (compat con firmware pre-2026-04-16)
+    //   "MOUSE_CLICK L"   → left click
+    //   "MOUSE_CLICK R"   → right click (context menu en Tibia)
+    //   "MOUSE_CLICK M"   → middle click
+    //
+    // Bug fix 2026-04-16: antes el Arduino solo hacía LEFT, rechazando
+    // silenciosamente "MOUSE_CLICK R" con "ERR unknown command". Esto
+    // rompía todo el flujo de stow_bag / deposit / context menus del bot.
+    else if (strcmp(cmd, "MOUSE_CLICK") == 0
+          || strcmp(cmd, "MOUSE_CLICK L") == 0) {
         AbsoluteMouse.press(MOUSE_LEFT);
         delay(CLICK_HOLD_MS);
         AbsoluteMouse.release(MOUSE_LEFT);
+        Serial.print(F("OK\n"));
+    }
+    else if (strcmp(cmd, "MOUSE_CLICK R") == 0) {
+        AbsoluteMouse.press(MOUSE_RIGHT);
+        delay(CLICK_HOLD_MS);
+        AbsoluteMouse.release(MOUSE_RIGHT);
+        Serial.print(F("OK\n"));
+    }
+    else if (strcmp(cmd, "MOUSE_CLICK M") == 0) {
+        AbsoluteMouse.press(MOUSE_MIDDLE);
+        delay(CLICK_HOLD_MS);
+        AbsoluteMouse.release(MOUSE_MIDDLE);
         Serial.print(F("OK\n"));
     }
     // KEY_TAP <hex_or_dec>
