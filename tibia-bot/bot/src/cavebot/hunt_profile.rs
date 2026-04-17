@@ -221,8 +221,13 @@ mod tests {
     fn supplies_list_roundtrips() {
         let profile = HuntProfile::load(&sample_profile_path()).expect("load profile");
         let list = profile.supplies_list();
-        assert_eq!(list.len(), 3);
+        // 2 items actualmente (mana_potion + health_potion). rope está
+        // documentada en comentario pero no en [supplies] porque no tiene
+        // template de inventory (uncheckable). Si se agrega rope.png, el
+        // profile debería re-incluirla y este assert sube a 3.
+        assert_eq!(list.len(), 2);
         assert!(list.iter().any(|(name, _)| name == "mana_potion"));
+        assert!(list.iter().any(|(name, _)| name == "health_potion"));
     }
 
     #[test]

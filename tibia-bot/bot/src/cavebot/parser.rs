@@ -62,6 +62,12 @@ struct CavebotFile {
 struct CavebotHeader {
     #[serde(default = "default_loop")]
     loop_: bool,
+    /// Opcional. Si se setea, el parser carga `assets/hunts/<name>.toml`
+    /// y los steps pueden consumir datos del profile con `from_profile = true`
+    /// (ej: check_supplies lee las thresholds de `[supplies]` en vez de repetir
+    /// la lista inline). Ver `assets/hunts/abdendriel_wasps.toml` para un ejemplo.
+    #[serde(default)]
+    hunt_profile: Option<String>,
 }
 
 fn default_loop() -> bool {
@@ -189,6 +195,10 @@ struct StepToml {
     on_fail: Option<String>,
     #[serde(default)]
     requirements: Option<Vec<SupplyRequirement>>,
+    /// Si true, CheckSupplies toma las thresholds del hunt profile declarado
+    /// en `[cavebot].hunt_profile`. Mutuamente exclusivo con `requirements`.
+    #[serde(default)]
+    from_profile: bool,
     // TypeInField
     #[serde(default)]
     field_vx: Option<i32>,
@@ -287,12 +297,24 @@ pub fn load_with_tuning(path: &Path, fps: u32, tuning: super::runner::NodeTuning
         .with_context(|| format!("No se pudo leer '{}'", path.display()))?;
     let file: CavebotFile = toml::from_str(&raw)
         .with_context(|| format!("TOML inválido en '{}'", path.display()))?;
-    build_cavebot(file, fps, tuning)
+
+    // Resolver `hunts_dir` convencional: el cavebot vive típicamente en
+    // `<assets>/cavebot/<name>.toml` y los hunt profiles en `<assets>/hunts/`.
+    // Si la estructura de directorios es distinta, el profile no se carga y
+    // los steps con `from_profile = true` fallarán con un error explícito.
+    let hunts_dir = path.parent().and_then(Path::parent).map(|p| p.join("hunts"));
+
+    build_cavebot(file, fps, tuning, hunts_dir.as_deref())
 }
 
 /// Construye un `Cavebot` desde una estructura TOML ya parseada.
 /// Privado al módulo — los tests lo usan directamente via super::.
-fn build_cavebot(file: CavebotFile, fps: u32, tuning: super::runner::NodeTuning) -> Result<Cavebot> {
+fn build_cavebot(
+    file:      CavebotFile,
+    fps:       u32,
+    tuning:    super::runner::NodeTuning,
+    hunts_dir: Option<&Path>,
+) -> Result<Cavebot> {
     // Si hay sections, concatenar sus steps en orden. Si no, usar los steps planos.
     let raw_steps: Vec<StepToml> = if !file.sections.is_empty() {
         file.sections.into_iter().flat_map(|s| s.steps).collect()
@@ -304,13 +326,43 @@ fn build_cavebot(file: CavebotFile, fps: u32, tuning: super::runner::NodeTuning)
         bail!("Cavebot file no contiene ningún step");
     }
 
+    // Cargar hunt profile si el cavebot lo referencia.
+    let hunt_profile: Option<super::hunt_profile::HuntProfile> = match (
+        file.cavebot.hunt_profile.as_deref(),
+        hunts_dir,
+    ) {
+        (Some(name), Some(dir)) => {
+            let profile = super::hunt_profile::HuntProfile::load_by_name(dir, name)
+                .with_context(|| format!(
+                    "no se pudo cargar hunt profile '{}' desde '{}'",
+                    name, dir.display()
+                ))?;
+            tracing::info!(
+                "Cavebot hunt_profile='{}' cargado: {} stackables, {} supplies",
+                profile.name,
+                profile.loot.stackables.len(),
+                profile.supplies.len()
+            );
+            Some(profile)
+        }
+        (Some(name), None) => {
+            bail!(
+                "cavebot TOML declara hunt_profile='{}' pero no se pudo derivar \
+                 hunts_dir del path. Los cavebots deben vivir en <assets>/cavebot/*.toml \
+                 con hunt profiles en <assets>/hunts/*.toml.",
+                name
+            );
+        }
+        (None, _) => None,
+    };
+
     // Primera pasada: convertir cada StepToml → Step, usando target_idx=0 placeholder
     // para los Goto. Recolectar simultáneamente el mapa label → índice.
     let mut steps = Vec::with_capacity(raw_steps.len());
     let mut labels: HashMap<String, usize> = HashMap::new();
 
     for (idx, st) in raw_steps.into_iter().enumerate() {
-        let step = parse_step_toml(st)
+        let step = parse_step_toml(st, hunt_profile.as_ref())
             .with_context(|| format!("step[{}]", idx))?;
         if let StepKind::Label = &step.kind {
             let name = step.label.clone()
@@ -363,7 +415,10 @@ fn build_cavebot(file: CavebotFile, fps: u32, tuning: super::runner::NodeTuning)
 
 // ── StepToml → Step ──────────────────────────────────────────────────────────
 
-fn parse_step_toml(st: StepToml) -> Result<Step> {
+fn parse_step_toml(
+    st:            StepToml,
+    hunt_profile:  Option<&super::hunt_profile::HuntProfile>,
+) -> Result<Step> {
     let StepToml {
         kind, name, key, duration_ms, interval_ms,
         until, max_wait_ms, label, when, vx, vy, retry_count,
@@ -372,7 +427,7 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
         x, y, z,
         chest_vx, chest_vy, stow_vx, stow_vy, menu_wait_ms, process_ms,
         item_vx, item_vy, amount_vx, amount_vy, confirm_vx, confirm_vy, quantity, spacing_ms,
-        on_fail, requirements,
+        on_fail, requirements, from_profile,
         slot_vx, slot_vy, menu_offset_x, menu_offset_y, stow_process_ms, max_iterations,
         field_vx, field_vy, text, wait_after_click_ms, wait_after_type_ms, char_spacing_ms,
         verify,
@@ -529,13 +584,46 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
             }
         }
         "check_supplies" => {
-            let reqs = requirements.context("check_supplies: falta 'requirements' (array)")?;
             let fail_label = on_fail.context("check_supplies: falta 'on_fail'")?;
-            if reqs.is_empty() {
-                bail!("check_supplies: 'requirements' no puede estar vacío");
-            }
+
+            // Tres casos:
+            // 1. from_profile=true + requirements=None → lee del hunt profile
+            // 2. from_profile=false + requirements=Some(...) → inline legacy
+            // 3. ambos presentes → error (ambiguous)
+            // 4. ninguno → error
+            let reqs: Vec<(String, u32)> = match (from_profile, requirements) {
+                (true, Some(_)) => bail!(
+                    "check_supplies: `from_profile = true` es mutuamente exclusivo con \
+                     `requirements = [...]`. Elegir uno."
+                ),
+                (true, None) => {
+                    let profile = hunt_profile.context(
+                        "check_supplies: `from_profile = true` requiere que el cavebot \
+                         TOML declare `[cavebot] hunt_profile = \"<name>\"` al top-level."
+                    )?;
+                    let list = profile.supplies_list();
+                    if list.is_empty() {
+                        bail!(
+                            "check_supplies: hunt_profile '{}' tiene [supplies] vacío.",
+                            profile.name
+                        );
+                    }
+                    // Convert (String, SupplyConfig) → (String, u32) usando el umbral `min`.
+                    list.into_iter().map(|(name, cfg)| (name, cfg.min)).collect()
+                }
+                (false, Some(rs)) => {
+                    if rs.is_empty() {
+                        bail!("check_supplies: 'requirements' no puede estar vacío");
+                    }
+                    rs.into_iter().map(|r| (r.item, r.min_count)).collect()
+                }
+                (false, None) => bail!(
+                    "check_supplies: falta `requirements` inline o `from_profile = true`"
+                ),
+            };
+
             StepKind::CheckSupplies {
-                requirements: reqs.into_iter().map(|r| (r.item, r.min_count)).collect(),
+                requirements: reqs,
                 on_fail_label: fail_label,
                 on_fail_idx: 0, // resuelto en label pass
             }
@@ -751,7 +839,24 @@ mod tests {
 
     fn parse(toml_src: &str) -> Result<Cavebot> {
         let file: CavebotFile = toml::from_str(toml_src)?;
-        build_cavebot(file, 30, crate::cavebot::runner::NodeTuning::default())
+        build_cavebot(file, 30, crate::cavebot::runner::NodeTuning::default(), None)
+    }
+
+    /// Variant que carga hunt profiles desde el directorio real `assets/hunts/`.
+    /// Usado por tests que validan `[cavebot] hunt_profile = "..."` en vivo.
+    #[allow(dead_code)]
+    fn parse_with_hunts_dir(toml_src: &str) -> Result<Cavebot> {
+        let file: CavebotFile = toml::from_str(toml_src)?;
+        let hunts_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("assets/hunts");
+        build_cavebot(
+            file,
+            30,
+            crate::cavebot::runner::NodeTuning::default(),
+            Some(&hunts_dir),
+        )
     }
 
     #[test]
@@ -1716,5 +1821,165 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{} no parsea: {}", script, e));
             assert!(cb.steps.len() > 0, "{} no tiene steps", script);
         }
+    }
+
+    // ── hunt_profile integration tests ────────────────────────────────────
+
+    #[test]
+    fn check_supplies_from_profile_loads_supplies_list() {
+        // Usa el hunt profile real abdendriel_wasps.toml y verifica que
+        // check_supplies con from_profile=true toma las thresholds del [supplies].
+        let toml_src = r#"
+[cavebot]
+loop = true
+hunt_profile = "abdendriel_wasps"
+
+[[step]]
+kind = "label"
+name = "refill"
+
+[[step]]
+kind = "check_supplies"
+on_fail = "refill"
+from_profile = true
+"#;
+        let cb = parse_with_hunts_dir(toml_src)
+            .expect("parse debería resolver hunt_profile correctamente");
+        // El step 1 (idx=1) debe ser CheckSupplies con reqs del profile.
+        match &cb.steps[1].kind {
+            StepKind::CheckSupplies { requirements, .. } => {
+                // abdendriel_wasps tiene 2 supplies checkables: mana_potion + health_potion.
+                // (rope está documentada pero excluida porque no hay template de inventory.)
+                assert_eq!(requirements.len(), 2, "expected 2 checkable supplies from profile");
+                let has_mana = requirements.iter().any(|(n, v)| n == "mana_potion" && *v == 20);
+                let has_health = requirements.iter().any(|(n, v)| n == "health_potion" && *v == 5);
+                assert!(has_mana, "mana_potion con min=20 esperado");
+                assert!(has_health, "health_potion con min=5 esperado");
+            }
+            other => panic!("esperado CheckSupplies, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_supplies_from_profile_without_hunt_profile_declared_fails() {
+        // from_profile = true pero [cavebot].hunt_profile no declarado → error.
+        let toml_src = r#"
+[cavebot]
+loop = true
+
+[[step]]
+kind = "label"
+name = "refill"
+
+[[step]]
+kind = "check_supplies"
+on_fail = "refill"
+from_profile = true
+"#;
+        let err = parse(toml_src).expect_err("debería fallar sin hunt_profile");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("hunt_profile"),
+            "error debería mencionar hunt_profile: {}", msg
+        );
+    }
+
+    #[test]
+    fn check_supplies_inline_and_from_profile_mutually_exclusive() {
+        // Ambos set → ambiguous error.
+        let toml_src = r#"
+[cavebot]
+loop = true
+hunt_profile = "abdendriel_wasps"
+
+[[step]]
+kind = "label"
+name = "refill"
+
+[[step]]
+kind = "check_supplies"
+on_fail = "refill"
+from_profile = true
+requirements = [{ item = "mana_potion", min_count = 10 }]
+"#;
+        let err = parse_with_hunts_dir(toml_src)
+            .expect_err("debería fallar con ambos presentes");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("mutuamente exclusivo"),
+            "error debería mencionar mutual exclusion: {}", msg
+        );
+    }
+
+    #[test]
+    fn check_supplies_inline_legacy_still_works() {
+        // Backwards compat: requirements = [...] sin hunt_profile.
+        let toml_src = r#"
+[cavebot]
+loop = true
+
+[[step]]
+kind = "label"
+name = "refill"
+
+[[step]]
+kind = "check_supplies"
+on_fail = "refill"
+requirements = [
+    { item = "mana_potion", min_count = 3 },
+    { item = "health_potion", min_count = 2 },
+]
+"#;
+        let cb = parse(toml_src).expect("inline legacy debería seguir parseando");
+        match &cb.steps[1].kind {
+            StepKind::CheckSupplies { requirements, .. } => {
+                assert_eq!(requirements.len(), 2);
+                assert!(requirements.iter().any(|(n, _)| n == "mana_potion"));
+            }
+            _ => panic!("expected CheckSupplies"),
+        }
+    }
+
+    #[test]
+    fn check_supplies_without_reqs_or_profile_fails() {
+        let toml_src = r#"
+[cavebot]
+loop = true
+
+[[step]]
+kind = "label"
+name = "refill"
+
+[[step]]
+kind = "check_supplies"
+on_fail = "refill"
+"#;
+        let err = parse(toml_src).expect_err("sin reqs ni from_profile debería fallar");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("requirements") || msg.contains("from_profile"));
+    }
+
+    #[test]
+    fn hunt_profile_unknown_name_fails_with_helpful_error() {
+        let toml_src = r#"
+[cavebot]
+loop = true
+hunt_profile = "definitely_not_a_real_hunt_xyz"
+
+[[step]]
+kind = "label"
+name = "refill"
+
+[[step]]
+kind = "wait"
+duration_ms = 100
+"#;
+        let err = parse_with_hunts_dir(toml_src)
+            .expect_err("profile inexistente debería fallar");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("definitely_not_a_real_hunt_xyz") || msg.contains("no se pudo cargar"),
+            "error debería mencionar el nombre del profile: {}", msg
+        );
     }
 }

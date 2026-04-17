@@ -53,7 +53,11 @@ drop = []
 # poison damage de wasps es mínimo (2 hp/turno). Cantidades muy reducidas.
 mana_potion   = { min = 20, target = 50 }   # bajo — wasps consumen muy poca mana
 health_potion = { min = 5,  target = 10 }   # emergency only, no combat heal
-rope          = { min = 1,  target = 1  }   # para escaleras/holes del hunt
+# rope: requerida físicamente para escaleras/holes, pero no tiene template
+# de inventory (assets/templates/inventory/rope.png no existe), así que
+# no se puede check automáticamente. Asumir que el user tiene 1 en bag.
+# Si se agrega el template, descomentar:
+# rope        = { min = 1,  target = 1  }
 
 # ─────────────────────────────────────────────────────────────────────
 # Monsters

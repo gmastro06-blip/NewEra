@@ -79,7 +79,11 @@
 # ═══════════════════════════════════════════════════════════════════════
 
 [cavebot]
-loop = true
+loop    = true
+# Profile centraliza loot/supplies/monsters/metrics para este hunt.
+# Los steps `check_supplies` con `from_profile = true` leen las thresholds
+# del `[supplies]` del profile en vez de duplicar la lista inline.
+hunt_profile = "abdendriel_wasps"
 
 # ═══════════════════════════════════════════════════════════════
 # LABELS DE ENTRADA
@@ -287,12 +291,14 @@ until = "no_combat"
 max_wait_ms = 5000
 
 # Verify supplies before going back to hunt
+# from_profile = true toma las thresholds del hunt profile declarado en
+# [cavebot].hunt_profile ("abdendriel_wasps"). Equivalente a una lista
+# inline pero sin duplicar config — si el profile cambia, este check
+# automáticamente usa los nuevos valores.
 [[step]]
 kind = "check_supplies"
 on_fail = "refill"
-requirements = [
-    { item = "mana_potion", min_count = 3 },
-]
+from_profile = true
 
 # ═══════════════════════════════════════════════════════════════
 # GO HUNT — Ab'dendriel city → ladder z=6→7 → surface
@@ -645,13 +651,14 @@ name = "count"
 kind = "label"
 name = "continue"
 
-# Verificar supplies — si quedan <10 manas, ir directo a leave (refill).
+# Verificar supplies mid-hunt. from_profile usa el threshold `min` del profile
+# (20 manas para Ab'dendriel Wasps), más conservador que el viejo 10 inline —
+# si el char baja de 20 manas, vuelve a refill en vez de arriesgar quedarse
+# sin durante el hunt.
 [[step]]
 kind = "check_supplies"
 on_fail = "leave"
-requirements = [
-    { item = "mana_potion", min_count = 10 },
-]
+from_profile = true
 
 # ═══════════════════════════════════════════════════════════════
 # LEAVE — vuelta a Ab'dendriel city (depot)
