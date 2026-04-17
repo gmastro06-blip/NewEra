@@ -52,6 +52,10 @@ name = "lint_cavebot"
 path = "src/bin/lint_cavebot.rs"
 
 [[bin]]
+name = "validate_hunt_profile"
+path = "src/bin/validate_hunt_profile.rs"
+
+[[bin]]
 name = "calibration_helper"
 path = "src/bin/calibration_helper.rs"
 

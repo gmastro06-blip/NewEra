@@ -524,3 +524,126 @@ impl Config {
         })
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: parse SOLO la sección `[game_coords]` desde un string TOML.
+    fn parse_gc(toml_src: &str) -> Result<GameCoordsConfig> {
+        #[derive(Debug, Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            game_coords: GameCoordsConfig,
+        }
+        let w: Wrapper = toml::from_str(toml_src)?;
+        Ok(w.game_coords)
+    }
+
+    #[test]
+    fn starting_coord_absent_defaults_to_none() {
+        let cfg = parse_gc(r#"
+[game_coords]
+map_index_path = ""
+"#).expect("parse");
+        assert_eq!(cfg.starting_coord, None);
+    }
+
+    #[test]
+    fn starting_coord_array_syntax_parses() {
+        let cfg = parse_gc(r#"
+[game_coords]
+map_index_path = "assets/map_index.bin"
+starting_coord = [32681, 31686, 6]
+"#).expect("parse");
+        assert_eq!(cfg.starting_coord, Some([32681, 31686, 6]));
+    }
+
+    #[test]
+    fn starting_coord_negative_values_allowed() {
+        // Algunos mapas Tibia tienen coords negativas en ciertos pisos
+        // profundos o en otros continentes; i32 acepta el rango completo.
+        let cfg = parse_gc(r#"
+[game_coords]
+map_index_path = ""
+starting_coord = [-100, 50000, 15]
+"#).expect("parse");
+        assert_eq!(cfg.starting_coord, Some([-100, 50000, 15]));
+    }
+
+    #[test]
+    fn starting_coord_too_few_elements_errors() {
+        // Array con <3 elementos debe fallar (el tipo es `[i32; 3]` — serde
+        // rechaza arrays más cortos).
+        let err2 = parse_gc(r#"
+[game_coords]
+starting_coord = [32681, 31686]
+"#).expect_err("array de 2 debería fallar");
+        let msg = format!("{:#}", err2);
+        assert!(
+            msg.contains("invalid") || msg.contains("length")
+                || msg.contains("expected") || msg.contains("3"),
+            "error debería mencionar length/expected/3, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn starting_coord_extra_elements_truncated_silently() {
+        // Limitación conocida del crate `toml` 0.5+: arrays con MÁS elementos
+        // que el tipo `[i32; N]` se truncan silenciosamente al 1er N en vez
+        // de fallar. Documentamos el comportamiento aquí — si el user
+        // escribe [1,2,3,4] por error, los valores 4+ se descartan sin warning.
+        //
+        // Mitigación: el validator binario (o un lint) debería flagear esto
+        // si se vuelve un problema en práctica.
+        let cfg = parse_gc(r#"
+[game_coords]
+starting_coord = [1, 2, 3, 4]
+"#).expect("arity>3 no es un error, se trunca");
+        assert_eq!(cfg.starting_coord, Some([1, 2, 3]),
+                   "los elementos extra se descartan silenciosamente");
+    }
+
+    #[test]
+    fn starting_coord_non_integer_errors() {
+        // Floats no son válidos para tile coords (son enteros).
+        let err = parse_gc(r#"
+[game_coords]
+starting_coord = [32681.5, 31686, 6]
+"#).expect_err("float en array debería fallar");
+        assert!(!format!("{:#}", err).is_empty());
+    }
+
+    #[test]
+    fn game_coords_full_config_with_all_fields() {
+        let cfg = parse_gc(r#"
+[game_coords]
+map_index_path         = "assets/map_index.bin"
+detect_interval        = 20
+ndi_tile_scale         = 5
+minimap_dir            = "assets/minimap/minimap"
+matcher_threshold      = 0.08
+matcher_floors         = "6,7,8,9,10"
+disambiguation_enabled = true
+starting_coord         = [32681, 31686, 6]
+"#).expect("parse");
+        assert_eq!(cfg.map_index_path, "assets/map_index.bin");
+        assert_eq!(cfg.detect_interval, Some(20));
+        assert_eq!(cfg.ndi_tile_scale, 5);
+        assert_eq!(cfg.minimap_dir, "assets/minimap/minimap");
+        assert!((cfg.matcher_threshold - 0.08).abs() < 1e-6);
+        assert_eq!(cfg.matcher_floors.as_deref(), Some("6,7,8,9,10"));
+        assert!(cfg.disambiguation_enabled);
+        assert_eq!(cfg.starting_coord, Some([32681, 31686, 6]));
+    }
+
+    #[test]
+    fn game_coords_default_has_none_starting_coord() {
+        let cfg = GameCoordsConfig::default();
+        assert_eq!(cfg.starting_coord, None);
+        assert!(cfg.disambiguation_enabled, "disambiguation defaults to true");
+    }
+}
