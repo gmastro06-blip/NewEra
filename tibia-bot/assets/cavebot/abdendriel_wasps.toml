@@ -211,12 +211,20 @@ max_wait_ms = 5000
 #   bye_button:          (117, 298)   — icono mano rojo (cierra chat)
 
 # 1. Say "hi" + click bag icon
+# Verify: tras el click al bag icon, la trade window debe renderizar.
+# Si el template npc_trade no aparece en 4s → SafetyPause con reason
+# diagnosticable "verify_failed" (vs 12 clicks fantasma del bug pre-ADR-003).
 [[step]]
 kind = "open_npc_trade"
 greeting_phrases = ["hi"]
 bag_button_vx    = 163
 bag_button_vy    = 301
 wait_button_ms   = 1500
+
+[step.verify]
+template   = "npc_trade"
+timeout_ms = 4000
+on_fail    = "safety_pause"
 
 # 2. Click "Ty to search" + type "mana potion" para filtrar lista
 [[step]]
@@ -228,6 +236,10 @@ wait_after_click_ms = 200
 wait_after_type_ms  = 400
 
 # 3. Buy 100 mana potions con amount flow: click row → click amount → type "100" → click Buy
+# Verify: postcondition real del buy → inventario de mana_potion debe aumentar
+# ≥ 50 unidades (bought 100, margen por si stack se reparte o algo falla
+# parcialmente). require_positive=true rechaza deltas negativos.
+# Si timeout → SafetyPause (probablemente NPC no vendió o sin gold suficiente).
 [[step]]
 kind = "buy_item"
 item_vx    = 380
@@ -239,11 +251,23 @@ confirm_vy = 327
 quantity   = 100
 spacing_ms = 250
 
+[step.verify]
+inventory_delta = { item = "mana_potion", min_abs_delta = 50, require_positive = true }
+timeout_ms      = 5000
+on_fail         = "safety_pause"
+
 # 4. Click bye icon para cerrar chat con NPC (usamos Ladder semánticamente)
+# Verify: tras el bye click, la trade window debe cerrar. Si sigue abierta
+# en 2s → probablemente el click cayó fuera del bye icon. SafetyPause.
 [[step]]
 kind = "ladder"
 vx = 117
 vy = 298
+
+[step.verify]
+absent_template = "npc_trade"
+timeout_ms      = 2000
+on_fail         = "safety_pause"
 
 [[step]]
 kind = "wait"
