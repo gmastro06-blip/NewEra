@@ -42,7 +42,7 @@ use std::path::Path;
 
 use crate::act::keycode;
 use crate::cavebot::runner::Cavebot;
-use crate::cavebot::step::{Condition, StandUntil, Step, StepKind};
+use crate::cavebot::step::{Condition, StandUntil, Step, StepKind, StepVerify, VerifyCheck, VerifyFailAction};
 
 // ── TOML schema ──────────────────────────────────────────────────────────────
 
@@ -202,12 +202,75 @@ struct StepToml {
     wait_after_type_ms: Option<u64>,
     #[serde(default)]
     char_spacing_ms: Option<u64>,
+    // Verify (postcondition)
+    #[serde(default)]
+    verify: Option<StepVerifyToml>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct SupplyRequirement {
     item: String,
     min_count: u32,
+}
+
+/// Parsed TOML representation of `[step.verify]` sub-table.
+///
+/// Schema:
+/// ```toml
+/// [step.verify]
+/// # Exactly ONE of the following must be set:
+/// template        = "npc_trade"             # TemplateVisible
+/// absent_template = "npc_trade"             # TemplateAbsent
+/// condition       = "has_item(mana_potion, 3)"   # ConditionMet (same grammar as goto_if.when)
+/// inventory_delta = { item = "mana_potion", min_abs_delta = 50, require_positive = true }
+///
+/// # Optional for template checks: ROI override
+/// roi = { x = 100, y = 200, w = 400, h = 300 }
+///
+/// # Common optional fields:
+/// timeout_ms = 3000              # default
+/// on_fail    = "safety_pause"    # | "advance" | "goto:<label>"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+struct StepVerifyToml {
+    #[serde(default)]
+    template: Option<String>,
+    #[serde(default)]
+    absent_template: Option<String>,
+    #[serde(default)]
+    condition: Option<String>,
+    #[serde(default)]
+    inventory_delta: Option<InventoryDeltaToml>,
+    #[serde(default)]
+    roi: Option<RoiDefToml>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    on_fail: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+struct InventoryDeltaToml {
+    item: String,
+    min_abs_delta: u32,
+    #[serde(default)]
+    require_positive: bool,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+struct RoiDefToml {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+impl From<RoiDefToml> for crate::sense::vision::calibration::RoiDef {
+    fn from(r: RoiDefToml) -> Self {
+        Self { x: r.x, y: r.y, w: r.w, h: r.h }
+    }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -284,6 +347,15 @@ fn build_cavebot(file: CavebotFile, fps: u32, tuning: super::runner::NodeTuning)
             }
             _ => {}
         }
+        // Resolve label for verify.on_fail = GotoLabel (same label map).
+        if let Some(v) = &mut step.verify {
+            if let VerifyFailAction::GotoLabel { target_label, target_idx } = &mut v.on_fail {
+                *target_idx = *labels.get(target_label)
+                    .with_context(|| format!(
+                        "step[{}] verify.on_fail goto: label '{}' no encontrado", idx, target_label
+                    ))?;
+            }
+        }
     }
 
     Ok(Cavebot::with_tuning(steps, file.cavebot.loop_, fps, tuning))
@@ -303,6 +375,7 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
         on_fail, requirements,
         slot_vx, slot_vy, menu_offset_x, menu_offset_y, stow_process_ms, max_iterations,
         field_vx, field_vy, text, wait_after_click_ms, wait_after_type_ms, char_spacing_ms,
+        verify,
     } = st;
 
     let kind_lower = kind.to_lowercase();
@@ -484,7 +557,70 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
         other => bail!("kind desconocido: '{}'", other),
     };
 
-    Ok(Step { label: name, kind: step_kind })
+    let verify = match verify {
+        Some(v) => Some(parse_verify_toml(v).context("verify")?),
+        None => None,
+    };
+
+    Ok(Step { label: name, kind: step_kind, verify })
+}
+
+fn parse_verify_toml(toml_v: StepVerifyToml) -> Result<StepVerify> {
+    // Count how many check fields are set — must be exactly 1.
+    let count = [
+        toml_v.template.is_some(),
+        toml_v.absent_template.is_some(),
+        toml_v.condition.is_some(),
+        toml_v.inventory_delta.is_some(),
+    ].iter().filter(|&&b| b).count();
+
+    if count == 0 {
+        bail!("verify: debe especificar exactamente uno de: template, absent_template, condition, inventory_delta");
+    }
+    if count > 1 {
+        bail!("verify: solo uno de template/absent_template/condition/inventory_delta puede estar presente, no múltiples");
+    }
+
+    let check = if let Some(name) = toml_v.template {
+        VerifyCheck::TemplateVisible { name, roi: toml_v.roi.map(Into::into) }
+    } else if let Some(name) = toml_v.absent_template {
+        VerifyCheck::TemplateAbsent { name, roi: toml_v.roi.map(Into::into) }
+    } else if let Some(cond_str) = toml_v.condition {
+        VerifyCheck::ConditionMet(parse_condition(&cond_str)?)
+    } else if let Some(delta) = toml_v.inventory_delta {
+        if delta.min_abs_delta == 0 {
+            bail!("verify.inventory_delta.min_abs_delta debe ser > 0");
+        }
+        VerifyCheck::InventoryDelta {
+            item: delta.item,
+            min_abs_delta: delta.min_abs_delta,
+            require_positive: delta.require_positive,
+        }
+    } else {
+        unreachable!();
+    };
+
+    let on_fail = match toml_v.on_fail.as_deref() {
+        None | Some("safety_pause") => VerifyFailAction::SafetyPause,
+        Some("advance") => VerifyFailAction::Advance,
+        Some(s) if s.starts_with("goto:") => {
+            let label = s.trim_start_matches("goto:").to_string();
+            if label.is_empty() {
+                bail!("verify.on_fail: 'goto:' requiere nombre de label. Ej: 'goto:refill'");
+            }
+            VerifyFailAction::GotoLabel { target_label: label, target_idx: 0 }
+        }
+        Some(other) => bail!(
+            "verify.on_fail: valor inválido '{}'. Esperado: 'safety_pause' | 'advance' | 'goto:<label>'",
+            other
+        ),
+    };
+
+    Ok(StepVerify {
+        check,
+        timeout_ms: toml_v.timeout_ms.unwrap_or(3_000),
+        on_fail,
+    })
 }
 
 // ── Mini-parsers de expresiones ──────────────────────────────────────────────
@@ -1306,6 +1442,253 @@ mod tests {
             field_vy = 200
         "#;
         assert!(parse(src_no_text).is_err(), "type_in_field sin text debe ser error");
+    }
+
+    // ── StepVerify parser tests (Fase 2C) ────────────────────────────────
+
+    #[test]
+    fn verify_template_visible_parses() {
+        let src = r#"
+            [[step]]
+            kind             = "open_npc_trade"
+            greeting_phrases = ["hi"]
+            bag_button_vx    = 100
+            bag_button_vy    = 200
+
+            [step.verify]
+            template = "npc_trade"
+        "#;
+        let cb = parse(src).unwrap();
+        let v = cb.steps[0].verify.as_ref().expect("verify present");
+        match &v.check {
+            VerifyCheck::TemplateVisible { name, roi } => {
+                assert_eq!(name, "npc_trade");
+                assert!(roi.is_none());
+            }
+            _ => panic!("expected TemplateVisible"),
+        }
+    }
+
+    #[test]
+    fn verify_with_roi_override() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            template = "npc_trade"
+            roi      = { x = 100, y = 200, w = 400, h = 300 }
+        "#;
+        let cb = parse(src).unwrap();
+        let v = cb.steps[0].verify.as_ref().unwrap();
+        match &v.check {
+            VerifyCheck::TemplateVisible { roi: Some(r), .. } => {
+                assert_eq!(r.x, 100);
+                assert_eq!(r.y, 200);
+                assert_eq!(r.w, 400);
+                assert_eq!(r.h, 300);
+            }
+            _ => panic!("expected TemplateVisible with Some(roi)"),
+        }
+    }
+
+    #[test]
+    fn verify_condition_parses() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            condition = "has_item(mana_potion, 3)"
+        "#;
+        let cb = parse(src).unwrap();
+        let v = cb.steps[0].verify.as_ref().unwrap();
+        match &v.check {
+            VerifyCheck::ConditionMet(Condition::HasItem { name, min_count }) => {
+                assert_eq!(name, "mana_potion");
+                assert_eq!(*min_count, 3);
+            }
+            _ => panic!("expected ConditionMet(HasItem)"),
+        }
+    }
+
+    #[test]
+    fn verify_inventory_delta_parses() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            inventory_delta = { item = "mana_potion", min_abs_delta = 50, require_positive = true }
+        "#;
+        let cb = parse(src).unwrap();
+        let v = cb.steps[0].verify.as_ref().unwrap();
+        match &v.check {
+            VerifyCheck::InventoryDelta { item, min_abs_delta, require_positive } => {
+                assert_eq!(item, "mana_potion");
+                assert_eq!(*min_abs_delta, 50);
+                assert!(*require_positive);
+            }
+            _ => panic!("expected InventoryDelta"),
+        }
+    }
+
+    #[test]
+    fn verify_multiple_checks_fails() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            template  = "npc_trade"
+            condition = "has_item(mana_potion, 3)"
+        "#;
+        assert!(parse(src).is_err(), "verify con múltiples checks debe fallar");
+    }
+
+    #[test]
+    fn verify_no_checks_fails() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            timeout_ms = 3000
+        "#;
+        assert!(parse(src).is_err(), "verify sin ningún check debe fallar");
+    }
+
+    #[test]
+    fn verify_on_fail_advance() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            template = "npc_trade"
+            on_fail  = "advance"
+        "#;
+        let cb = parse(src).unwrap();
+        let v = cb.steps[0].verify.as_ref().unwrap();
+        assert!(matches!(v.on_fail, VerifyFailAction::Advance));
+    }
+
+    #[test]
+    fn verify_on_fail_goto_resolves_idx() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            template = "npc_trade"
+            on_fail  = "goto:refill_entry"
+
+            [[step]]
+            kind = "label"
+            name = "refill_entry"
+
+            [[step]]
+            kind = "hotkey"
+            key  = "F1"
+        "#;
+        let cb = parse(src).unwrap();
+        let v = cb.steps[0].verify.as_ref().unwrap();
+        match &v.on_fail {
+            VerifyFailAction::GotoLabel { target_label, target_idx } => {
+                assert_eq!(target_label, "refill_entry");
+                assert_eq!(*target_idx, 1, "label 'refill_entry' debe resolver a idx 1");
+            }
+            _ => panic!("expected GotoLabel"),
+        }
+    }
+
+    #[test]
+    fn verify_on_fail_goto_missing_label_errors() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            template = "npc_trade"
+            on_fail  = "goto:nonexistent"
+        "#;
+        assert!(parse(src).is_err(), "verify goto a label inexistente debe fallar");
+    }
+
+    #[test]
+    fn verify_on_fail_goto_empty_label_errors() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            template = "npc_trade"
+            on_fail  = "goto:"
+        "#;
+        assert!(parse(src).is_err(), "verify on_fail 'goto:' sin label debe fallar");
+    }
+
+    #[test]
+    fn verify_inventory_delta_zero_fails() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            inventory_delta = { item = "gp", min_abs_delta = 0 }
+        "#;
+        assert!(parse(src).is_err(), "inventory_delta con min_abs_delta=0 debe fallar");
+    }
+
+    #[test]
+    fn verify_on_fail_invalid_errors() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            template = "npc_trade"
+            on_fail  = "wat"
+        "#;
+        assert!(parse(src).is_err(), "on_fail con valor inválido debe fallar");
+    }
+
+    #[test]
+    fn step_without_verify_has_none() {
+        let src = r#"
+            [[step]]
+            kind        = "walk"
+            key         = "D"
+            duration_ms = 1000
+        "#;
+        let cb = parse(src).unwrap();
+        assert!(cb.steps[0].verify.is_none());
+    }
+
+    #[test]
+    fn verify_timeout_default() {
+        let src = r#"
+            [[step]]
+            kind = "wait"
+            duration_ms = 100
+
+            [step.verify]
+            template = "npc_trade"
+        "#;
+        let cb = parse(src).unwrap();
+        let v = cb.steps[0].verify.as_ref().unwrap();
+        assert_eq!(v.timeout_ms, 3000);
     }
 
     /// Smoke test: los 3 scripts MINOR completados en R10 deben parsear OK.

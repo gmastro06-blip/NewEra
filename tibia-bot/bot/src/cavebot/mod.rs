@@ -34,6 +34,7 @@
 //! `[[step]]` plano, es legacy. `POST /cavebot/load` fuerza cavebot;
 //! `POST /waypoints/load` usa legacy.
 
+pub mod hunt_profile;
 pub mod parser;
 pub mod runner;
 pub mod step;

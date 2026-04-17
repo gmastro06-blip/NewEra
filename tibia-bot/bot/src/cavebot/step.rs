@@ -7,6 +7,8 @@
 //! Los labels y gotos se resuelven a índices numéricos en `parser.rs`
 //! (pre-computed al load), así que el runtime no hace lookups por nombre.
 
+use crate::sense::vision::calibration::RoiDef;
+
 /// Un step del cavebot: una instrucción que el iterador ejecuta tick a tick.
 ///
 /// El `label_name` es opcional y solo se usa para diagnóstico + para que
@@ -20,6 +22,10 @@ pub struct Step {
     pub label: Option<String>,
     /// El tipo de acción del step.
     pub kind: StepKind,
+    /// Postcondition verification (optional). If `Some`, the runner enforces
+    /// it after the step's natural completion.
+    #[allow(dead_code)] // wired in Fase 2D
+    pub verify: Option<StepVerify>,
 }
 
 /// Variantes de pasos del cavebot. Cada variante tiene su propia lógica de
@@ -403,6 +409,77 @@ impl Condition {
     }
 }
 
+/// Postcondition verification attached to a step. After the step's natural
+/// completion (phase-wise), the runner polls `check` every ~100ms up to
+/// `timeout_ms`. If `check` passes → advance normally. If timeout → apply
+/// `on_fail`.
+///
+/// Designed to catch "fire-and-forget" bugs — clicks emitted without effect
+/// currently look like progress to the cavebot. With StepVerify, a click on
+/// a non-existent NPC fails the verify (template `npc_trade` never appears)
+/// and triggers `SafetyPause` with a diagnosable reason.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired in Fase 2D (runner integration)
+pub struct StepVerify {
+    /// What to check after the step completes.
+    pub check: VerifyCheck,
+    /// Max wait for the check to pass. Default 3000.
+    pub timeout_ms: u64,
+    /// What to do if `check` fails after `timeout_ms`. Default SafetyPause.
+    pub on_fail: VerifyFailAction,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired in Fase 2D (runner integration)
+pub enum VerifyCheck {
+    /// Template matching: assert template `name` is visible in the frame
+    /// after the step. Optional ROI override — if `None`, use the
+    /// template's configured ROI (from `calibration.toml [ui_rois]`).
+    /// Score must be ≤ UiDetector's threshold.
+    TemplateVisible {
+        name: String,
+        /// Optional ROI to search in, in frame-absolute coords.
+        /// `None` = use the template's configured ROI.
+        roi: Option<RoiDef>,
+    },
+    /// Opposite of TemplateVisible — assert the template is NOT visible.
+    /// Useful after "bye"/close actions: "verify npc_trade is gone".
+    TemplateAbsent {
+        name: String,
+        roi: Option<RoiDef>,
+    },
+    /// Reuse existing Condition enum. Assert `condition.eval(ctx) == true`.
+    /// Useful for inventory/coord checks: `condition = "has_item(mana_potion, 3)"`.
+    ConditionMet(Condition),
+    /// Inventory changed by at least N units of `item` compared to when the
+    /// step started. +N = gained; -N = lost. Use abs value for "changed at all".
+    /// Runner snapshots `ctx.inventory_stacks[item]` at step start and compares.
+    InventoryDelta {
+        item: String,
+        /// Minimum absolute delta (always positive). 0 disallowed.
+        min_abs_delta: u32,
+        /// If true, require delta > 0 (gained). If false, accept either direction.
+        require_positive: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired in Fase 2D (runner integration)
+pub enum VerifyFailAction {
+    /// Default: pause the bot with a diagnosable reason.
+    /// Runner emits `CavebotAction::SafetyPause { reason: "verify_failed:<step_info>" }`.
+    SafetyPause,
+    /// Skip the failed verify and advance to the next step anyway.
+    /// Risky — use only for best-effort steps like optional loot.
+    Advance,
+    /// Jump to a named recovery label. Label resolved at load time by parser.
+    /// `target_idx` is resolved like Goto/GotoIf/CheckSupplies labels.
+    GotoLabel {
+        target_label: String,
+        target_idx: usize,
+    },
+}
+
 /// Criterios de finalización para un step `Stand`. El cavebot se queda en el
 /// step sin emitir acciones mientras no se cumpla, dejando que el FSM maneje
 /// el combate/heal.
@@ -487,5 +564,36 @@ mod tests {
         let c = Condition::Not(Box::new(Condition::HpBelow(0.5)));
         assert!(!c.eval(&ctx(Some(0.3), None, 0, 0, false)));
         assert!(c.eval(&ctx(Some(0.8), None, 0, 0, false)));
+    }
+
+    #[test]
+    fn step_default_verify_is_none() {
+        let s = Step {
+            label: None,
+            kind: StepKind::Wait { duration_ms: 100 },
+            verify: None,
+        };
+        assert!(s.verify.is_none());
+    }
+
+    #[test]
+    fn verify_check_template_visible_carries_name() {
+        let v = StepVerify {
+            check: VerifyCheck::TemplateVisible {
+                name: "npc_trade".into(),
+                roi: None,
+            },
+            timeout_ms: 3000,
+            on_fail: VerifyFailAction::SafetyPause,
+        };
+        match &v.check {
+            VerifyCheck::TemplateVisible { name, roi } => {
+                assert_eq!(name, "npc_trade");
+                assert!(roi.is_none());
+            }
+            _ => panic!("expected TemplateVisible"),
+        }
+        assert_eq!(v.timeout_ms, 3000);
+        assert!(matches!(v.on_fail, VerifyFailAction::SafetyPause));
     }
 }

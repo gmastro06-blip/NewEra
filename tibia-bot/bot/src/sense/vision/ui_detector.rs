@@ -108,6 +108,21 @@ struct UiTemplate {
     roi:      Option<RoiDef>,
 }
 
+/// Resultado de un match on-demand (API síncrona).
+///
+/// Coords son frame-absolutas (incluyen offset de ROI si se usó una).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MatchResult {
+    /// Best SSD-normalized score. Lower = better match. Typical threshold ≤ 0.15.
+    pub score: f32,
+    /// Top-left (x, y) of the best match in *frame coordinates* (not ROI-relative).
+    pub x: u32,
+    pub y: u32,
+    /// Width/height of the template that matched.
+    pub w: u32,
+    pub h: u32,
+}
+
 /// Detector genérico de UI con background thread.
 ///
 /// Llama a `tick(frame)` cada tick del game loop (no bloquea).
@@ -268,6 +283,66 @@ impl UiDetector {
             self.last_submitted = Some(now);
         }
     }
+
+    // ── API síncrona on-demand (Fase 2A) ──────────────────────────────────────
+    //
+    // Estos métodos corren template-matching INLINE en el thread del caller
+    // (no van al background worker). Útiles para verificar postcondiciones
+    // después de una acción del cavebot. Coste esperado: 5–30 ms por llamada
+    // según tamaño de ROI y template.
+
+    /// Runs template matching INLINE on the caller thread. Does NOT go through
+    /// the background worker. Uses the ROI configured for the template (or full
+    /// frame if no ROI). Returns `Some(MatchResult)` if the best score ≤ threshold,
+    /// `None` otherwise (not found or template not loaded).
+    ///
+    /// Typical caller: cavebot runner verifying a step's postcondition.
+    /// Expected cost: 5–30 ms on an 800×600 ROI vs a 50×50 template.
+    pub fn match_now(&self, frame: &Frame, template_name: &str) -> Option<MatchResult> {
+        let tpl = self.templates.iter().find(|t| t.name == template_name)?;
+        let (search, offset_x, offset_y) = if let Some(roi) = tpl.roi {
+            (crop_to_gray(frame, roi)?, roi.x, roi.y)
+        } else {
+            (frame_to_gray(frame), 0, 0)
+        };
+        best_match(&search, &tpl.template, offset_x, offset_y, self.threshold)
+    }
+
+    /// Runs template matching in a specific ROI override (not the configured one).
+    /// Used when a step wants to verify a template appears in a tight box — e.g.
+    /// "confirm that 'buy' button is visible at (100, 200) ± 10 px" you pass
+    /// roi={x:90, y:190, w:template.w+20, h:template.h+20}.
+    pub fn match_in_roi(
+        &self,
+        frame: &Frame,
+        template_name: &str,
+        roi: RoiDef,
+    ) -> Option<MatchResult> {
+        let tpl = self.templates.iter().find(|t| t.name == template_name)?;
+        let search = crop_to_gray(frame, roi)?;
+        best_match(&search, &tpl.template, roi.x, roi.y, self.threshold)
+    }
+
+    /// Convenience wrapper: returns true if `match_now` found a match with
+    /// score ≤ self.threshold AND the match center is within `tolerance` px of
+    /// (expected_x, expected_y). Useful for "button at this exact spot" checks.
+    pub fn match_at_point(
+        &self,
+        frame: &Frame,
+        template_name: &str,
+        expected_x: u32,
+        expected_y: u32,
+        tolerance: u32,
+    ) -> bool {
+        let Some(m) = self.match_now(frame, template_name) else {
+            return false;
+        };
+        let cx = m.x + m.w / 2;
+        let cy = m.y + m.h / 2;
+        let dx = cx.abs_diff(expected_x);
+        let dy = cy.abs_diff(expected_y);
+        dx <= tolerance && dy <= tolerance
+    }
 }
 
 // ── Helpers de conversión Frame → GrayImage ──────────────────────────────────
@@ -292,6 +367,50 @@ fn crop_to_gray(frame: &Frame, roi: RoiDef) -> Option<GrayImage> {
     Some(gray)
 }
 
+/// Busca el mejor match de `template` dentro de `search` y retorna
+/// `Some(MatchResult)` con coords frame-absolutas (search_offset_{x,y} + offset
+/// local) si el score es ≤ threshold. Usado por la API síncrona.
+fn best_match(
+    search:        &GrayImage,
+    template:      &GrayImage,
+    search_offset_x: u32,
+    search_offset_y: u32,
+    threshold:     f32,
+) -> Option<MatchResult> {
+    let tw = template.width();
+    let th = template.height();
+    if search.width() < tw || search.height() < th {
+        return None;
+    }
+    let result = match_template(
+        search,
+        template,
+        MatchTemplateMethod::SumOfSquaredErrorsNormalized,
+    );
+    let result_w = result.width();
+    // `result` es ImageBuffer<Luma<f32>>; iter() va fila por fila.
+    let mut best_idx   = 0usize;
+    let mut best_score = f32::MAX;
+    for (idx, px) in result.iter().enumerate() {
+        if *px < best_score {
+            best_score = *px;
+            best_idx   = idx;
+        }
+    }
+    if best_score > threshold {
+        return None;
+    }
+    let local_x = (best_idx as u32) % result_w;
+    let local_y = (best_idx as u32) / result_w;
+    Some(MatchResult {
+        score: best_score,
+        x: search_offset_x + local_x,
+        y: search_offset_y + local_y,
+        w: tw,
+        h: th,
+    })
+}
+
 fn frame_to_gray(frame: &Frame) -> GrayImage {
     let mut gray = GrayImage::new(frame.width, frame.height);
     let stride   = frame.width as usize * 4;
@@ -306,4 +425,147 @@ fn frame_to_gray(frame: &Frame) -> GrayImage {
         }
     }
     gray
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Instant;
+
+    /// Helper: build a 100×100 RGBA frame filled with `bg`, then paint a
+    /// 10×10 square of `fg` at (sx, sy).
+    fn make_frame(w: u32, h: u32, bg: u8, fg: u8, sx: u32, sy: u32, sq: u32) -> Frame {
+        let mut data = vec![bg; (w as usize) * (h as usize) * 4];
+        // canal alpha a 255 en todo el buffer
+        for i in 0..(w as usize) * (h as usize) {
+            data[i * 4 + 3] = 255;
+        }
+        for row in sy..(sy + sq) {
+            for col in sx..(sx + sq) {
+                let off = (row as usize) * (w as usize) * 4 + (col as usize) * 4;
+                data[off]     = fg;
+                data[off + 1] = fg;
+                data[off + 2] = fg;
+                data[off + 3] = 255;
+            }
+        }
+        Frame {
+            width:       w,
+            height:      h,
+            data,
+            captured_at: Instant::now(),
+        }
+    }
+
+    /// Guard: removes a directory on drop so a failed test doesn't leave junk.
+    struct TmpDirGuard(std::path::PathBuf);
+    impl Drop for TmpDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Crea un directorio tmp único, escribe un template PNG (gris `fg` sobre
+    /// fondo negro) de tamaño `size × size` y lo asocia con `name`.
+    /// Devuelve el path al directorio y el guard que lo limpia al drop.
+    fn make_template_dir(
+        name: &str,
+        size: u32,
+        fg: u8,
+    ) -> (std::path::PathBuf, TmpDirGuard) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("ui_detector_test_{}_{}", std::process::id(), seq));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut img = GrayImage::new(size, size);
+        for y in 0..size {
+            for x in 0..size {
+                img.put_pixel(x, y, image::Luma([fg]));
+            }
+        }
+        img.save(dir.join(format!("{}.png", name))).unwrap();
+        let guard = TmpDirGuard(dir.clone());
+        (dir, guard)
+    }
+
+    #[test]
+    fn match_now_finds_square_at_expected_coords() {
+        // Square de 10×10 blanco en (30, 40) sobre fondo negro.
+        let frame = make_frame(100, 100, 0, 255, 30, 40, 10);
+        let (dir, _guard) = make_template_dir("square", 10, 255);
+
+        let mut det = UiDetector::new(0.15);
+        det.load_dir(&dir, &HashMap::new());
+        assert_eq!(det.len(), 1);
+
+        let m = det.match_now(&frame, "square").expect("match_now debería encontrar");
+        assert_eq!(m.x, 30);
+        assert_eq!(m.y, 40);
+        assert_eq!(m.w, 10);
+        assert_eq!(m.h, 10);
+        assert!(m.score <= 0.15, "score {} fuera del threshold", m.score);
+    }
+
+    #[test]
+    fn match_in_roi_returns_frame_absolute_coords() {
+        let frame = make_frame(100, 100, 0, 255, 30, 40, 10);
+        let (dir, _guard) = make_template_dir("square", 10, 255);
+
+        let mut det = UiDetector::new(0.15);
+        det.load_dir(&dir, &HashMap::new());
+
+        // ROI ajustada alrededor del square: (25, 35) con 20×20 lo envuelve.
+        let roi = RoiDef { x: 25, y: 35, w: 20, h: 20 };
+        let m = det.match_in_roi(&frame, "square", roi).expect("match en ROI");
+        // Coords deben ser frame-absolutas (30, 40), no ROI-relativas (5, 5).
+        assert_eq!(m.x, 30, "x debe ser frame-absolute");
+        assert_eq!(m.y, 40, "y debe ser frame-absolute");
+    }
+
+    #[test]
+    fn match_at_point_respects_tolerance() {
+        let frame = make_frame(100, 100, 0, 255, 30, 40, 10);
+        let (dir, _guard) = make_template_dir("square", 10, 255);
+
+        let mut det = UiDetector::new(0.15);
+        det.load_dir(&dir, &HashMap::new());
+
+        // Centro real: (35, 45). Con tolerance=2 debe aceptar (34, 46).
+        assert!(det.match_at_point(&frame, "square", 34, 46, 2));
+        // Con tolerance=2 debe rechazar (50, 60) — demasiado lejos.
+        assert!(!det.match_at_point(&frame, "square", 50, 60, 2));
+        // Template inexistente → false siempre.
+        assert!(!det.match_at_point(&frame, "no_such_tpl", 35, 45, 2));
+    }
+
+    #[test]
+    fn match_now_returns_none_for_unloaded_template() {
+        let frame = make_frame(100, 100, 0, 255, 30, 40, 10);
+        let (dir, _guard) = make_template_dir("square", 10, 255);
+
+        let mut det = UiDetector::new(0.15);
+        det.load_dir(&dir, &HashMap::new());
+
+        assert!(det.match_now(&frame, "ghost").is_none());
+    }
+
+    #[test]
+    fn match_now_returns_none_when_score_above_threshold() {
+        // Frame SIN el square (todo negro). El template blanco 10×10 no va a
+        // matchear bajo threshold=0.05 contra un frame uniforme negro.
+        let frame = make_frame(100, 100, 0, 0, 0, 0, 0);
+        let (dir, _guard) = make_template_dir("square", 10, 255);
+
+        let mut det = UiDetector::new(0.05);
+        det.load_dir(&dir, &HashMap::new());
+
+        assert!(
+            det.match_now(&frame, "square").is_none(),
+            "frame sin el patrón no debe matchear bajo threshold estricto"
+        );
+    }
 }

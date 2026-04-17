@@ -1810,11 +1810,11 @@ mod tests {
     }
 
     fn step(kind: StepKind) -> Step {
-        Step { label: None, kind }
+        Step { label: None, kind, verify: None }
     }
 
     fn labeled(name: &str, kind: StepKind) -> Step {
-        Step { label: Some(name.into()), kind }
+        Step { label: Some(name.into()), kind, verify: None }
     }
 
     // ── Walk ──────────────────────────────────────────────────────────
