@@ -20,7 +20,7 @@
 //! hasta que vuelva a Walking. Esto congela los timers del step actual,
 //! que se restartearán al volver (ver `restart_current_step`).
 
-use crate::cavebot::step::{Step, StepKind, StandUntil};
+use crate::cavebot::step::{Step, StepKind, StandUntil, StepVerify, VerifyCheck, VerifyFailAction};
 
 /// Ticks consecutivos sin movimiento antes de declarar stuck y avanzar el step.
 /// 60 ticks @ 30Hz = 2 segundos empujando contra una pared → abandonar dirección.
@@ -72,6 +72,17 @@ pub struct TickContext {
     /// Si los digit templates no están cargados, este map suele coincidir
     /// con `inventory_counts` (1 unit per slot).
     pub inventory_stacks: std::collections::HashMap<String, u32>,
+}
+
+/// State while the runner is polling the current step's postcondition.
+/// Set when `advance()` is called on a step with `verify: Some(...)`.
+/// Cleared by `do_advance()` when verify passes or on_fail is applied.
+#[derive(Debug, Clone)]
+struct VerifyingState {
+    /// Tick when verify started (when the step would have advanced).
+    started_tick: u64,
+    /// Max ticks before timeout.
+    timeout_ticks: u64,
 }
 
 /// Acción que el cavebot pide al BotLoop este tick.
@@ -284,6 +295,17 @@ pub struct Cavebot {
     /// timers de `wait_after_click_ms`, `char_spacing_ms` y
     /// `wait_after_type_ms`.
     type_field_phase_start: u64,
+    /// Set to Some when the runner is polling a postcondition. While Some,
+    /// tick() evaluates the check instead of dispatching the step.
+    verifying: Option<VerifyingState>,
+    /// Snapshot of ctx.inventory_stacks at step entry. Used by
+    /// VerifyCheck::InventoryDelta. Captured lazily when `needs_inventory_snapshot`
+    /// is true.
+    inventory_at_step_start: std::collections::HashMap<String, u32>,
+    /// Set to true when advance/jump_to transitions to a new step. The top
+    /// of tick() snapshots the current inventory stacks lazily (it needs a
+    /// ctx reference).
+    needs_inventory_snapshot: bool,
 }
 
 impl Cavebot {
@@ -341,6 +363,9 @@ impl Cavebot {
             type_field_phase: 0,
             type_field_char_idx: 0,
             type_field_phase_start: 0,
+            verifying: None,
+            inventory_at_step_start: std::collections::HashMap::new(),
+            needs_inventory_snapshot: true,
         }
     }
 
@@ -377,6 +402,12 @@ impl Cavebot {
     /// Este método es idempotente si se le pasa el mismo ctx varias veces,
     /// EXCEPTO cuando avanza el step (entonces mutates).
     pub fn tick(&mut self, ctx: &mut TickContext) -> CavebotAction {
+        // Lazy snapshot at step entry (for VerifyCheck::InventoryDelta).
+        if self.needs_inventory_snapshot {
+            self.inventory_at_step_start = ctx.inventory_stacks.clone();
+            self.needs_inventory_snapshot = false;
+        }
+
         // Protección contra loops infinitos de Goto/Label/GotoIf sin Wait/Walk.
         // Si más de N jumps ocurren en un mismo tick, pausamos.
         let mut max_iters = 64;
@@ -391,6 +422,62 @@ impl Cavebot {
             let Some(idx) = self.current else {
                 return CavebotAction::Finished;
             };
+
+            // Verify intercept — if we're polling a postcondition, evaluate it.
+            if let Some(verifying) = self.verifying.clone() {
+                // Safety: if verifying is Some, the current step MUST have a verify clause.
+                let verify = match self.steps[idx].verify.clone() {
+                    Some(v) => v,
+                    None => {
+                        tracing::error!(
+                            "Cavebot step[{}]: verifying=Some but step.verify=None. Clearing.",
+                            idx
+                        );
+                        self.verifying = None;
+                        continue;
+                    }
+                };
+                let elapsed = ctx.tick.saturating_sub(verifying.started_tick);
+                if self.evaluate_verify(&verify.check, ctx) {
+                    let elapsed_ms = (elapsed as u64) * 1000 / self.fps as u64;
+                    tracing::info!(
+                        "Cavebot step[{}]={:?}: verify PASS in {}ms",
+                        idx, self.steps[idx].label, elapsed_ms
+                    );
+                    self.verifying = None;
+                    self.do_advance(ctx.tick);
+                    continue;
+                }
+                if elapsed >= verifying.timeout_ticks {
+                    let label = self.steps[idx].label.clone();
+                    tracing::warn!(
+                        "Cavebot step[{}]={:?}: verify TIMEOUT ({}ms), on_fail={:?}",
+                        idx, label, verify.timeout_ms, verify.on_fail
+                    );
+                    match verify.on_fail {
+                        VerifyFailAction::SafetyPause => {
+                            self.verifying = None;
+                            let reason = format!(
+                                "verify_failed: step[{}]={:?} check={:?} timeout={}ms",
+                                idx, label, verify.check, verify.timeout_ms
+                            );
+                            return CavebotAction::SafetyPause { reason };
+                        }
+                        VerifyFailAction::Advance => {
+                            self.verifying = None;
+                            self.do_advance(ctx.tick);
+                            continue;
+                        }
+                        VerifyFailAction::GotoLabel { target_idx, .. } => {
+                            self.verifying = None;
+                            self.jump_to(target_idx, ctx.tick);
+                            continue;
+                        }
+                    }
+                }
+                // Still waiting — emit Idle.
+                return CavebotAction::Idle;
+            }
 
             // Clonamos el kind porque algunas ramas mutan self (advance).
             let kind = self.steps[idx].kind.clone();
@@ -1177,8 +1264,70 @@ impl Cavebot {
         }
     }
 
+    /// Evaluate a VerifyCheck against the current context. Returns true if
+    /// the postcondition is satisfied.
+    ///
+    /// For TemplateVisible/Absent, uses `ctx.ui_matches` which is the cached
+    /// async result from UiDetector (up to ~500ms stale). That staleness is
+    /// acceptable because verify timeouts default to 3000ms.
+    fn evaluate_verify(&self, check: &VerifyCheck, ctx: &TickContext) -> bool {
+        match check {
+            VerifyCheck::TemplateVisible { name, roi: _ } => {
+                ctx.ui_matches.iter().any(|m| m == name)
+            }
+            VerifyCheck::TemplateAbsent { name, roi: _ } => {
+                !ctx.ui_matches.iter().any(|m| m == name)
+            }
+            VerifyCheck::ConditionMet(cond) => cond.eval(ctx),
+            VerifyCheck::InventoryDelta { item, min_abs_delta, require_positive } => {
+                let start = self.inventory_at_step_start.get(item).copied().unwrap_or(0) as i64;
+                let now = ctx.inventory_stacks.get(item).copied().unwrap_or(0) as i64;
+                let delta = now - start;
+                if *require_positive {
+                    delta >= *min_abs_delta as i64
+                } else {
+                    delta.unsigned_abs() >= *min_abs_delta as u64
+                }
+            }
+        }
+    }
+
     /// Avanza al siguiente step. Loopea si `loop_`, termina si no.
+    ///
+    /// Wrapper que enruta por verify: si el step actual tiene un `StepVerify`
+    /// y no estamos ya en modo verifying, entra a verify mode en lugar de
+    /// avanzar. Los call sites existentes invocan este wrapper sin cambios.
     fn advance(&mut self, tick: u64) {
+        let Some(idx) = self.current else {
+            self.do_advance(tick);
+            return;
+        };
+        // If already verifying, this is a PASS — fall through to do_advance.
+        if self.verifying.is_some() {
+            self.do_advance(tick);
+            return;
+        }
+        // If step has verify, enter verify mode instead of advancing.
+        if let Some(verify) = self.steps[idx].verify.clone() {
+            let timeout_ticks = ms_to_ticks(verify.timeout_ms, self.fps);
+            let label = self.steps[idx].label.clone();
+            tracing::info!(
+                "Cavebot step[{}]={:?}: entering verify check={:?} timeout_ms={}",
+                idx, label, verify.check, verify.timeout_ms
+            );
+            self.verifying = Some(VerifyingState {
+                started_tick: tick,
+                timeout_ticks,
+            });
+            return;
+        }
+        self.do_advance(tick);
+    }
+
+    /// Low-level advance (sin verify interception). Mueve `current` al siguiente
+    /// step y resetea todo el estado per-step. Llamado por el wrapper `advance`
+    /// cuando no hay verify o tras un verify PASS.
+    fn do_advance(&mut self, tick: u64) {
         let Some(idx) = self.current else { return };
         let next = idx + 1;
         if next < self.steps.len() {
@@ -1213,6 +1362,8 @@ impl Cavebot {
         self.type_field_char_idx = 0;
         self.type_field_phase_start = 0;
         self.reset_node_state();
+        self.verifying = None;
+        self.needs_inventory_snapshot = true;
     }
 
     /// Salta a un índice específico (Goto/GotoIf).
@@ -1279,6 +1430,8 @@ impl Cavebot {
             self.type_field_phase_start = 0;
             self.needs_kills_baseline = true;
             self.reset_node_state();
+            self.verifying = None;
+            self.needs_inventory_snapshot = true;
         } else {
             tracing::warn!(
                 "Cavebot::jump_to: target_idx={} out of bounds (len={}) — terminando lista",
@@ -3629,5 +3782,361 @@ mod tests {
             cb.tick(&mut ctx(100)),
             CavebotAction::Click { vx: 1, vy: 2 }
         );
+    }
+
+    // ── StepVerify (Fase 2D) ──────────────────────────────────────────
+    //
+    // Covers the verify/postcondition pipeline:
+    //   1. Step emits as usual (Hotkey tap, etc.)
+    //   2. advance() sees step.verify=Some → enters verifying mode (Idle)
+    //   3. Subsequent ticks evaluate the VerifyCheck:
+    //        - pass → do_advance + continue
+    //        - timeout → apply VerifyFailAction (SafetyPause / Advance / GotoLabel)
+    //        - neither → stay in verifying, emit Idle
+    //
+    // Tests use small timeout_ms (33 @ fps=30 = 1 tick) to make timeouts
+    // reachable in a few ticks.
+    mod verify_tests {
+        use super::*;
+        use crate::cavebot::step::{StepVerify, VerifyCheck, VerifyFailAction};
+
+        /// Build a step with an attached postcondition.
+        fn step_with_verify(kind: StepKind, verify: StepVerify) -> Step {
+            Step { label: None, kind, verify: Some(verify) }
+        }
+
+        /// Context builder with a custom ui_matches list.
+        fn ctx_ui(tick: u64, matches: Vec<&str>) -> TickContext {
+            TickContext {
+                tick,
+                ui_matches: matches.into_iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            }
+        }
+
+        // 1. TemplateVisible PASS
+        #[test]
+        fn verify_template_visible_passes_when_ui_matches_contains_name() {
+            let verify = StepVerify {
+                check: VerifyCheck::TemplateVisible { name: "foo".into(), roi: None },
+                timeout_ms: 3000,
+                on_fail: VerifyFailAction::SafetyPause,
+            };
+            let mut cb = Cavebot::new(
+                vec![
+                    step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify),
+                    step(StepKind::Hotkey { hidcode: 0xF2 }),
+                ],
+                false, 30,
+            );
+            // tick 0: Hotkey emits F1 → advance() enters verify mode.
+            assert_eq!(cb.tick(&mut ctx_ui(0, vec![])), CavebotAction::KeyTap(0xF1));
+            assert_eq!(cb.current, Some(0));
+            assert!(cb.verifying.is_some());
+            // tick 1: ctx.ui_matches contains "foo" → PASS → do_advance → step 1 emits F2.
+            // (Hotkey at step 1 has no verify, so after emitting it advances past end → current=None.)
+            assert_eq!(cb.tick(&mut ctx_ui(1, vec!["foo"])), CavebotAction::KeyTap(0xF2));
+            assert!(cb.verifying.is_none());
+        }
+
+        // 2. TemplateVisible TIMEOUT → SafetyPause
+        #[test]
+        fn verify_template_visible_safety_pause_on_timeout() {
+            let verify = StepVerify {
+                check: VerifyCheck::TemplateVisible { name: "foo".into(), roi: None },
+                timeout_ms: 33,
+                on_fail: VerifyFailAction::SafetyPause,
+            };
+            let mut cb = Cavebot::new(
+                vec![step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify)],
+                false, 30,
+            );
+            // tick 0: emit + enter verify.
+            assert_eq!(cb.tick(&mut ctx_ui(0, vec![])), CavebotAction::KeyTap(0xF1));
+            assert!(cb.verifying.is_some());
+            // tick 1: elapsed = 1 tick, timeout_ticks = ceil(33*30/1000) = 1
+            //   → elapsed >= timeout_ticks → SafetyPause.
+            let action = cb.tick(&mut ctx_ui(1, vec![]));
+            match action {
+                CavebotAction::SafetyPause { reason } => {
+                    assert!(reason.contains("verify_failed"), "reason: {}", reason);
+                    assert!(reason.contains("foo"), "reason: {}", reason);
+                }
+                other => panic!("expected SafetyPause, got {:?}", other),
+            }
+            assert!(cb.verifying.is_none());
+        }
+
+        // 3. TemplateAbsent PASS
+        #[test]
+        fn verify_template_absent_passes_when_ui_matches_empty() {
+            let verify = StepVerify {
+                check: VerifyCheck::TemplateAbsent { name: "foo".into(), roi: None },
+                timeout_ms: 3000,
+                on_fail: VerifyFailAction::SafetyPause,
+            };
+            let mut cb = Cavebot::new(
+                vec![
+                    step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify),
+                    step(StepKind::Hotkey { hidcode: 0xF2 }),
+                ],
+                false, 30,
+            );
+            // tick 0: emit + verify.
+            assert_eq!(cb.tick(&mut ctx_ui(0, vec![])), CavebotAction::KeyTap(0xF1));
+            // tick 1: ui_matches=["bar"] doesn't contain "foo" → pass immediately → step 1 emits F2.
+            assert_eq!(cb.tick(&mut ctx_ui(1, vec!["bar"])), CavebotAction::KeyTap(0xF2));
+        }
+
+        // 4. TemplateAbsent TIMEOUT → GotoLabel
+        #[test]
+        fn verify_template_absent_timeout_goto_label() {
+            let verify = StepVerify {
+                check: VerifyCheck::TemplateAbsent { name: "foo".into(), roi: None },
+                timeout_ms: 33,
+                on_fail: VerifyFailAction::GotoLabel {
+                    target_label: "recovery".into(),
+                    target_idx: 0,
+                },
+            };
+            let mut cb = Cavebot::new(
+                vec![
+                    labeled("recovery", StepKind::Label),
+                    step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify),
+                    step(StepKind::Hotkey { hidcode: 0xF2 }),
+                ],
+                false, 30,
+            );
+            // tick 0: Label consumed → advance to idx 1 → Hotkey emits F1 + enters verify.
+            assert_eq!(cb.tick(&mut ctx_ui(0, vec![])), CavebotAction::KeyTap(0xF1));
+            assert_eq!(cb.current, Some(1));
+            assert!(cb.verifying.is_some());
+            // tick 1: ui_matches contains "foo" → verify fails (we wanted absent) → timeout.
+            //   on_fail=GotoLabel{target_idx=0}, so jump back to Label(0), then advance to idx 1.
+            //   But idx 1 has verify, so after emit it re-enters verifying.
+            //   Result: current=1 again (Label→1), Hotkey F1 emits again.
+            let action = cb.tick(&mut ctx_ui(1, vec!["foo"]));
+            assert_eq!(action, CavebotAction::KeyTap(0xF1));
+            assert_eq!(cb.current, Some(1), "should loop back via GotoLabel target_idx=0 → Label → idx 1");
+            assert!(cb.verifying.is_some());
+        }
+
+        // 5. ConditionMet PASS
+        #[test]
+        fn verify_condition_met_passes() {
+            use crate::cavebot::step::Condition;
+            let verify = StepVerify {
+                check: VerifyCheck::ConditionMet(Condition::HpBelow(0.5)),
+                timeout_ms: 3000,
+                on_fail: VerifyFailAction::SafetyPause,
+            };
+            let mut cb = Cavebot::new(
+                vec![
+                    step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify),
+                    step(StepKind::Hotkey { hidcode: 0xF2 }),
+                ],
+                false, 30,
+            );
+            // tick 0: HP=0.8 (not <0.5), hotkey emits. Enters verifying.
+            let mut c0 = TickContext { tick: 0, hp_ratio: Some(0.8), ..Default::default() };
+            assert_eq!(cb.tick(&mut c0), CavebotAction::KeyTap(0xF1));
+            // tick 1: HP=0.3 (<0.5) → pass immediately → step 1 emits F2.
+            let mut c1 = TickContext { tick: 1, hp_ratio: Some(0.3), ..Default::default() };
+            assert_eq!(cb.tick(&mut c1), CavebotAction::KeyTap(0xF2));
+        }
+
+        // 6. ConditionMet TIMEOUT → Advance
+        #[test]
+        fn verify_condition_timeout_advance() {
+            use crate::cavebot::step::Condition;
+            let verify = StepVerify {
+                check: VerifyCheck::ConditionMet(Condition::HpBelow(0.5)),
+                timeout_ms: 33,
+                on_fail: VerifyFailAction::Advance,
+            };
+            let mut cb = Cavebot::new(
+                vec![
+                    step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify),
+                    step(StepKind::Hotkey { hidcode: 0xF2 }),
+                ],
+                false, 30,
+            );
+            // tick 0: HP=0.9 never below 0.5, hotkey emits. Enters verifying.
+            let mut c0 = TickContext { tick: 0, hp_ratio: Some(0.9), ..Default::default() };
+            assert_eq!(cb.tick(&mut c0), CavebotAction::KeyTap(0xF1));
+            // tick 1: still 0.9, timeout elapsed → on_fail=Advance → step 1 emits F2.
+            let mut c1 = TickContext { tick: 1, hp_ratio: Some(0.9), ..Default::default() };
+            assert_eq!(cb.tick(&mut c1), CavebotAction::KeyTap(0xF2));
+        }
+
+        // 7. InventoryDelta positive PASS (gained items)
+        #[test]
+        fn verify_inventory_delta_positive_passes_when_gained() {
+            let verify = StepVerify {
+                check: VerifyCheck::InventoryDelta {
+                    item: "mp".into(),
+                    min_abs_delta: 3,
+                    require_positive: true,
+                },
+                timeout_ms: 3000,
+                on_fail: VerifyFailAction::SafetyPause,
+            };
+            let mut cb = Cavebot::new(
+                vec![
+                    step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify),
+                    step(StepKind::Hotkey { hidcode: 0xF2 }),
+                ],
+                false, 30,
+            );
+            // tick 0: mp=5 at entry. emit + verify (snapshot captured = 5).
+            let mut c0 = TickContext {
+                tick: 0,
+                inventory_stacks: std::collections::HashMap::from([("mp".to_string(), 5u32)]),
+                ..Default::default()
+            };
+            assert_eq!(cb.tick(&mut c0), CavebotAction::KeyTap(0xF1));
+            assert_eq!(cb.inventory_at_step_start.get("mp"), Some(&5u32));
+            // tick 1: mp=10. delta=+5 >= 3, require_positive ✓ → pass → step 1 emits F2.
+            let mut c1 = TickContext {
+                tick: 1,
+                inventory_stacks: std::collections::HashMap::from([("mp".to_string(), 10u32)]),
+                ..Default::default()
+            };
+            assert_eq!(cb.tick(&mut c1), CavebotAction::KeyTap(0xF2));
+        }
+
+        // 8. InventoryDelta positive FAILS when items lost → SafetyPause
+        #[test]
+        fn verify_inventory_delta_positive_fails_when_lost() {
+            let verify = StepVerify {
+                check: VerifyCheck::InventoryDelta {
+                    item: "mp".into(),
+                    min_abs_delta: 3,
+                    require_positive: true,
+                },
+                timeout_ms: 33,
+                on_fail: VerifyFailAction::SafetyPause,
+            };
+            let mut cb = Cavebot::new(
+                vec![step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify)],
+                false, 30,
+            );
+            // tick 0: mp=5 at entry. emit + verify.
+            let mut c0 = TickContext {
+                tick: 0,
+                inventory_stacks: std::collections::HashMap::from([("mp".to_string(), 5u32)]),
+                ..Default::default()
+            };
+            assert_eq!(cb.tick(&mut c0), CavebotAction::KeyTap(0xF1));
+            // tick 1: mp=2 (delta=-3), require_positive → fails. Timeout elapsed → SafetyPause.
+            let mut c1 = TickContext {
+                tick: 1,
+                inventory_stacks: std::collections::HashMap::from([("mp".to_string(), 2u32)]),
+                ..Default::default()
+            };
+            let action = cb.tick(&mut c1);
+            assert!(
+                matches!(action, CavebotAction::SafetyPause { .. }),
+                "expected SafetyPause, got {:?}",
+                action
+            );
+        }
+
+        // 9. InventoryDelta abs mode passes either direction
+        #[test]
+        fn verify_inventory_delta_abs_mode_passes_either_direction() {
+            let verify = StepVerify {
+                check: VerifyCheck::InventoryDelta {
+                    item: "mp".into(),
+                    min_abs_delta: 3,
+                    require_positive: false,
+                },
+                timeout_ms: 3000,
+                on_fail: VerifyFailAction::SafetyPause,
+            };
+            let mut cb = Cavebot::new(
+                vec![
+                    step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify),
+                    step(StepKind::Hotkey { hidcode: 0xF2 }),
+                ],
+                false, 30,
+            );
+            // tick 0: mp=10 at entry.
+            let mut c0 = TickContext {
+                tick: 0,
+                inventory_stacks: std::collections::HashMap::from([("mp".to_string(), 10u32)]),
+                ..Default::default()
+            };
+            assert_eq!(cb.tick(&mut c0), CavebotAction::KeyTap(0xF1));
+            // tick 1: mp=5. delta=-5, abs=5 >= 3, require_positive=false → pass.
+            let mut c1 = TickContext {
+                tick: 1,
+                inventory_stacks: std::collections::HashMap::from([("mp".to_string(), 5u32)]),
+                ..Default::default()
+            };
+            assert_eq!(cb.tick(&mut c1), CavebotAction::KeyTap(0xF2));
+        }
+
+        // 10. Step without verify: no verify state ever set.
+        #[test]
+        fn step_without_verify_does_not_enter_verifying() {
+            let mut cb = Cavebot::new(
+                vec![
+                    step(StepKind::Hotkey { hidcode: 0xF1 }),
+                    step(StepKind::Hotkey { hidcode: 0xF2 }),
+                ],
+                false, 30,
+            );
+            assert!(cb.verifying.is_none());
+            assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::KeyTap(0xF1));
+            assert!(cb.verifying.is_none());
+            assert_eq!(cb.tick(&mut ctx(1)), CavebotAction::KeyTap(0xF2));
+            assert!(cb.verifying.is_none());
+        }
+
+        // 11. Verify waiting doesn't trigger the 64-iter loop cap (returns Idle per tick).
+        #[test]
+        fn verify_preserves_through_iteration_loop_cap() {
+            let verify = StepVerify {
+                check: VerifyCheck::TemplateVisible { name: "foo".into(), roi: None },
+                timeout_ms: 60_000, // far beyond any test
+                on_fail: VerifyFailAction::SafetyPause,
+            };
+            let mut cb = Cavebot::new(
+                vec![step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify)],
+                false, 30,
+            );
+            // tick 0: emit + verify.
+            assert_eq!(cb.tick(&mut ctx_ui(0, vec![])), CavebotAction::KeyTap(0xF1));
+            // Ticks 1..100: always Idle, never Panic, cavebot stays at step 0.
+            for t in 1..=100u64 {
+                assert_eq!(cb.tick(&mut ctx_ui(t, vec![])), CavebotAction::Idle, "tick {}", t);
+                assert_eq!(cb.current, Some(0));
+                assert!(cb.verifying.is_some());
+            }
+        }
+
+        // 12. jump_to_label clears verifying state.
+        #[test]
+        fn jump_to_clears_verifying_state() {
+            let verify = StepVerify {
+                check: VerifyCheck::TemplateVisible { name: "foo".into(), roi: None },
+                timeout_ms: 3000,
+                on_fail: VerifyFailAction::SafetyPause,
+            };
+            let mut cb = Cavebot::new(
+                vec![
+                    labeled("home", StepKind::Label),
+                    step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify),
+                ],
+                true, 30,
+            );
+            // tick 0: Label consumed → advance to idx 1 → Hotkey emits + enters verify.
+            assert_eq!(cb.tick(&mut ctx_ui(0, vec![])), CavebotAction::KeyTap(0xF1));
+            assert!(cb.verifying.is_some());
+            // Manual jump_to_label bypasses the verify intercept → state cleared.
+            assert!(cb.jump_to_label("home", 100));
+            assert!(cb.verifying.is_none());
+        }
     }
 }
