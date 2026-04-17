@@ -441,6 +441,22 @@ pub struct StepVerify {
     pub timeout_ms: u64,
     /// What to do if `check` fails after `timeout_ms`. Default SafetyPause.
     pub on_fail: VerifyFailAction,
+    /// Max retries of the step action before applying `on_fail`. Default 0
+    /// (single attempt, legacy behavior).
+    ///
+    /// Cuando > 0, si el primer verify timeout no se cumple, el runner:
+    /// 1. Resetea el state del step (phase=0, iters=0) — el step vuelve a
+    ///    ejecutar su acción desde el principio.
+    /// 2. Clear verifying state, decrementa `retry_action` contador.
+    /// 3. El step re-emite su action (click, type, etc.) y el verify vuelve
+    ///    a poll. Útil para absorber lag puntual del cliente (NPC trade
+    ///    window no abrió por frame drop, segundo click la abre).
+    ///
+    /// Cada retry suma `timeout_ms` al tiempo total máximo de espera — un
+    /// step con `retry_action = 2, timeout_ms = 3000` tarda hasta 9s antes
+    /// de triggering on_fail. Usar con moderación para no esconder bugs
+    /// reales.
+    pub retry_action: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -599,6 +615,7 @@ mod tests {
             },
             timeout_ms: 3000,
             on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
         };
         match &v.check {
             VerifyCheck::TemplateVisible { name, roi } => {

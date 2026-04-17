@@ -258,6 +258,10 @@ struct StepVerifyToml {
     timeout_ms: Option<u64>,
     #[serde(default)]
     on_fail: Option<String>,
+    /// Número de retries del action antes de aplicar on_fail. Default 0.
+    /// Ver StepVerify::retry_action.
+    #[serde(default)]
+    retry_action: Option<u8>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -734,6 +738,7 @@ fn parse_verify_toml(toml_v: StepVerifyToml) -> Result<StepVerify> {
         check,
         timeout_ms: toml_v.timeout_ms.unwrap_or(3_000),
         on_fail,
+        retry_action: toml_v.retry_action.unwrap_or(0),
     })
 }
 

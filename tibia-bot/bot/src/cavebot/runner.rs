@@ -83,6 +83,10 @@ struct VerifyingState {
     started_tick: u64,
     /// Max ticks before timeout.
     timeout_ticks: u64,
+    /// Retries del action restantes antes de aplicar on_fail. Decrementa en
+    /// cada timeout. Cuando llega a 0, on_fail se aplica. Se inicializa al
+    /// valor de `StepVerify::retry_action` cuando verify entra.
+    retries_left: u8,
 }
 
 /// Acción que el cavebot pide al BotLoop este tick.
@@ -311,6 +315,12 @@ pub struct Cavebot {
     /// of tick() snapshots the current inventory stacks lazily (it needs a
     /// ctx reference).
     needs_inventory_snapshot: bool,
+    /// Si Some, el próximo `advance()` debe re-entrar verifying con este
+    /// count de retries en vez del valor original del StepVerify. Usado
+    /// por la retry logic: cuando el verify falla con retries > 0, el
+    /// intercept sale de verifying (para que el step re-ejecute su action)
+    /// y deja este hint para que el próximo advance() lo tome.
+    pending_retries: Option<u8>,
 }
 
 impl Cavebot {
@@ -385,6 +395,7 @@ impl Cavebot {
             verifying: None,
             inventory_at_step_start: std::collections::HashMap::new(),
             needs_inventory_snapshot: true,
+            pending_retries: None,
         }
     }
 
@@ -471,6 +482,43 @@ impl Cavebot {
                 }
                 if elapsed >= verifying.timeout_ticks {
                     let label = self.steps[idx].label.clone();
+
+                    // Retry logic: si quedan retries, resetear el state del step
+                    // y dejar que vuelva a ejecutar su acción desde phase 0.
+                    // Re-entra verifying con el mismo retries_left - 1.
+                    if verifying.retries_left > 0 {
+                        let remaining = verifying.retries_left - 1;
+                        tracing::warn!(
+                            "Cavebot step[{}]={:?}: verify TIMEOUT ({}ms), RETRYING action ({} retries left)",
+                            idx, label, verify.timeout_ms, remaining
+                        );
+                        self.reset_step_state();
+                        self.verifying = Some(VerifyingState {
+                            started_tick: ctx.tick,
+                            timeout_ticks: verifying.timeout_ticks,
+                            retries_left: remaining,
+                        });
+                        // NOTA: NO llamamos `continue`. El step NO ejecuta
+                        // acción durante verifying — solo al salir. Salimos
+                        // via un Idle tick; el siguiente tick re-evaluará el
+                        // verify. Para que el action se re-ejecute, hay que
+                        // salir de verifying.
+                        //
+                        // Truco: seteamos verifying = None brevemente, el
+                        // step se ejecutará (emit action), y el advance()
+                        // subsecuente re-entrará verifying con los retries
+                        // decrementados. Pero advance() lee retry_action del
+                        // StepVerify, no del VerifyingState — así que no
+                        // respeta los retries left.
+                        //
+                        // Solución: exit verifying + guardar retries_left
+                        // en un field scratch del Cavebot, y el próximo
+                        // advance() lo consume.
+                        self.verifying = None;
+                        self.pending_retries = Some(remaining);
+                        continue;
+                    }
+
                     tracing::warn!(
                         "Cavebot step[{}]={:?}: verify TIMEOUT ({}ms), on_fail={:?}",
                         idx, label, verify.timeout_ms, verify.on_fail
@@ -478,6 +526,7 @@ impl Cavebot {
                     match verify.on_fail {
                         VerifyFailAction::SafetyPause => {
                             self.verifying = None;
+                            self.pending_retries = None;
                             let reason = format!(
                                 "verify_failed: step[{}]={:?} check={:?} timeout={}ms",
                                 idx, label, verify.check, verify.timeout_ms
@@ -486,11 +535,13 @@ impl Cavebot {
                         }
                         VerifyFailAction::Advance => {
                             self.verifying = None;
+                            self.pending_retries = None;
                             self.do_advance(ctx.tick);
                             continue;
                         }
                         VerifyFailAction::GotoLabel { target_idx, .. } => {
                             self.verifying = None;
+                            self.pending_retries = None;
                             self.jump_to(target_idx, ctx.tick);
                             continue;
                         }
@@ -1366,17 +1417,53 @@ impl Cavebot {
         if let Some(verify) = self.steps[idx].verify.clone() {
             let timeout_ticks = ms_to_ticks(verify.timeout_ms, self.fps);
             let label = self.steps[idx].label.clone();
+            // Si viene de un retry, usar el counter remanente; sino el full
+            // retry_action del StepVerify.
+            let retries_left = self.pending_retries.take()
+                .unwrap_or(verify.retry_action);
             tracing::info!(
-                "Cavebot step[{}]={:?}: entering verify check={:?} timeout_ms={}",
-                idx, label, verify.check, verify.timeout_ms
+                "Cavebot step[{}]={:?}: entering verify check={:?} timeout_ms={} retries_left={}",
+                idx, label, verify.check, verify.timeout_ms, retries_left
             );
             self.verifying = Some(VerifyingState {
                 started_tick: tick,
                 timeout_ticks,
+                retries_left,
             });
             return;
         }
         self.do_advance(tick);
+    }
+
+    /// Resetea el estado per-step del step ACTUAL (phases, counters, timers)
+    /// SIN cambiar `current`. Usado por la retry logic del verify cuando un
+    /// timeout debe re-ejecutar el action del step desde el principio
+    /// (phase 0). Análogo a la parte "state wipe" de `do_advance` pero sin
+    /// bumpear `current`.
+    fn reset_step_state(&mut self) {
+        self.last_emit_tick = None;
+        self.loot_clicks_done = 0;
+        self.npc_phrase_idx = 0;
+        self.npc_wait_start = None;
+        self.open_trade_phase = 0;
+        self.open_trade_phrase_idx = 0;
+        self.open_trade_phase_start = 0;
+        self.stuck_walk_ticks = 0;
+        self.deposit_phase = 0;
+        self.deposit_phase_start = 0;
+        self.buy_phase = 0;
+        self.buy_clicks_done = 0;
+        self.buy_last_click_tick = 0;
+        self.buy_amount_digit_idx = 0;
+        self.stow_phase = 0;
+        self.stow_phase_start = 0;
+        self.stow_iterations_done = 0;
+        self.stow_baseline_counts = None;
+        self.stow_stale_iters = 0;
+        self.type_field_phase = 0;
+        self.type_field_char_idx = 0;
+        self.type_field_phase_start = 0;
+        self.reset_node_state();
     }
 
     /// Low-level advance (sin verify interception). Mueve `current` al siguiente
@@ -3977,6 +4064,7 @@ mod tests {
                 check: VerifyCheck::TemplateVisible { name: "foo".into(), roi: None },
                 timeout_ms: 3000,
                 on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![
@@ -4002,6 +4090,7 @@ mod tests {
                 check: VerifyCheck::TemplateVisible { name: "foo".into(), roi: None },
                 timeout_ms: 33,
                 on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify)],
@@ -4030,6 +4119,7 @@ mod tests {
                 check: VerifyCheck::TemplateAbsent { name: "foo".into(), roi: None },
                 timeout_ms: 3000,
                 on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![
@@ -4054,6 +4144,7 @@ mod tests {
                     target_label: "recovery".into(),
                     target_idx: 0,
                 },
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![
@@ -4085,6 +4176,7 @@ mod tests {
                 check: VerifyCheck::ConditionMet(Condition::HpBelow(0.5)),
                 timeout_ms: 3000,
                 on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![
@@ -4109,6 +4201,7 @@ mod tests {
                 check: VerifyCheck::ConditionMet(Condition::HpBelow(0.5)),
                 timeout_ms: 33,
                 on_fail: VerifyFailAction::Advance,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![
@@ -4136,6 +4229,7 @@ mod tests {
                 },
                 timeout_ms: 3000,
                 on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![
@@ -4172,6 +4266,7 @@ mod tests {
                 },
                 timeout_ms: 33,
                 on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify)],
@@ -4209,6 +4304,7 @@ mod tests {
                 },
                 timeout_ms: 3000,
                 on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![
@@ -4257,6 +4353,7 @@ mod tests {
                 check: VerifyCheck::TemplateVisible { name: "foo".into(), roi: None },
                 timeout_ms: 60_000, // far beyond any test
                 on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify)],
@@ -4279,6 +4376,7 @@ mod tests {
                 check: VerifyCheck::TemplateVisible { name: "foo".into(), roi: None },
                 timeout_ms: 3000,
                 on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
             };
             let mut cb = Cavebot::new(
                 vec![
@@ -4293,6 +4391,102 @@ mod tests {
             // Manual jump_to_label bypasses the verify intercept → state cleared.
             assert!(cb.jump_to_label("home", 100));
             assert!(cb.verifying.is_none());
+        }
+
+        // 13. retry_action: tras timeout, re-ejecuta el action en vez de
+        //     aplicar on_fail directamente.
+        #[test]
+        fn verify_retry_action_re_emits_step_before_on_fail() {
+            // retry_action=1 + TemplateVisible que nunca matcheará → debe
+            // emitir el Hotkey dos veces antes de aplicar SafetyPause (el
+            // action del primer attempt + el action del retry).
+            let verify = StepVerify {
+                check: VerifyCheck::TemplateVisible { name: "never".into(), roi: None },
+                timeout_ms: 33, // 1 tick @ 30fps
+                on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 1,
+            };
+            let mut cb = Cavebot::new(
+                vec![step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify)],
+                false, 30,
+            );
+            // tick 0: Hotkey emite (attempt 1) → enters verify con retries_left=1
+            assert_eq!(cb.tick(&mut ctx_ui(0, vec![])), CavebotAction::KeyTap(0xF1));
+            let v1 = cb.verifying.clone().expect("verifying after tick 0");
+            assert_eq!(v1.retries_left, 1);
+
+            // tick 2: elapsed=2 ticks >= 1 timeout → timeout, PERO retries_left>0
+            // → retry: reset step state, verifying=None, pending_retries=Some(0).
+            // En la misma iter del loop `continue`, el step vuelve a ejecutar:
+            // emite Hotkey (attempt 2) + entra verify nuevo con retries_left=0.
+            assert_eq!(cb.tick(&mut ctx_ui(2, vec![])), CavebotAction::KeyTap(0xF1));
+            let v2 = cb.verifying.clone().expect("verifying after retry");
+            assert_eq!(v2.retries_left, 0, "retry decremented");
+
+            // tick 4: segundo timeout → retries_left==0 → SafetyPause.
+            let action = cb.tick(&mut ctx_ui(4, vec![]));
+            match action {
+                CavebotAction::SafetyPause { reason } => {
+                    assert!(
+                        reason.contains("verify_failed"),
+                        "reason debe contener 'verify_failed', got: {}",
+                        reason
+                    );
+                }
+                other => panic!("esperaba SafetyPause tras retries agotados, got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn verify_retry_action_passes_on_second_attempt() {
+            // retry_action=1 + ctx que matchea el template en el 2do intento →
+            // el retry salva la situación, no dispara on_fail.
+            let verify = StepVerify {
+                check: VerifyCheck::TemplateVisible { name: "foo".into(), roi: None },
+                timeout_ms: 33,
+                on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 1,
+            };
+            let mut cb = Cavebot::new(
+                vec![
+                    step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify),
+                    step(StepKind::Hotkey { hidcode: 0xF2 }),
+                ],
+                false, 30,
+            );
+            // tick 0: Hotkey emite + enters verify. ui_matches vacío.
+            assert_eq!(cb.tick(&mut ctx_ui(0, vec![])), CavebotAction::KeyTap(0xF1));
+            // tick 2: timeout → retry: step re-emite Hotkey. ui_matches sigue vacío.
+            assert_eq!(cb.tick(&mut ctx_ui(2, vec![])), CavebotAction::KeyTap(0xF1));
+            // tick 3: ahora ui_matches contiene "foo" → verify PASS →
+            //        do_advance → tick re-loops al siguiente step Hotkey 0xF2.
+            assert_eq!(
+                cb.tick(&mut ctx_ui(3, vec!["foo".into()])),
+                CavebotAction::KeyTap(0xF2)
+            );
+            assert!(cb.verifying.is_none(), "verifying clear tras PASS");
+        }
+
+        #[test]
+        fn verify_retry_action_zero_is_legacy_single_attempt() {
+            // retry_action=0 (default) = comportamiento legacy: verify fail
+            // dispara on_fail inmediato sin retry.
+            let verify = StepVerify {
+                check: VerifyCheck::TemplateVisible { name: "never".into(), roi: None },
+                timeout_ms: 33,
+                on_fail: VerifyFailAction::SafetyPause,
+                retry_action: 0,
+            };
+            let mut cb = Cavebot::new(
+                vec![step_with_verify(StepKind::Hotkey { hidcode: 0xF1 }, verify)],
+                false, 30,
+            );
+            // tick 0: emite F1 + enters verify.
+            cb.tick(&mut ctx_ui(0, vec![]));
+            // tick 2: timeout → directo a SafetyPause (sin retry).
+            let action = cb.tick(&mut ctx_ui(2, vec![]));
+            assert!(matches!(action, CavebotAction::SafetyPause { .. }),
+                    "retry_action=0 = legacy → SafetyPause directo");
         }
     }
 }
