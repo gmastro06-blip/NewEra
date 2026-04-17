@@ -198,14 +198,26 @@ o de layout visual, re-calibrar.
 Ejecutar **antes** de cada sesión live para catch errores de config:
 
 ```powershell
+# Validar bot + bridge config (paths, BE mitigations, thresholds)
+.\target\release\validate_config.exe --bot bot\config.toml --bridge bridge\bridge_config.toml
+
 # Validar cavebot TOML
 .\target\release\lint_cavebot.exe assets\cavebot\abdendriel_wasps.toml
 
 # Validar hunt profile
 .\target\release\validate_hunt_profile.exe assets\hunts\abdendriel_wasps.toml
 
-# Ambos deben terminar con "0 errors"
+# Todos deben terminar con "0 errors"
 ```
+
+`validate_config` chequea:
+- HTTP listen_addr no expuesto a LAN
+- map_index / minimap paths existen y son coherentes
+- starting_coord sensato (z en rango, dentro de matcher_floors)
+- bridge mode = "serial" (no sendinput)
+- focus poll_interval_ms ≥ 500 (anti-detection)
+- safety humanize_timing activo, max_session_hours razonable
+- serial.port formato COM válido
 
 ---
 

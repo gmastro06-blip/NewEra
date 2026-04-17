@@ -56,6 +56,10 @@ name = "validate_hunt_profile"
 path = "src/bin/validate_hunt_profile.rs"
 
 [[bin]]
+name = "validate_config"
+path = "src/bin/validate_config.rs"
+
+[[bin]]
 name = "calibration_helper"
 path = "src/bin/calibration_helper.rs"
 
