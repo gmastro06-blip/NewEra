@@ -136,31 +136,41 @@ max_wait_ms = 30000
 #   menu @ stow row  = (1723, 415)  — "Stow all items of this type"
 #   offset           = (+87, +258)  — delta del slot al menu row
 #
-# DESHABILITADO TEMP (commented out) 2026-04-17 durante E2E iter 3:
-# el char no tiene loot stackable cuando arranca el test desde depot frio —
-# solo magic_ring + shovel (non-stackables). El detector stash_full dispara
-# SafetyPause correctamente detectando "no hay stackables". Skipeamos los
-# stow steps para validar el resto del flow (NPC, buy, hunt). Cuando el
-# char vuelva del hunt con loot real, re-habilitamos.
-# [[step]]
-# kind = "stow_all_items"
-# slot_vx         = 1636
-# slot_vy         = 157
-# menu_offset_x   = 87
-# menu_offset_y   = 258
-# menu_wait_ms    = 600
-# stow_process_ms = 1200
-# max_iterations  = 6
+# Re-habilitados 2026-04-17 v4 con `from_profile = true` (commit e1ea675).
+#
+# El pre-check del step lee `[loot].stackables` del hunt profile
+# ("abdendriel_wasps": gold_coin + honeycomb + mana_potion). Si el
+# inventario del char NO tiene ninguno de esos items, el step advance
+# sin iterar — evita los 2 SafetyPause fantasma del cold boot que
+# nos bloquearon el E2E iter 3 (char con solo magic_ring + shovel).
+#
+# Cuando el char vuelve del hunt con loot real → el pre-check pasa y
+# el step itera N veces como antes. Sin edits manuales entre sesiones.
 
-# [[step]]
-# kind = "stow_all_items"
-# slot_vx         = 1596
-# slot_vy         = 215
-# menu_offset_x   = 87
-# menu_offset_y   = 258
-# menu_wait_ms    = 600
-# stow_process_ms = 1200
-# max_iterations  = 6
+# Stow Green Backpack (bag 3) — slot 1636,157 (primer slot interno)
+# Menu "Stow all items of this type" a +87,+258 del slot.
+[[step]]
+kind = "stow_all_items"
+slot_vx         = 1636
+slot_vy         = 157
+menu_offset_x   = 87
+menu_offset_y   = 258
+menu_wait_ms    = 600
+stow_process_ms = 1200
+max_iterations  = 6
+from_profile    = true
+
+# Stow Bag (bag 4) — slot 1596,215.
+[[step]]
+kind = "stow_all_items"
+slot_vx         = 1596
+slot_vy         = 215
+menu_offset_x   = 87
+menu_offset_y   = 258
+menu_wait_ms    = 600
+stow_process_ms = 1200
+max_iterations  = 6
+from_profile    = true
 
 # Walk to NPC shopkeeper (intermediate nodes para evitar stuck en pillars)
 [[step]]

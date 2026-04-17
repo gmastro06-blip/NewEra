@@ -441,16 +441,63 @@ Exit codes: 0=pass, 1=fail (postcondition not met), 2=error (bot not reachable, 
 
 ## Hunt profiles
 
-`assets/hunts/<name>.toml` centralizes data for a specific hunt (loot stackables, supplies thresholds, monster lists, metrics baselines). Loaded via `HuntProfile::load_by_name(Path::new("assets/hunts"), "abdendriel_wasps")`. Intended consumers:
-
-- `check_supplies` step → reads `[supplies]` instead of inline `requirements` array
-- `stow_all_items` → uses `[loot.stackables]` as whitelist for stash-full detector
-- Battle list validator → cross-references `[monsters]` for lure protection
-- `/metrics` → compares actual xp/hour vs `[metrics.expected_xp_per_hour]` as health signal
+`assets/hunts/<name>.toml` centralizes data for a specific hunt (loot stackables, supplies thresholds, monster lists, metrics baselines). Loaded via `HuntProfile::load_by_name(Path::new("assets/hunts"), "abdendriel_wasps")`.
 
 Profile schema: `HuntProfile { name, description, level_range, vocation, loot, supplies, monsters, metrics, calibration_hints }`. See `assets/hunts/abdendriel_wasps.toml` for a complete example.
 
-**Integration status**: profile loader exists (`bot/src/cavebot/hunt_profile.rs`) but step-level consumption not yet wired. Current cavebot TOMLs still duplicate the lists inline. Migration to `hunt_profile = "<name>"` top-level reference is incremental per-step.
+### Cavebot integration via `from_profile`
+
+A cavebot TOML references a profile at the top-level:
+
+```toml
+[cavebot]
+loop         = true
+hunt_profile = "abdendriel_wasps"   # loads assets/hunts/abdendriel_wasps.toml
+```
+
+The parser expects the convention `<assets>/cavebot/*.toml` + `<assets>/hunts/*.toml` (sibling dirs). If the cavebot file lives elsewhere, hunts_dir can't be derived and `hunt_profile = "..."` errors.
+
+Once declared, specific steps can consume the profile with `from_profile = true`:
+
+**`check_supplies from_profile = true`** — reads `[supplies]` thresholds instead of an inline `requirements` array:
+```toml
+[[step]]
+kind        = "check_supplies"
+on_fail     = "refill"
+from_profile = true                 # uses profile.supplies_list() — items with `min` field
+```
+Only supplies that have an `assets/templates/inventory/<name>.png` template can be checked; uncheckable supplies (ropes, shovels not pictured) should be omitted from the profile's `[supplies]` table.
+
+**`stow_all_items from_profile = true`** — uses `[loot].stackables` as a whitelist with two effects:
+1. **Pre-check skip**: if the inventory contains *zero* items from the whitelist, the step advances without iterating (saves the 2 phantom iterations that the stash_full detector would otherwise log as "no change"). Useful on cold-boot when the char has only gear in the bag.
+2. **Enhanced stash_full reason**: if the detector fires, the `SafetyPause` reason includes `expected_stackables=[...]` so the operator knows which items the step was looking for.
+
+```toml
+[[step]]
+kind         = "stow_all_items"
+slot_vx      = 1636
+slot_vy      = 157
+# ... standard fields ...
+from_profile = true                 # uses profile.loot.stackables
+```
+
+**Mutual exclusion**: within a single step, `from_profile = true` and inline `requirements = [...]` (for check_supplies) are mutually exclusive — having both is an error.
+
+Other intended profile consumers (not yet wired): battle-list validator against `[monsters]` for lure protection, `/metrics` comparisons against `[metrics.expected_xp_per_hour]`.
+
+### Observability
+
+`GET /cavebot/status` exposes the loaded profile name:
+```json
+{
+  "loaded": true,
+  "enabled": true,
+  "hunt_profile": "abdendriel_wasps",
+  "verifying": false,
+  ...
+}
+```
+`verifying = true` when the runner is polling a step's postcondition (see StepVerify section).
 
 ## Tile-hashing — absolute position from minimap
 
