@@ -19,7 +19,16 @@ max_backoff_secs    = 5
 
 [http]
 # El servidor HTTP del bot (panel de control y endpoints de test).
-listen_addr         = "0.0.0.0:8080"
+#
+# **Anti-detection**: default "127.0.0.1:8080" = loopback only (localhost
+# en esta máquina). Los endpoints expuestos (/cavebot/status, /metrics)
+# identifican trivialmente al server como un bot; NO deben ser accesibles
+# desde la LAN o Internet.
+#
+# Si necesitás monitoring remoto (Prometheus/Grafana en otra máquina),
+# overridear a "0.0.0.0:8080" Y configurar firewall para whitelist
+# del IP del scraper.
+listen_addr         = "127.0.0.1:8080"
 
 [loop_config]
 # Frecuencia del game loop en Hz. 30 Hz = ~33ms por tick.

@@ -49,12 +49,15 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("tibia_bot=info")),
+                // Generic filter name para que no aparezca `tibia_bot=info`
+                // como string constant en el binary. RUST_LOG env var sigue
+                // funcionando normalmente.
+                .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_target(false)
         .init();
 
-    info!("=== tibia-bot arrancando ===");
+    info!("=== NewEra runtime up ===");
 
     // ── 2. Config ──────────────────────────────────────────────────────────
     let config_path = std::env::args()
@@ -252,6 +255,6 @@ async fn main() -> Result<()> {
         error!("No se pudo enviar RESET a la Pico: {}", e);
     }
 
-    info!("tibia-bot terminado.");
+    info!("runtime terminado.");
     Ok(())
 }

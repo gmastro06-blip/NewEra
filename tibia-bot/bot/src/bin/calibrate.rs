@@ -33,13 +33,13 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("tibia-bot calibrate")
+            .with_title("Calibrate")
             .with_inner_size([1280.0, 780.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "tibia-bot calibrate",
+        "Calibrate",
         options,
         Box::new(move |cc| {
             Ok(Box::new(CalibrateApp::new(cc, frame_path.clone(), assets_dir.clone())))

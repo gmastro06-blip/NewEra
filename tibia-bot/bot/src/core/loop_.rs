@@ -364,11 +364,18 @@ impl BotLoop {
         // Cada string pendiente de tipear se convierte en una secuencia de
         // HID keycodes: [Enter, chars..., Enter]. El primer Enter abre el
         // chat de Tibia, el segundo envía el mensaje.
-        // Pace: 1 char cada `TYPING_TICK_SPACING` ticks (≈ 7.5 chars/s)
-        // para respetar el rate limiter global (8 keys/s default).
+        //
+        // Pace: típico humano 150-300ms/char con alta varianza. Anti-detection
+        // 2026-04-17: spacing aleatorio por char ∈ [TYPING_MIN, TYPING_MAX]
+        // ticks. Antes era fijo en 4 ticks (133ms) — uniformity es un
+        // fingerprint de bot (humanos varían naturalmente entre teclas).
+        //
+        // Rango: 3-8 ticks @ 30Hz = 100-267ms por tecla. Respeta rate
+        // limiter global (8 keys/s default) en el peor caso (100ms = 10/s).
         let mut typing_buffer: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
         let mut typing_next_tick: u64 = 0;
-        const TYPING_TICK_SPACING: u64 = 4;
+        const TYPING_MIN_TICKS: u64 = 3;
+        const TYPING_MAX_TICKS: u64 = 8;
 
         // ── Auto-loot state (kill-driven, smoothed sparkles como guard) ──
         //
@@ -1062,7 +1069,12 @@ impl BotLoop {
                 debug!("typing: emitting 0x{:02X}", hid);
                 self.dispatch_action(BotAction::UseHotkey { hidcode: hid });
                 emitted_hotkeys.push((hid, "typing"));
-                typing_next_tick = tick_num + TYPING_TICK_SPACING;
+                // Spacing aleatorio por char (anti-detection, ver comentario
+                // arriba en declaración de TYPING_MIN/MAX_TICKS).
+                use rand::Rng;
+                let next_spacing = rand::thread_rng()
+                    .gen_range(TYPING_MIN_TICKS..=TYPING_MAX_TICKS);
+                typing_next_tick = tick_num + next_spacing;
             }
 
             // ── AUTO-LOOT (kill-driven + sparkles guard) ─────────────────

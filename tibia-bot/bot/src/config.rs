@@ -69,7 +69,22 @@ pub struct HttpConfig {
     pub listen_addr: String,
 }
 
-fn default_http_addr() -> String { "0.0.0.0:8080".into() }
+/// Default HTTP bind: `127.0.0.1:8080` (loopback only).
+///
+/// **Anti-detection 2026-04-17**: bajado de `0.0.0.0` (all-interfaces) a
+/// `127.0.0.1` (localhost only). Con el default anterior, el bot HTTP
+/// server era alcanzable desde toda la LAN — cualquier host remoto podía
+/// scrapear `/cavebot/status` (expone `hunt_profile`, `verifying`,
+/// `current_step`) o `/metrics` (gauges bot-specific), lo que identifica
+/// trivialmente la máquina como un bot server.
+///
+/// Si necesitás monitoring desde otra máquina (ej Prometheus en otro
+/// host, Grafana remoto), overridear en config:
+///   [http]
+///   listen_addr = "0.0.0.0:8080"   # opt-in, LAN accessible
+///
+/// Y considerar firewall rule para limitar source IPs.
+fn default_http_addr() -> String { "127.0.0.1:8080".into() }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
