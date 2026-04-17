@@ -554,15 +554,35 @@ fn parse_step_toml(
             menu_wait_ms: menu_wait_ms.unwrap_or(300),
             process_ms:   process_ms.unwrap_or(500),
         },
-        "stow_all_items" => StepKind::StowAllItems {
-            slot_vx:         slot_vx.context("stow_all_items: falta 'slot_vx' (primer slot del bag)")?,
-            slot_vy:         slot_vy.context("stow_all_items: falta 'slot_vy'")?,
-            menu_offset_x:   menu_offset_x.unwrap_or(90),
-            menu_offset_y:   menu_offset_y.unwrap_or(197),
-            menu_wait_ms:    menu_wait_ms.unwrap_or(300),
-            stow_process_ms: stow_process_ms.unwrap_or(800),
-            max_iterations:  max_iterations.unwrap_or(8),
-        },
+        "stow_all_items" => {
+            // `from_profile = true` populates stackables_whitelist desde
+            // el hunt profile cargado. Sin profile + from_profile=true → error.
+            let stackables_whitelist = if from_profile {
+                let profile = hunt_profile.context(
+                    "stow_all_items: `from_profile = true` requiere que el cavebot \
+                     TOML declare `[cavebot] hunt_profile = \"<name>\"` al top-level."
+                )?;
+                if profile.loot.stackables.is_empty() {
+                    bail!(
+                        "stow_all_items: hunt_profile '{}' tiene [loot].stackables vacío.",
+                        profile.name
+                    );
+                }
+                Some(profile.loot.stackables.clone())
+            } else {
+                None
+            };
+            StepKind::StowAllItems {
+                slot_vx:         slot_vx.context("stow_all_items: falta 'slot_vx' (primer slot del bag)")?,
+                slot_vy:         slot_vy.context("stow_all_items: falta 'slot_vy'")?,
+                menu_offset_x:   menu_offset_x.unwrap_or(90),
+                menu_offset_y:   menu_offset_y.unwrap_or(197),
+                menu_wait_ms:    menu_wait_ms.unwrap_or(300),
+                stow_process_ms: stow_process_ms.unwrap_or(800),
+                max_iterations:  max_iterations.unwrap_or(8),
+                stackables_whitelist,
+            }
+        }
         "buy_item" => {
             // amount_vx y amount_vy son opcionales. Si sólo uno está presente
             // es una config ambigua → error explícito para que el usuario
@@ -1397,7 +1417,9 @@ mod tests {
             StepKind::StowAllItems {
                 slot_vx, slot_vy, menu_offset_x, menu_offset_y,
                 menu_wait_ms, stow_process_ms, max_iterations,
+                stackables_whitelist,
             } => {
+                assert!(stackables_whitelist.is_none(), "sin from_profile, whitelist None");
                 assert_eq!(*slot_vx, 1595);
                 assert_eq!(*slot_vy, 140);
                 assert_eq!(*menu_offset_x, 90);

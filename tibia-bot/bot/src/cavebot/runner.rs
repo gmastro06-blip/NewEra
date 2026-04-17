@@ -807,7 +807,36 @@ impl Cavebot {
                     slot_vx, slot_vy,
                     menu_offset_x, menu_offset_y,
                     menu_wait_ms, stow_process_ms, max_iterations,
+                    stackables_whitelist,
                 } => {
+                    // Pre-check (si hay whitelist del hunt profile): si el
+                    // inventario no contiene NINGÚN item del whitelist, skip
+                    // el step sin iterar. Evita las 2 iters fantasma del
+                    // stash_full detector cuando el char arranca sin loot
+                    // stackable (ej cold boot, solo gear).
+                    if self.stow_iterations_done == 0
+                        && self.stow_phase == 0
+                        && self.stow_baseline_counts.is_none()
+                    {
+                        if let Some(whitelist) = &stackables_whitelist {
+                            let has_any_stackable = whitelist.iter()
+                                .any(|name| ctx.inventory_counts.get(name).copied().unwrap_or(0) > 0);
+                            if !has_any_stackable {
+                                tracing::info!(
+                                    "StowAllItems[{}] skipped: inventario sin items del whitelist \
+                                     {:?} — char no tiene loot stackable para stow. Advancing sin iterar.",
+                                    idx, whitelist
+                                );
+                                self.stow_phase = 0;
+                                self.stow_iterations_done = 0;
+                                self.stow_baseline_counts = None;
+                                self.stow_stale_iters = 0;
+                                self.advance(ctx.tick);
+                                continue;
+                            }
+                        }
+                    }
+
                     // Exit condition: ya hicimos todas las iteraciones.
                     if self.stow_iterations_done >= max_iterations {
                         tracing::info!(
@@ -880,13 +909,18 @@ impl Cavebot {
                                     } else {
                                         self.stow_stale_iters = self.stow_stale_iters.saturating_add(1);
                                         if self.stow_stale_iters >= 2 {
+                                            let whitelist_hint = match &stackables_whitelist {
+                                                Some(w) => format!(" expected_stackables={:?}", w),
+                                                None => String::new(),
+                                            };
                                             let reason = format!(
                                                 "stow:stash_full_or_no_stackables: {} iters sin cambio en inventory. \
-                                                 baseline={} current={} — revisar si Supply Stash está lleno o \
+                                                 baseline={} current={}{} — revisar si Supply Stash está lleno o \
                                                  si el bag no tiene más items stackables.",
                                                 self.stow_stale_iters,
                                                 fmt_counts_summary(baseline),
                                                 fmt_counts_summary(&ctx.inventory_counts),
+                                                whitelist_hint,
                                             );
                                             tracing::error!("Cavebot: {}", reason);
                                             self.stow_phase = 0;
@@ -3452,6 +3486,7 @@ mod tests {
                     menu_offset_x: 90, menu_offset_y: 197,
                     menu_wait_ms: 100, stow_process_ms: 100,
                     max_iterations: 8,
+                    stackables_whitelist: None,
                 }),
                 step(StepKind::Hotkey { hidcode: 0xEE }),
             ],
@@ -3513,6 +3548,7 @@ mod tests {
                     menu_offset_x: 90, menu_offset_y: 197,
                     menu_wait_ms: 100, stow_process_ms: 100,
                     max_iterations: 8,
+                    stackables_whitelist: None,
                 }),
                 step(StepKind::Hotkey { hidcode: 0xEE }),
             ],
@@ -3558,6 +3594,7 @@ mod tests {
                     menu_offset_x: 90, menu_offset_y: 197,
                     menu_wait_ms: 100, stow_process_ms: 100,
                     max_iterations: 3,
+                    stackables_whitelist: None,
                 }),
                 step(StepKind::Hotkey { hidcode: 0xEE }),
             ],
@@ -3599,6 +3636,104 @@ mod tests {
         assert_eq!(action, CavebotAction::KeyTap(0xEE));
         assert_eq!(cb.stow_iterations_done, 0, "reset tras completar el step");
         assert!(cb.stow_baseline_counts.is_none(), "baseline limpio tras completar");
+    }
+
+    #[test]
+    fn stow_all_items_skips_when_whitelist_has_no_match_in_inventory() {
+        // Con whitelist del hunt profile (["gold_coin", "honeycomb", "mana_potion"])
+        // + inventario solo con non-stackables del char (magic_ring, shovel) →
+        // el step debe hacer skip (advance sin iterar, sin emitir RC ni Click).
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::StowAllItems {
+                    slot_vx: 1600, slot_vy: 50,
+                    menu_offset_x: 90, menu_offset_y: 197,
+                    menu_wait_ms: 100, stow_process_ms: 100,
+                    max_iterations: 8,
+                    stackables_whitelist: Some(vec![
+                        "gold_coin".into(),
+                        "honeycomb".into(),
+                        "mana_potion".into(),
+                    ]),
+                }),
+                step(StepKind::Hotkey { hidcode: 0xEE }),
+            ],
+            false, 30,
+        );
+        // Inventory sin ningún item del whitelist.
+        let inv_non_stackables = &[("magic_ring", 5), ("shovel", 3)];
+
+        // Tick 0: el pre-check debe detectar 0 matches del whitelist y
+        // advance inmediato al Hotkey (sin RightClick).
+        let action = tick_with_inv(&mut cb, 0, inv_non_stackables);
+        assert_eq!(
+            action, CavebotAction::KeyTap(0xEE),
+            "step debería skippear y avanzar directo al Hotkey"
+        );
+        assert_eq!(cb.stow_iterations_done, 0, "sin iteraciones emitidas");
+        assert!(cb.stow_baseline_counts.is_none(), "sin baseline capturado");
+    }
+
+    #[test]
+    fn stow_all_items_proceeds_when_whitelist_has_match() {
+        // Con whitelist + inventario que tiene al menos 1 match (mana_potion=5) →
+        // el step debe proceder normalmente (emite RightClick + captura baseline).
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::StowAllItems {
+                    slot_vx: 1600, slot_vy: 50,
+                    menu_offset_x: 90, menu_offset_y: 197,
+                    menu_wait_ms: 100, stow_process_ms: 100,
+                    max_iterations: 8,
+                    stackables_whitelist: Some(vec![
+                        "gold_coin".into(),
+                        "mana_potion".into(),
+                    ]),
+                }),
+                step(StepKind::Hotkey { hidcode: 0xEE }),
+            ],
+            false, 30,
+        );
+        let inv = &[("mana_potion", 5), ("magic_ring", 5)];
+
+        // Tick 0: inventario contiene mana_potion (parte del whitelist) →
+        // procede normalmente, emite RightClick.
+        let action = tick_with_inv(&mut cb, 0, inv);
+        assert_eq!(
+            action,
+            CavebotAction::RightClick { vx: 1600, vy: 50 },
+            "debería emitir RightClick en phase 0 iter 1"
+        );
+        assert!(cb.stow_baseline_counts.is_some(), "baseline capturado");
+    }
+
+    #[test]
+    fn stow_all_items_without_whitelist_runs_unconditionally() {
+        // Sin whitelist (None), el pre-check no aplica — step corre normal
+        // incluso con inventario de puros non-stackables.
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::StowAllItems {
+                    slot_vx: 1600, slot_vy: 50,
+                    menu_offset_x: 90, menu_offset_y: 197,
+                    menu_wait_ms: 100, stow_process_ms: 100,
+                    max_iterations: 8,
+                    stackables_whitelist: None,
+                }),
+                step(StepKind::Hotkey { hidcode: 0xEE }),
+            ],
+            false, 30,
+        );
+        let inv_non_stackables = &[("magic_ring", 5), ("shovel", 3)];
+
+        // Sin whitelist, emite RightClick incluso sin items stackables
+        // (backwards compat — stash_full detector pausará tras 2 iters stale).
+        let action = tick_with_inv(&mut cb, 0, inv_non_stackables);
+        assert_eq!(
+            action,
+            CavebotAction::RightClick { vx: 1600, vy: 50 },
+            "sin whitelist el step corre sin pre-check"
+        );
     }
 
     #[test]

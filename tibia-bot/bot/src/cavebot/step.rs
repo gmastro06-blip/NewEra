@@ -242,6 +242,20 @@ pub enum StepKind {
         /// las iteraciones restantes no hacen nada (menu sin "Stow all" para
         /// non-stackables). Default 8.
         max_iterations:  u8,
+        /// Whitelist de items stackables esperados del hunt (populado desde
+        /// `[cavebot].hunt_profile` + `[loot].stackables` del profile si el
+        /// step declara `from_profile = true`).
+        ///
+        /// Uso:
+        /// - **Pre-check**: si el inventario no contiene NINGÚN item del
+        ///   whitelist, el step advance inmediato sin iterar — evita 2+
+        ///   iteraciones fantasma del stash_full detector cuando el char
+        ///   no tiene loot stackable (cold boot, solo gear en el bag).
+        /// - **Stash-full reason**: incluido en el SafetyPause reason si
+        ///   dispara, para que el operador sepa qué items se esperaban.
+        ///
+        /// `None` = sin whitelist; el step corre las max_iterations siempre.
+        stackables_whitelist: Option<Vec<String>>,
     },
     /// Escribe texto en un campo de input (no chat) haciendo primero click
     /// sobre el field para activarlo y luego emitiendo un `KeyTap` por cada
