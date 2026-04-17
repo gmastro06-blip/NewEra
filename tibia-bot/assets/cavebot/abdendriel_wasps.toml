@@ -138,8 +138,8 @@ slot_vx         = 1585
 slot_vy         = 150
 menu_offset_x   = 65
 menu_offset_y   = 245
-menu_wait_ms    = 300
-stow_process_ms = 800
+menu_wait_ms    = 600
+stow_process_ms = 1200
 max_iterations  = 6
 
 # Stow Bag (bag 4) — mismos offsets de menu (click x similar, menu aparece
@@ -150,8 +150,8 @@ slot_vx         = 1585
 slot_vy         = 215
 menu_offset_x   = 65
 menu_offset_y   = 245
-menu_wait_ms    = 300
-stow_process_ms = 800
+menu_wait_ms    = 600
+stow_process_ms = 1200
 max_iterations  = 6
 
 # Walk to NPC shopkeeper (intermediate nodes para evitar stuck en pillars)

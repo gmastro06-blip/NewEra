@@ -39,16 +39,16 @@ prompt_npc_trade   = { x = 50,  y = 25,  w = 420, h = 650 }
 # login: modal de login del cliente cuando se pierde sesión (server save,
 # disconnect, kick). Tibia 12 muestra un panel central grande con campos
 # account/password + logos del cliente. ROI cubre la zona central típica.
-# NOTA: coords son PLACEHOLDER — refinar capturando frame real con el login
-# modal abierto y medir con GIMP. Template en assets/templates/prompts/login.png.
+# NOTA: coords aún PLACEHOLDER — login modal no capturado live todavía.
+# Refinar próxima vez que el char quede en login (disconnect, app restart).
 prompt_login       = { x = 560, y = 220, w = 800, h = 600 }
 
 # char_select: lista de personajes post-login y post-muerte (Tibia no tiene
 # "death screen" separada — va directo a char select). Panel central con
-# lista de chars + botones Login/Cancel.
-# NOTA: coords son PLACEHOLDER — refinar con frame real. Template en
-# assets/templates/prompts/char_select.png.
-prompt_char_select = { x = 600, y = 200, w = 720, h = 650 }
+# list de chars + botones OK/Cancel.
+# 2026-04-17: calibrado live tras server save kick. Panel ~870x450 centrado
+# horizontalmente. Agregado margen ±10px para tolerar drift.
+prompt_char_select = { x = 490, y = 290, w = 900, h = 480 }
 
 # ── UI genérica (depot chest, menús contextuales) ────────────────────────────
 # ROIs de búsqueda para los templates de assets/templates/ui/.
@@ -94,14 +94,19 @@ stow_menu   = { x = 900,  y = 0, w = 1020, h = 800 }
 [inventory_backpack_strip]
 # Calibrado empíricamente 2026-04-15 contra frame NDI real:
 # - Strip en (1567, 22), ancho 174
-# - 2 backpacks abiertos (Backpack + Bag), stride vertical 68 px
+# - 4 backpacks stacked (Backpack + Golden Backpack + Green Backpack + Bag)
+# - Stride vertical 68 px (bag title + slot row + capacity bar)
 # - Slot row en el TOP de cada backpack (title bar va debajo, no arriba)
-# - Items detectados: ring/shovel/potion en Backpack 1, 3 mana potions en Bag
+#
+# 2026-04-17: subido de 2 → 4 porque con 2 solo se escaneaban Backpack y
+# Golden Backpack; el refill compra mana potions que van a Green Backpack o
+# Bag (bags 3 y 4). Con count=2, CheckSupplies no veía las manas compradas
+# → cavebot saltaba el hunt y volvía a refill ciclando infinitamente.
 x              = 1567
 y              = 22
 backpack_w     = 174
 backpack_h     = 68
-backpack_count = 2     # Backpack + Bag (ajustar si abres más)
+backpack_count = 4     # Backpack + Golden + Green + Bag
 slot_x_offset  = 18    # margen interno del backpack al 1er slot
 slot_y_offset  = 0     # slots al top del backpack (sin offset)
 slot_size      = 32
