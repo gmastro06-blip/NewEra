@@ -468,6 +468,61 @@ pub fn apply_displacement(
 // **Uso**: se carga desde `assets/minimap/minimap/` vía `load_dir(floors)` al
 // boot. Luego `detect` se llama como fallback del dHash en Vision::tick.
 
+/// Máximo desplazamiento XY en tiles permitido entre dos detecciones
+/// consecutivas en el mismo piso. Usado por `validate_jump` como
+/// physical-motion sanity filter para rechazar false positives.
+///
+/// Valor: 30 tiles / 500ms ≈ 60 tiles/s. Referencias de movimiento:
+/// - Walking: ~10 tiles/s (sin haste)
+/// - Utani hur: ~15 tiles/s
+/// - Utani gran hur: ~25 tiles/s
+///
+/// Margen ~2× sobre el máximo esperado para absorber jitter de timing
+/// + drift del detect interval bajo carga.
+pub const MAX_JUMP_PER_DETECT: i32 = 30;
+
+/// Physical-motion sanity filter sobre el output del `MinimapMatcher::detect()`.
+///
+/// Rechaza detecciones inconsistentes con el movimiento real del personaje:
+/// un char no puede saltar >`MAX_JUMP_PER_DETECT` tiles entre dos detecciones
+/// (intervalo ~500ms) caminando normal. Si el matcher devuelve un coord
+/// físicamente imposible, probablemente es un false positive (validado
+/// live 2026-04-17: matcher elegía un sector diagonal ~370 tiles off del
+/// seed en Ab'dendriel depot).
+///
+/// Reglas:
+/// - Si `detected` es `None` → retorna `None` (passthrough).
+/// - Si `force_full=true` → bypassa el filtro (re-validación explícita,
+///   acepta drift grande tras muerte/despawn).
+/// - Si `last` es `None` → no hay baseline, acepta (cold boot sin seed).
+/// - Si `detected.z != last.z` → cross-floor (ladder/rope/teleport),
+///   acepta sin filtro — las subidas/bajadas son saltos legítimos
+///   en distancia XY mínima pero cambian el piso.
+/// - Si `|dx| > MAX_JUMP OR |dy| > MAX_JUMP` en el mismo piso → rechaza (`None`).
+/// - Sino → acepta (`Some(detected)`).
+pub fn validate_jump(
+    last:      Option<(i32, i32, i32)>,
+    detected:  Option<(i32, i32, i32)>,
+    force_full: bool,
+) -> Option<(i32, i32, i32)> {
+    let d = detected?;
+    if force_full {
+        return Some(d);
+    }
+    let Some(l) = last else {
+        return Some(d);
+    };
+    if d.2 != l.2 {
+        return Some(d); // cross-floor — bypass
+    }
+    let dx = (d.0 - l.0).abs();
+    let dy = (d.1 - l.1).abs();
+    if dx > MAX_JUMP_PER_DETECT || dy > MAX_JUMP_PER_DETECT {
+        return None;
+    }
+    Some(d)
+}
+
 /// Entry de reference en el atlas: el GrayImage del PNG + sus coords world.
 #[allow(dead_code)]
 pub struct ReferenceSector {
@@ -1110,6 +1165,97 @@ impl MinimapMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── validate_jump ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_jump_none_detected_passes_through() {
+        assert_eq!(validate_jump(Some((100, 100, 6)), None, false), None);
+        assert_eq!(validate_jump(None, None, false), None);
+        assert_eq!(validate_jump(None, None, true), None);
+    }
+
+    #[test]
+    fn validate_jump_no_last_accepts_any_detect() {
+        // Cold boot sin seed: sin baseline, aceptamos lo que devuelva el matcher.
+        assert_eq!(
+            validate_jump(None, Some((99999, 99999, 6)), false),
+            Some((99999, 99999, 6))
+        );
+    }
+
+    #[test]
+    fn validate_jump_force_full_bypasses_filter() {
+        // force_full = re-validación, acepta drift grande.
+        let last     = Some((1000, 1000, 6));
+        let detected = Some((5000, 5000, 6));
+        assert_eq!(validate_jump(last, detected, true), detected);
+    }
+
+    #[test]
+    fn validate_jump_cross_floor_accepts_any_xy() {
+        // Ladder/rope/teleport: z cambia, xy puede cambiar arbitrariamente.
+        let last = Some((1000, 1000, 6));
+        // Mismo XY, piso distinto → ladder
+        assert_eq!(
+            validate_jump(last, Some((1000, 1000, 7)), false),
+            Some((1000, 1000, 7))
+        );
+        // XY muy distinto + z distinto → teleport
+        assert_eq!(
+            validate_jump(last, Some((5000, 5000, 7)), false),
+            Some((5000, 5000, 7))
+        );
+    }
+
+    #[test]
+    fn validate_jump_same_floor_within_max_accepts() {
+        let last = Some((1000, 1000, 6));
+        // dx=30, dy=0 → justo en el borde (<=30 acepta)
+        assert_eq!(
+            validate_jump(last, Some((1030, 1000, 6)), false),
+            Some((1030, 1000, 6))
+        );
+        // dx=-30, dy=-30 → esquina, borde ambos
+        assert_eq!(
+            validate_jump(last, Some((970, 970, 6)), false),
+            Some((970, 970, 6))
+        );
+        // Movimiento pequeño normal
+        assert_eq!(
+            validate_jump(last, Some((1005, 1003, 6)), false),
+            Some((1005, 1003, 6))
+        );
+    }
+
+    #[test]
+    fn validate_jump_same_floor_exceeds_max_rejects_x() {
+        let last = Some((1000, 1000, 6));
+        // dx=31 > MAX_JUMP=30
+        assert_eq!(validate_jump(last, Some((1031, 1000, 6)), false), None);
+    }
+
+    #[test]
+    fn validate_jump_same_floor_exceeds_max_rejects_y() {
+        let last = Some((1000, 1000, 6));
+        // dy=31 > MAX_JUMP=30
+        assert_eq!(validate_jump(last, Some((1000, 1031, 6)), false), None);
+    }
+
+    #[test]
+    fn validate_jump_large_jump_rejected() {
+        // Caso real observado 2026-04-17: matcher devolvía coord ~370 tiles off
+        // del seed por false positive en sector diagonal vecino.
+        let seed     = Some((32681, 31686, 6));
+        let false_fp = Some((32980, 31460, 6));
+        assert_eq!(validate_jump(seed, false_fp, false), None);
+    }
+
+    #[test]
+    fn validate_jump_max_jump_constant_is_30() {
+        // Documenta la constante para reviewers / regresion detection.
+        assert_eq!(MAX_JUMP_PER_DETECT, 30);
+    }
 
     fn make_patch(w: usize, h: usize, seed: u8) -> Vec<u8> {
         let mut data = vec![0u8; w * h * 4];

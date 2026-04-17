@@ -383,6 +383,13 @@ impl Vision {
         self.tracked_sub_tile_px = (0, 0);
     }
 
+    /// Read accessor a `last_game_coords` para tests de integración que
+    /// validan el bootstrap-seed del matcher al aplicar config.
+    #[doc(hidden)]
+    pub fn last_game_coords_for_test(&self) -> Option<(i32, i32, i32)> {
+        self.last_game_coords
+    }
+
     /// Retorna el centro del minimap en coordenadas del viewport, ajustado
     /// por el anchor tracker. Usado por el cavebot Node para calcular clicks.
     /// `None` si el minimap no está calibrado.
@@ -694,40 +701,21 @@ impl Vision {
                             self.frame_count, self.last_game_coords, detected, elapsed_ms
                         );
                     }
-                    // Physical-motion sanity filter contra false positives.
-                    //
-                    // El matcher puede devolver un sector visualmente similar
-                    // pero físicamente lejano al last_known (validado live
-                    // 2026-04-17: matcher reportaba coords ~370 tiles off
-                    // del seed en el sector diagonal del 3×3 grid de narrow
-                    // search). Un char no puede saltar >MAX_JUMP tiles entre
-                    // detects (intervalo 500ms) en movimiento normal.
-                    //
-                    // Rechazamos matches con delta xy absoluto > MAX_JUMP
-                    // en el mismo piso (z preservado). Cross-floor moves
-                    // (z diff) se aceptan sin filtro — ladder/rope/teleport
-                    // son legítimos. force_full también bypassa el filtro
-                    // para permitir re-sincronización tras un quizás
-                    // desvío grande (ej tras una muerte o despawn).
-                    //
-                    // MAX_JUMP = 30 tiles / 500ms = 60 tiles/s máximo.
-                    // Walking = 10 tiles/s, utani gran hur = 25 tiles/s.
-                    // Margen 2× da tolerancia para lag + detections spaced.
-                    const MAX_JUMP_PER_DETECT: i32 = 30;
-                    let mut detected_filtered = detected;
-                    if !force_full {
+                    // Physical-motion sanity filter (ver game_coords::validate_jump).
+                    let detected_filtered = game_coords::validate_jump(
+                        self.last_game_coords,
+                        detected,
+                        force_full,
+                    );
+                    if detected_filtered.is_none() && detected.is_some() && !force_full {
                         if let (Some(d), Some(l)) = (detected, self.last_game_coords) {
-                            let same_floor = d.2 == l.2;
-                            let dx = (d.0 - l.0).abs();
-                            let dy = (d.1 - l.1).abs();
-                            if same_floor && (dx > MAX_JUMP_PER_DETECT || dy > MAX_JUMP_PER_DETECT) {
-                                tracing::warn!(
-                                    "MinimapMatcher rejected jump: last={:?} detected={:?} \
-                                     (|dx|={}, |dy|={} > {}tiles/500ms). Probable false positive.",
-                                    l, d, dx, dy, MAX_JUMP_PER_DETECT
-                                );
-                                detected_filtered = None;
-                            }
+                            tracing::warn!(
+                                "MinimapMatcher rejected jump: last={:?} detected={:?} \
+                                 (|dx|={}, |dy|={} > {}tiles/500ms). Probable false positive.",
+                                l, d,
+                                (d.0 - l.0).abs(), (d.1 - l.1).abs(),
+                                game_coords::MAX_JUMP_PER_DETECT
+                            );
                         }
                     }
                     if detected_filtered.is_some() {

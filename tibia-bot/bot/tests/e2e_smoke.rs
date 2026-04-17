@@ -373,3 +373,50 @@ fn matcher_stats_snapshot_serializable() {
     assert!(json.contains("last_score"));
     assert!(json.contains("floors_loaded"));
 }
+
+/// Valida el bootstrap-seed del matcher: si la config lleva
+/// `starting_coord = [X, Y, Z]`, `load_map_index` setea
+/// `last_game_coords = Some((X, Y, Z))` para que el primer `detect()`
+/// haga narrow search desde ese sector (no brute force global).
+///
+/// Fix validado live el 2026-04-17 en Ab'dendriel depot: sin seed el
+/// matcher caía en un false positive ~946 tiles al este; con seed
+/// reporta el coord real ±3 tiles.
+#[test]
+fn starting_coord_seed_applied_on_load_map_index() {
+    let mut vision = Vision::load(std::path::Path::new("/no_assets_for_test"));
+
+    // Pre-condición: cold boot, sin seed → None.
+    assert_eq!(vision.last_game_coords_for_test(), None);
+
+    let mut gc_cfg = tibia_bot::config::GameCoordsConfig::default();
+    gc_cfg.starting_coord = Some([32681, 31686, 6]);
+    vision.load_map_index(&gc_cfg);
+
+    // Post: seed aplicada como last_game_coords.
+    assert_eq!(
+        vision.last_game_coords_for_test(),
+        Some((32681, 31686, 6)),
+        "starting_coord debe semillar last_game_coords"
+    );
+}
+
+#[test]
+fn starting_coord_absent_leaves_last_game_coords_unchanged() {
+    let mut vision = Vision::load(std::path::Path::new("/no_assets_for_test"));
+
+    // Sin seed en config, last_game_coords se mantiene None.
+    let gc_cfg = tibia_bot::config::GameCoordsConfig::default();
+    vision.load_map_index(&gc_cfg);
+    assert_eq!(vision.last_game_coords_for_test(), None);
+
+    // Incluso si inyectamos un valor antes, sin seed no lo tocamos.
+    vision.set_last_game_coords_for_test(Some((1, 2, 3)));
+    let gc_cfg2 = tibia_bot::config::GameCoordsConfig::default();
+    vision.load_map_index(&gc_cfg2);
+    assert_eq!(
+        vision.last_game_coords_for_test(),
+        Some((1, 2, 3)),
+        "load_map_index sin seed no debe resetear last_game_coords"
+    );
+}
