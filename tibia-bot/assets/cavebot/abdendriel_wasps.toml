@@ -195,12 +195,18 @@ kind = "npc_dialog"
 phrases = ["hi", "trade"]
 wait_prompt_ms = 1500
 
+# Calibrado live 2026-04-17 con hover mouse + GetCursorPos sobre la trade
+# window abierta (filtrada por "potions") del NPC Ashari Aelzerand Neeymas:
+#   - mana_potion row en la lista scrolleable: (446, 148)
+#   - Buy button "Buy 1x mana potion for 56 gold": (478, 322)
+# Nota: el NPC filter requirió decir "hi" → "potions" en chat (no "trade").
+# Abrir trade window directa vía click en botón bag también funciona (TBD en cavebot).
 [[step]]
 kind = "buy_item"
-item_vx    = 120     # CALIBRAR: posición del mana potion en el trade window
-item_vy    = 340
-confirm_vx = 300     # CALIBRAR: botón confirm/buy
-confirm_vy = 520
+item_vx    = 446
+item_vy    = 148
+confirm_vx = 478
+confirm_vy = 322
 quantity   = 100
 spacing_ms = 150
 
