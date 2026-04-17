@@ -131,27 +131,32 @@ max_wait_ms = 30000
 #   slot_vx/vy       = (1636, 157)  — primer slot del bag
 #   menu @ stow row  = (1723, 415)  — "Stow all items of this type"
 #   offset           = (+87, +258)  — delta del slot al menu row
-[[step]]
-kind = "stow_all_items"
-slot_vx         = 1636
-slot_vy         = 157
-menu_offset_x   = 87
-menu_offset_y   = 258
-menu_wait_ms    = 600
-stow_process_ms = 1200
-max_iterations  = 6
+#
+# DESHABILITADO TEMP (commented out) 2026-04-17 durante E2E iter 3:
+# el char no tiene loot stackable cuando arranca el test desde depot frio —
+# solo magic_ring + shovel (non-stackables). El detector stash_full dispara
+# SafetyPause correctamente detectando "no hay stackables". Skipeamos los
+# stow steps para validar el resto del flow (NPC, buy, hunt). Cuando el
+# char vuelva del hunt con loot real, re-habilitamos.
+# [[step]]
+# kind = "stow_all_items"
+# slot_vx         = 1636
+# slot_vy         = 157
+# menu_offset_x   = 87
+# menu_offset_y   = 258
+# menu_wait_ms    = 600
+# stow_process_ms = 1200
+# max_iterations  = 6
 
-# Stow Bag (bag 4) — mismos offsets de menu (Tibia 12 menu aparece
-# relativo al right-click con delta constante).
-[[step]]
-kind = "stow_all_items"
-slot_vx         = 1596
-slot_vy         = 215
-menu_offset_x   = 87
-menu_offset_y   = 258
-menu_wait_ms    = 600
-stow_process_ms = 1200
-max_iterations  = 6
+# [[step]]
+# kind = "stow_all_items"
+# slot_vx         = 1596
+# slot_vy         = 215
+# menu_offset_x   = 87
+# menu_offset_y   = 258
+# menu_wait_ms    = 600
+# stow_process_ms = 1200
+# max_iterations  = 6
 
 # Walk to NPC shopkeeper (intermediate nodes para evitar stuck en pillars)
 [[step]]

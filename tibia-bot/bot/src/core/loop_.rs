@@ -493,7 +493,25 @@ impl BotLoop {
                     // vea la pausa con la misma reason coherente.
                     current_pause_reason = Some("vision:no_frame".into());
                 }
-                NoFrameStep::FrameOk | NoFrameStep::Accumulating => {}
+                NoFrameStep::FrameOk => {
+                    // Fix 2026-04-17: si frames volvieron y la reason previa
+                    // era "vision:no_frame", la limpiamos para que el FSM
+                    // pueda salir de Paused cuando el operador re-resume.
+                    // Sin esta limpieza, la reason queda pegada y el FSM
+                    // siempre vuelve a Paused aunque is_paused=false.
+                    //
+                    // Limpiamos AMBAS: current_pause_reason (variable local
+                    // del loop que el FSM chequea) y state.safety_pause_reason
+                    // (struct compartido expuesto vía HTTP).
+                    if current_pause_reason.as_deref() == Some("vision:no_frame") {
+                        current_pause_reason = None;
+                    }
+                    let mut g = self.state.write();
+                    if g.safety_pause_reason.as_deref() == Some("vision:no_frame") {
+                        g.safety_pause_reason = None;
+                    }
+                }
+                NoFrameStep::Accumulating => {}
             }
 
             // ── VISION ────────────────────────────────────────────────────────
@@ -630,8 +648,12 @@ impl BotLoop {
                                 {
                                     let mut g = self.state.write();
                                     g.is_paused = true;
-                                    g.safety_pause_reason = Some(reason);
+                                    g.safety_pause_reason = Some(reason.clone());
                                 }
+                                // FIX 2026-04-17: propagar reason a la variable
+                                // local para que el snapshot al final del tick
+                                // (line ~1145) no la borre con None.
+                                current_pause_reason = Some(reason);
                                 self.cavebot_enabled = false;
                                 WaypointHint::Inactive
                             }
