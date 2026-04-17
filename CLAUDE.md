@@ -387,6 +387,71 @@ Node navigation has 10 tunable parameters via `NodeTuning` (runner.rs). Defaults
 
 **Cavebot vs Waypoints:** use Cavebot for new hunts (labels and conditionals); Waypoints (`bot/src/waypoints/mod.rs`) are the legacy system kept for simple refill loops already written in that format.
 
+### StepVerify — postcondition verification per step
+
+Every cavebot step can declare an optional `[step.verify]` subtable that the runner enforces AFTER the step's natural completion. This is the ADR-003 fix for "fire-and-forget" bugs where clicks emit without effect and the bot advances through fake progress. If the postcondition fails within `timeout_ms`, the runner applies `on_fail`.
+
+```toml
+[[step]]
+kind = "open_npc_trade"
+greeting_phrases = ["hi"]
+bag_button_vx = 163
+bag_button_vy = 301
+
+[step.verify]
+template   = "npc_trade"      # VerifyCheck::TemplateVisible
+timeout_ms = 3000             # default 3000
+on_fail    = "safety_pause"   # | "advance" | "goto:<label>"
+```
+
+**Check variants** (exactly one per `[step.verify]`):
+- `template = "<name>"` — UiDetector template `<name>` visible (uses cached `ctx.ui_matches`, up to 500ms stale)
+- `absent_template = "<name>"` — template NOT visible (for close/bye actions)
+- `condition = "<expr>"` — same grammar as `goto_if.when` (hp_below, has_item, at_coord, etc.)
+- `inventory_delta = { item = "mana_potion", min_abs_delta = 50, require_positive = true }` — inventory changed by ≥N units since step start. `require_positive=true` rejects decreases; false accepts either direction. Snapshot captured lazily on step entry.
+
+**Fail actions**:
+- `safety_pause` (default) — emit `CavebotAction::SafetyPause { reason: "verify_failed: step[N]=<label> check=<...> timeout=<ms>" }`. Bot pauses with diagnosable reason.
+- `advance` — skip the failed verify and move to next step (best-effort steps like optional loot).
+- `goto:<label>` — jump to a recovery label. Resolved at TOML load time like `goto`/`check_supplies.on_fail`.
+
+**Runner mechanics**:
+- `Cavebot.advance()` is a verify-aware wrapper; if `step.verify.is_some()` and we haven't verified yet, transitions to `verifying: Some(VerifyingState)` instead of advancing.
+- Each tick while verifying, `evaluate_verify()` runs the check. Pass → `do_advance()` + continue. Timeout → apply `on_fail`.
+- `jump_to` clears verifying (goto bypasses origin's verify).
+
+**Not verified via StepVerify** (use dedicated mechanisms):
+- Z arrival after Node steps — already covered by built-in z validation (SafetyPause with `node_z_mismatch`).
+- Cross-floor ladder/rope physical movement — covered by subsequent Node's z check.
+
+## click_live — standalone click validator (Fase 1 ADR-003)
+
+Binary `bot/src/bin/click_live.rs` — CLI tool to test a single click against Tibia (via bot's HTTP `/test/click` + `/test/grab`) and verify postcondition before spending 15 min on a full cavebot rebuild. Feedback loop: ~10s vs ~15min.
+
+```bash
+# Click at (117, 298), verify npc_trade template disappears, baseline BEFORE click:
+cargo run --release --bin click_live -- \
+    --coord 117,298 --button L \
+    --verify-template npc_trade \
+    --template-dir assets/templates/prompts \
+    --baseline-first --expect absent --timeout-ms 2000
+```
+
+Exit codes: 0=pass, 1=fail (postcondition not met), 2=error (bot not reachable, template missing, etc.). Use in CI or manual calibration.
+
+## Hunt profiles
+
+`assets/hunts/<name>.toml` centralizes data for a specific hunt (loot stackables, supplies thresholds, monster lists, metrics baselines). Loaded via `HuntProfile::load_by_name(Path::new("assets/hunts"), "abdendriel_wasps")`. Intended consumers:
+
+- `check_supplies` step → reads `[supplies]` instead of inline `requirements` array
+- `stow_all_items` → uses `[loot.stackables]` as whitelist for stash-full detector
+- Battle list validator → cross-references `[monsters]` for lure protection
+- `/metrics` → compares actual xp/hour vs `[metrics.expected_xp_per_hour]` as health signal
+
+Profile schema: `HuntProfile { name, description, level_range, vocation, loot, supplies, monsters, metrics, calibration_hints }`. See `assets/hunts/abdendriel_wasps.toml` for a complete example.
+
+**Integration status**: profile loader exists (`bot/src/cavebot/hunt_profile.rs`) but step-level consumption not yet wired. Current cavebot TOMLs still duplicate the lists inline. Migration to `hunt_profile = "<name>"` top-level reference is incremental per-step.
+
 ## Tile-hashing — absolute position from minimap
 
 `bot/src/sense/vision/game_coords.rs` compares the captured minimap against a pre-computed index of Tibia's own minimap PNG files to determine the player's exact `(x, y, z)` coordinates.
