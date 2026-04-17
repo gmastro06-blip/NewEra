@@ -233,6 +233,29 @@ async fn run_connected(
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
+    // V-001: handshake AUTH antes de cualquier otro comando.
+    if let Some(tok) = config.auth_token.as_ref().filter(|t| !t.is_empty()) {
+        let msg = format!("AUTH {}\n", tok);
+        writer.write_all(msg.as_bytes()).await.context("write AUTH")?;
+        match timeout(Duration::from_secs(3), lines.next_line()).await {
+            Ok(Ok(Some(resp))) if resp.trim().starts_with("OK") => {
+                info!("PicoLink: AUTH ok");
+            }
+            Ok(Ok(Some(resp))) => {
+                anyhow::bail!("bridge rechazó AUTH: {}", resp);
+            }
+            Ok(Ok(None)) => {
+                anyhow::bail!("bridge cerró la conexión antes de responder AUTH");
+            }
+            Ok(Err(e)) => {
+                anyhow::bail!("error leyendo respuesta AUTH: {}", e);
+            }
+            Err(_) => {
+                anyhow::bail!("bridge no respondió AUTH en 3s");
+            }
+        }
+    }
+
     // Dar tiempo al bridge/Pico para terminar de abrir el puerto serial.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -471,6 +494,7 @@ mod tests {
             connect_timeout_ms: 500,
             command_timeout_ms: 100,
             max_backoff_secs:  4,
+            auth_token:        None,  // tests sin auth
         }
     }
 

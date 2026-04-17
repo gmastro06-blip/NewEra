@@ -35,7 +35,24 @@ baud = 115200
 
 [tcp]
 # El bridge escucha aquí. El bot del PC procesador se conecta a esta IP:puerto.
-listen_addr = "0.0.0.0:9000"
+#
+# **V-001 CRITICAL**: `0.0.0.0:9000` = exposed a TODA la LAN. SIN AUTH_TOKEN,
+# cualquier host LAN puede conectar + inyectar keyboard/mouse commands → RCE
+# en esta máquina. Configurar `auth_token` OBLIGATORIO si usas 0.0.0.0.
+#
+# Para bot+bridge en misma máquina (setup más común), usar loopback:
+#   listen_addr = "127.0.0.1:9000"   # solo local, no auth needed
+listen_addr = "127.0.0.1:9000"
+
+# V-001: shared secret para autenticar el bot. Obligatorio si listen_addr
+# no es loopback. Generar en PowerShell:
+#   [Convert]::ToBase64String([byte[]] (1..32 | % {Get-Random -Max 256}))
+# El bot config debe tener el MISMO token en [pico].auth_token.
+#
+# Sin token (comentado/empty) + loopback bind = OK para dev/same-machine.
+# Sin token + LAN bind = CRITICAL VULNERABILITY, no hacer.
+#
+# auth_token = "paste-base64-token-here"
 
 [watchdog]
 # Watchdog de inactividad del bot. Si no llega ningún comando del bot durante

@@ -16,7 +16,7 @@
 ///   GET  /vision/grab/debug     → PNG del frame completo con TODOS los ROIs dibujados
 ///   GET  /vision/battle/debug   → JSON con datos de diagnóstico por slot de batalla
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -98,7 +98,62 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics",               get(handle_prometheus_metrics))
         .route("/recording/start",       post(handle_recording_start))
         .route("/recording/stop",        post(handle_recording_stop))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
+}
+
+/// V-002 fix: middleware que requiere `Authorization: Bearer <token>` si
+/// `config.http.auth_token` está set. Si no hay token configurado, pasa
+/// todo (backwards compat con configs viejos + loopback-only default).
+///
+/// 401 Unauthorized si falta o no matches. `/health` excluido para
+/// monitoring externo simple (solo retorna 200 OK, sin state).
+async fn auth_middleware(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // /health bypass para simple liveness checks sin necesidad del token.
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+
+    let Some(expected_token) = s.config.http.auth_token.as_ref()
+        .filter(|t| !t.is_empty()) else {
+        // Sin token configurado → sin auth (loopback-only seguro, LAN
+        // setup DEBE configurar token).
+        return next.run(req).await;
+    };
+
+    let header_ok = req.headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|token| {
+            // Constant-time compare para resistir timing attacks.
+            // Implementación simple: comparar byte-a-byte completa
+            // siempre (no early-return on mismatch).
+            let a = token.as_bytes();
+            let b = expected_token.as_bytes();
+            if a.len() != b.len() {
+                return false;
+            }
+            let mut acc: u8 = 0;
+            for i in 0..a.len() {
+                acc |= a[i] ^ b[i];
+            }
+            acc == 0
+        })
+        .unwrap_or(false);
+
+    if !header_ok {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            "missing or invalid Authorization: Bearer <token>",
+        ).into_response();
+    }
+
+    next.run(req).await
 }
 
 pub async fn serve(state: AppState) -> Result<()> {
@@ -1322,12 +1377,51 @@ struct CommandAck {
     message: String,
 }
 
+/// V-003 fix: valida que un path-arg de un load endpoint está dentro del
+/// directorio whitelisted. Previene path traversal (`../../../etc/passwd`).
+///
+/// Usa `canonicalize` para resolver symlinks + `..` y luego chequea que el
+/// resultado empieza con el allowed dir (también canonicalized).
+///
+/// Errors si el path no existe, es symlink a fuera del whitelist, o apunta
+/// afuera. El caller devuelve 400 Bad Request con el error.
+fn validate_load_path(user_path: &str, allowed_dir: &Path) -> Result<PathBuf, String> {
+    let p = Path::new(user_path);
+    let canonical = std::fs::canonicalize(p)
+        .map_err(|e| format!("path '{}' no resolvable: {}", user_path, e))?;
+    let allowed_canonical = match std::fs::canonicalize(allowed_dir) {
+        Ok(p) => p,
+        Err(_) => {
+            // Si el allowed_dir no existe todavía, usar como-es (rechaza
+            // silentemente por el check siguiente).
+            allowed_dir.to_path_buf()
+        }
+    };
+    if !canonical.starts_with(&allowed_canonical) {
+        return Err(format!(
+            "path '{}' escapa del directorio permitido '{}'",
+            canonical.display(), allowed_canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
 async fn handle_waypoints_load(
     State(s): State<AppState>,
     Query(q): Query<WaypointsLoadQuery>,
 ) -> Json<CommandAck> {
+    // V-003 fix: whitelist a assets/waypoints/
+    let validated = match validate_load_path(&q.path, Path::new("assets/waypoints")) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(CommandAck {
+                ok:      false,
+                message: format!("path rejected: {}", e),
+            });
+        }
+    };
     let cmd = LoopCommand::LoadWaypoints {
-        path:    PathBuf::from(&q.path),
+        path:    validated,
         enabled: q.enabled,
     };
     match s.loop_tx.send(cmd) {
@@ -1438,8 +1532,18 @@ async fn handle_cavebot_load(
     State(s): State<AppState>,
     Query(q): Query<CavebotLoadQuery>,
 ) -> Json<CommandAck> {
+    // V-003 fix: whitelist a assets/cavebot/
+    let validated = match validate_load_path(&q.path, Path::new("assets/cavebot")) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(CommandAck {
+                ok:      false,
+                message: format!("path rejected: {}", e),
+            });
+        }
+    };
     let cmd = LoopCommand::LoadCavebot {
-        path:    PathBuf::from(&q.path),
+        path:    validated,
         enabled: q.enabled,
     };
     match s.loop_tx.send(cmd) {
@@ -1537,7 +1641,21 @@ async fn handle_scripts_reload(
     State(s): State<AppState>,
     Query(q): Query<ScriptsReloadQuery>,
 ) -> Json<CommandAck> {
-    let path = if q.path.is_empty() { None } else { Some(PathBuf::from(&q.path)) };
+    // V-003 fix: si path está set, whitelist a assets/scripts/ (previene
+    // carga de .lua arbitrario).
+    let path = if q.path.is_empty() {
+        None
+    } else {
+        match validate_load_path(&q.path, Path::new("assets/scripts")) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                return Json(CommandAck {
+                    ok:      false,
+                    message: format!("path rejected: {}", e),
+                });
+            }
+        }
+    };
     let path_str = path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<config>".into());
     match s.loop_tx.send(LoopCommand::ReloadScripts { path }) {
         Ok(()) => {

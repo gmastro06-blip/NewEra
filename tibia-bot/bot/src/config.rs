@@ -57,6 +57,11 @@ pub struct PicoConfig {
     /// Backoff exponencial máximo entre reintentos TCP en segundos.
     #[serde(default = "default_max_backoff")]
     pub max_backoff_secs:  u64,
+    /// V-001: auth token que el bot envía como `AUTH <token>\n` tras conectar.
+    /// Debe matchear el `[tcp].auth_token` del bridge_config.toml. Si None o
+    /// empty, no se envía AUTH (requiere bridge sin token configurado también).
+    #[serde(default)]
+    pub auth_token:        Option<String>,
 }
 
 fn default_connect_timeout() -> u64 { 3_000 }
@@ -67,6 +72,17 @@ fn default_max_backoff()     -> u64 { 5     }
 pub struct HttpConfig {
     #[serde(default = "default_http_addr")]
     pub listen_addr: String,
+    /// Bearer token que debe presentarse en el header `Authorization: Bearer <token>`
+    /// de cada request. `None` o string vacío = sin autenticación (default, pero
+    /// inseguro si el HTTP está expuesto más allá de loopback).
+    ///
+    /// **V-002 mitigation**: genera un token aleatorio de 32+ chars y ponelo
+    /// aquí para impedir que procesos user-mode sin el token accedan al bot.
+    ///
+    /// Generar en PowerShell:
+    ///   [Convert]::ToBase64String([byte[]] (1..32 | % {Get-Random -Max 256}))
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 /// Default HTTP bind: `127.0.0.1:8080` (loopback only).

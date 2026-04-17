@@ -112,6 +112,16 @@ pub struct StowBagHint {
 impl HuntProfile {
     /// Carga un profile desde un archivo TOML.
     pub fn load(path: &Path) -> Result<Self> {
+        // V-005 fix: size limit contra OOM DoS.
+        const MAX_PROFILE_BYTES: u64 = 1 * 1024 * 1024; // 1 MB (profiles son pequeños)
+        let md = fs::metadata(path)
+            .with_context(|| format!("stat hunt profile `{}`", path.display()))?;
+        if md.len() > MAX_PROFILE_BYTES {
+            anyhow::bail!(
+                "hunt profile `{}` too large: {} bytes > {} bytes limit",
+                path.display(), md.len(), MAX_PROFILE_BYTES
+            );
+        }
         let raw = fs::read_to_string(path)
             .with_context(|| format!("reading hunt profile `{}`", path.display()))?;
         let profile: HuntProfile = toml::from_str(&raw)

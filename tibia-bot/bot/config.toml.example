@@ -9,13 +9,17 @@ retry_interval_secs = 2.0
 
 [pico]
 # IP del PC gaming y puerto del bridge. Ajustar según tu red.
-bridge_addr         = "192.168.1.100:9000"
+# Para bot+bridge en misma máquina (setup común): 127.0.0.1:9000.
+bridge_addr         = "127.0.0.1:9000"
 # Timeout para conectar al bridge (ms).
 connect_timeout_ms  = 3000
 # Timeout por comando: si la Pico no responde en 100ms, loggea warning.
 command_timeout_ms  = 100
 # Backoff exponencial máximo entre reintentos de conexión TCP (segundos).
 max_backoff_secs    = 5
+# V-001: shared-secret auth token. Debe matchear [tcp].auth_token del
+# bridge_config.toml. Obligatorio si el bridge escucha en LAN (no loopback).
+# auth_token        = "paste-same-token-as-bridge-here"
 
 [http]
 # El servidor HTTP del bot (panel de control y endpoints de test).
@@ -27,8 +31,15 @@ max_backoff_secs    = 5
 #
 # Si necesitás monitoring remoto (Prometheus/Grafana en otra máquina),
 # overridear a "0.0.0.0:8080" Y configurar firewall para whitelist
-# del IP del scraper.
+# del IP del scraper + OBLIGATORIO setear auth_token.
 listen_addr         = "127.0.0.1:8080"
+# V-002: bearer token para Authorization header. Si set (non-empty), todos
+# los endpoints except /health requieren `Authorization: Bearer <token>`.
+# Sin token + bind loopback = OK para dev/same-machine.
+# Sin token + bind LAN = local user-mode malware puede controlar el bot.
+# Generar en PowerShell:
+#   [Convert]::ToBase64String([byte[]] (1..32 | % {Get-Random -Max 256}))
+# auth_token        = "paste-base64-token-here"
 
 [loop_config]
 # Frecuencia del game loop en Hz. 30 Hz = ~33ms por tick.

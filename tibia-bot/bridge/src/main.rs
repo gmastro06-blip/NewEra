@@ -69,6 +69,17 @@ struct SerialConfig {
 #[derive(Debug, Deserialize)]
 struct TcpConfig {
     listen_addr: String,
+    /// V-001 fix (VULNERABILITIES.md): shared-secret que el bot debe enviar
+    /// como primer mensaje (`AUTH <token>\n`) antes de aceptar comandos HID.
+    /// Sin este handshake, el bridge cierra la conexión en <100ms.
+    ///
+    /// `None` o empty = sin auth (INSEGURO si el listen_addr no es loopback;
+    /// cualquier LAN host puede inyectar keyboard/mouse → RCE en gaming PC).
+    ///
+    /// Generar en PowerShell:
+    ///   [Convert]::ToBase64String([byte[]] (1..32 | % {Get-Random -Max 256}))
+    #[serde(default)]
+    auth_token: Option<String>,
 }
 
 /// Watchdog de inactividad: si no llega ningún comando del bot en
@@ -467,12 +478,18 @@ async fn main() -> Result<()> {
         // ── Modo SendInput: sin serial, ejecutar localmente ──────────────────
         loop {
             info!("Esperando cliente TCP en {}...", cfg.tcp.listen_addr);
-            let (socket, peer_addr) = match listener.accept().await {
+            let (mut socket, peer_addr) = match listener.accept().await {
                 Ok(c) => c,
                 Err(e) => { error!("Error aceptando conexión TCP: {}", e); continue; }
             };
             info!("Cliente TCP conectado desde {}", peer_addr);
             let _ = socket.set_nodelay(true);
+
+            // V-001: handshake obligatorio si auth_token configurado.
+            if !authenticate_client(&mut socket, cfg.tcp.auth_token.as_deref(), &peer_addr.to_string()).await {
+                // Cliente rechazado — socket se cierra al drop.
+                continue;
+            }
 
             let watchdog_timeout = cfg.watchdog.idle_timeout_secs;
             let exit_reason = run_proxy_sendinput(
@@ -500,12 +517,17 @@ async fn main() -> Result<()> {
             info!("Puerto serial {} abierto a {} baud", serial_cfg.port, serial_cfg.baud);
             info!("Esperando cliente TCP en {}...", cfg.tcp.listen_addr);
 
-            let (socket, peer_addr) = match listener.accept().await {
+            let (mut socket, peer_addr) = match listener.accept().await {
                 Ok(c) => c,
                 Err(e) => { error!("Error aceptando conexión TCP: {}", e); continue; }
             };
             info!("Cliente TCP conectado desde {}", peer_addr);
             let _ = socket.set_nodelay(true);
+
+            // V-001: handshake obligatorio si auth_token configurado.
+            if !authenticate_client(&mut socket, cfg.tcp.auth_token.as_deref(), &peer_addr.to_string()).await {
+                continue;
+            }
 
             let watchdog_timeout = cfg.watchdog.idle_timeout_secs;
             let exit_reason = run_proxy(
@@ -536,6 +558,93 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// V-001 fix: handshake de autenticación del cliente TCP.
+///
+/// Si `expected_token` está set, lee la primera línea del socket y verifica
+/// que sea exactamente `AUTH <token>\n`. Responde `OK\n` y retorna true si
+/// autenticado, `FAIL\n` + close si no. Timeout de 2s antes de rechazar
+/// (previene attacker hold-the-connection attacks).
+///
+/// Si `expected_token` es None o empty → skip (backwards compat con configs
+/// pre-V-001, pero imprime warn si listen_addr no es loopback).
+///
+/// Constant-time compare para resistir timing attacks (mismo tiempo si
+/// token wrong vs token right).
+async fn authenticate_client(
+    socket:         &mut TcpStream,
+    expected_token: Option<&str>,
+    peer:           &str,
+) -> bool {
+    let expected = match expected_token {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            // Sin token configurado → passthrough.
+            return true;
+        }
+    };
+
+    let mut buf = [0u8; 1024];
+    let read_result = tokio::time::timeout(
+        Duration::from_secs(2),
+        socket.read(&mut buf),
+    ).await;
+
+    let n = match read_result {
+        Ok(Ok(n)) if n > 0 => n,
+        Ok(Ok(_)) => {
+            warn!("AUTH: peer {} cerró sin enviar AUTH", peer);
+            return false;
+        }
+        Ok(Err(e)) => {
+            warn!("AUTH: error leyendo de peer {}: {}", peer, e);
+            return false;
+        }
+        Err(_) => {
+            warn!("AUTH: peer {} timeout sin enviar AUTH en 2s", peer);
+            let _ = socket.write_all(b"FAIL auth_timeout\n").await;
+            return false;
+        }
+    };
+
+    let line = String::from_utf8_lossy(&buf[..n]);
+    let trimmed = line.trim();
+    let token_provided = match trimmed.strip_prefix("AUTH ") {
+        Some(t) => t,
+        None => {
+            warn!("AUTH: peer {} no envió 'AUTH <token>' como primer msg (got: {:?})",
+                peer, &trimmed.chars().take(20).collect::<String>());
+            let _ = socket.write_all(b"FAIL need_auth_first\n").await;
+            return false;
+        }
+    };
+
+    // Constant-time compare.
+    let a = token_provided.as_bytes();
+    let b = expected.as_bytes();
+    let eq = a.len() == b.len() && {
+        let mut acc: u8 = 0;
+        for i in 0..a.len() {
+            acc |= a[i] ^ b[i];
+        }
+        acc == 0
+    };
+
+    if !eq {
+        warn!("AUTH: peer {} token mismatch (len_provided={}, len_expected={})",
+            peer, a.len(), b.len());
+        let _ = socket.write_all(b"FAIL bad_token\n").await;
+        return false;
+    }
+
+    if let Err(e) = socket.write_all(b"OK auth\n").await {
+        warn!("AUTH: peer {} OK reply falló: {}", peer, e);
+        return false;
+    }
+
+    info!("AUTH: peer {} autenticado OK", peer);
+    true
 }
 
 /// Intenta abrir el puerto serial indefinidamente cada 2 segundos.

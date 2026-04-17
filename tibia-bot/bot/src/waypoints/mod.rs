@@ -112,6 +112,16 @@ impl WaypointList {
     /// Carga un archivo TOML de waypoints y valida todas las hotkeys.
     /// Falla con error descriptivo si alguna `key` no se puede parsear.
     pub fn load(path: &Path, fps: u32) -> Result<Self> {
+        // V-005 fix: size limit contra OOM DoS.
+        const MAX_WAYPOINTS_BYTES: u64 = 1 * 1024 * 1024; // 1 MB
+        let md = std::fs::metadata(path)
+            .with_context(|| format!("stat '{}'", path.display()))?;
+        if md.len() > MAX_WAYPOINTS_BYTES {
+            anyhow::bail!(
+                "waypoints file '{}' too large: {} bytes > {} bytes limit",
+                path.display(), md.len(), MAX_WAYPOINTS_BYTES
+            );
+        }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("No se pudo leer '{}'", path.display()))?;
         let file: WaypointFile = toml::from_str(&raw)

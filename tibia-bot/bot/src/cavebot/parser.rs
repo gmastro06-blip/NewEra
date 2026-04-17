@@ -302,6 +302,17 @@ pub fn load(path: &Path, fps: u32) -> Result<Cavebot> {
 }
 
 pub fn load_with_tuning(path: &Path, fps: u32, tuning: super::runner::NodeTuning) -> Result<Cavebot> {
+    // V-005 fix: size limit antes de read_to_string para evitar OOM DoS si
+    // un attacker pasa un path a un file gigante.
+    const MAX_CAVEBOT_TOML_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
+    let md = std::fs::metadata(path)
+        .with_context(|| format!("No se pudo stat '{}'", path.display()))?;
+    if md.len() > MAX_CAVEBOT_TOML_BYTES {
+        bail!(
+            "cavebot file '{}' too large: {} bytes > {} bytes limit",
+            path.display(), md.len(), MAX_CAVEBOT_TOML_BYTES
+        );
+    }
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("No se pudo leer '{}'", path.display()))?;
     let file: CavebotFile = toml::from_str(&raw)
