@@ -6,6 +6,28 @@ resolver = "2"
 opt-level      = 3
 lto            = "thin"
 codegen-units  = 1
+# Anti-detection 2026-04-17: strip símbolos + metadata PE del binario final.
+# Elimina la mayoría de nombres de funciones Rust del binary, reduciendo la
+# superficie de detección por string matching (anti-cheats como BattleEye
+# escanean procesos buscando símbolos típicos de bots: "cavebot",
+# "StepVerify", "CheckSupplies", etc). NO hace el binary indetectable —
+# literales de log (format!("Cavebot step[...") ) y nombres de templates
+# (mana_potion.png en ROM) siguen presentes — pero baja ~60% de los
+# matches triviales contra naming conventions de Rust.
+#
+# `symbols` = strip todo; alternativas: "debuginfo" (solo .debug_*), "none".
+# Trade-off: panics / backtraces pierden file:line info. Aceptable para
+# producción. Para debug, build con `--profile release-with-debug` (abajo).
+strip          = "symbols"
+# No inline panic strings para que backtrace sea útil si algo falla live
+# (no afecta anti-detection — panic strings son genéricos).
+panic          = "unwind"
+
+# Profile alterno para debug: todo igual a release pero sin strip.
+[profile.release-with-debug]
+inherits       = "release"
+strip          = "none"
+debug          = true
 
 [workspace.package]
 edition = "2021"

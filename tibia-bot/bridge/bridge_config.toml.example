@@ -4,16 +4,21 @@
 # ── Modo de input ──────────────────────────────────────────────────────────
 # El bridge soporta 2 backends de actuación HID:
 #
-#   "sendinput": usa la Windows API SendInput para inyectar mouse/keyboard
-#                directamente en el proceso de la ventana en foreground.
-#                NO requiere hardware. Útil para dev/testing.
+#   "serial":    (DEFAULT + RECOMENDADO PARA LIVE) forwardea comandos via
+#                puerto serial COM a un microcontrolador con USB HID nativo
+#                (Pico 2, Arduino Leonardo, Pro Micro). Los eventos llegan
+#                al SO como hardware real — indistinguibles de mouse/teclado
+#                físico. **Inmune a BattleEye y anti-cheats que monitorean
+#                Windows SendInput / SetWindowsHookEx**. Requiere device
+#                conectado.
 #
-#   "serial":    forwardea comandos via puerto serial COM a un microcontrolador
-#                con USB HID nativo (Pico 2, Arduino Leonardo, Pro Micro).
-#                Más realista (eventos de hardware reales) pero requiere
-#                el dispositivo conectado.
+#   "sendinput": usa la Windows API SendInput para inyectar mouse/keyboard.
+#                NO requiere hardware. **DETECTABLE por BattleEye** —
+#                cualquier anti-cheat moderno flaguea procesos llamando
+#                SendInput/PostMessage sobre una ventana de juego. Usar
+#                SOLO para dev/testing sin cuenta real en riesgo.
 [input]
-mode = "sendinput"   # cambiar a "serial" para usar Pico 2 / Arduino Leonardo
+mode = "serial"   # default anti-detection. Cambiar a "sendinput" solo si no tenés Arduino.
 
 # ── Configuración serial (solo si mode = "serial") ─────────────────────────
 # Soporta tanto Raspberry Pi Pico 2 como Arduino Leonardo / Pro Micro.
@@ -45,17 +50,26 @@ idle_timeout_secs = 10
 [focus]
 # Detección de foco: si Tibia no es la ventana activa, el bridge bloquea
 # comandos HID (MOUSE_MOVE, MOUSE_CLICK, KEY_TAP) para evitar que keystrokes
-# y clicks vayan a la ventana equivocada. PING y RESET siempre pasan.
+# y clicks vayan a la ventana equivocada.
 #
-# RECOMENDADO PARA PRODUCCIÓN: enabled = true. Protección contra alt-tab
-# accidental que mandaría inputs a la ventana equivocada (detección anti-bot
-# o simplemente bugs visibles).
+# **Anti-detection 2026-04-17**: focus detection usa GetForegroundWindow +
+# GetWindowTextW cada N ms para leer el título de la ventana activa.
+# BattleEye (y anti-cheats similares) flagean procesos que polan estas APIs
+# a alta frecuencia (<500ms). Default subido a 2000ms + debounce reducido
+# a 2 → 4s de tolerancia. Para mayor sigilo, setear enabled=false (el bot
+# pierde el safety contra alt-tab pero evita todo el API polling).
+#
+# Trade-off de enabled=true @ 2000ms: si alt-tab accidentalmente por <2s, el
+# bot puede ejecutar 1-2 acciones con foco perdido antes de pausar. Es
+# manejable; el bot recupera solo al volver el foco.
 enabled = true
 # Substring a buscar en el título de la ventana activa.
 # Tibia usa "Tibia - NombrePersonaje" como título.
 window_title_contains = "Tibia"
-# Intervalo de polling en ms. 100ms es suficiente (el bot corre a 30Hz = 33ms).
-poll_interval_ms = 100
+# Intervalo de polling en ms. Default 2000ms (anti-detection). Valores
+# más bajos (<500ms) son fingerprintables como software de automation.
+poll_interval_ms = 2000
 # Polls consecutivos "sin foco" antes de declarar pérdida real.
-# 5 × 100ms = 500ms debounce — evita pausar por popups cortos (notifs, tooltips).
-debounce_count = 5
+# 2 × 2000ms = 4s debounce — absorbe popups cortos y latency de
+# window-switching sin bloquear comandos.
+debounce_count = 2

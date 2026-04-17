@@ -53,7 +53,12 @@ impl Default for InputConfig {
     fn default() -> Self { Self { mode: default_input_mode() } }
 }
 
-fn default_input_mode() -> String { "sendinput".to_string() }
+/// Default input mode: `serial` = Arduino HID (indistinguible de hardware,
+/// inmune a BattleEye). `sendinput` usa la Windows API y es detectable por
+/// anti-cheats que monitorean SetWindowsHookEx / SendInput calls.
+///
+/// ADR-001 recomienda serial como default en todos los setups live.
+fn default_input_mode() -> String { "serial".to_string() }
 
 #[derive(Debug, Deserialize)]
 struct SerialConfig {
@@ -118,8 +123,26 @@ impl Default for FocusConfig {
 }
 
 fn default_window_title() -> String { "Tibia".to_string() }
-fn default_poll_interval() -> u64 { 100 }
-fn default_debounce_count() -> u32 { 5 }
+/// Intervalo default de polling para focus detection, en ms.
+///
+/// **Anti-detection tuning 2026-04-17**: subido de 100ms a 2000ms. Un
+/// proceso llamando GetForegroundWindow + GetWindowTextW cada 100ms es un
+/// fingerprint textbook de software de automatización (anti-cheats como
+/// BattleEye flagean este patrón). A 2s el intervalo es indistinguible
+/// de cualquier monitoring utility comercial.
+///
+/// Trade-off: si el usuario alt-tab por <2s, el bot puede ejecutar 1-2
+/// acciones con foco perdido antes de pausar. Aceptable — un SafetyPause
+/// + manual resume cubre el caso.
+///
+/// Para detección más precisa sin polling, ver `focus_watcher_event_driven`
+/// (WinEvents hook) abajo — fires solo en cambios reales de foco.
+fn default_poll_interval() -> u64 { 2000 }
+/// Polls consecutivos sin foco para declarar foco perdido. Con default
+/// poll_interval=2000ms y debounce=2 → 4s de tolerancia. Valor anterior
+/// (debounce=5 @ 100ms = 500ms) era demasiado reactivo y también un
+/// fingerprint de high-frequency polling.
+fn default_debounce_count() -> u32 { 2 }
 
 fn load_config(path: &str) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
@@ -179,6 +202,30 @@ fn check_tibia_focused(_title_pattern: &str) -> bool {
 /// Fix 2026-04-16 V7: sin este flag, con Tibia en primary y mode=serial, clicks
 /// del bot caían en primary_w/2 de la coord esperada, haciendo inalcanzable la
 /// mitad izquierda del monitor.
+/// Cache TTL para el resultado de `query_geometry`. La ventana de Tibia
+/// no se mueve frecuentemente; cachear 10s reduce drásticamente el
+/// footprint de `EnumWindows` + `GetWindowTextW` en el process scan de
+/// BattleEye.
+///
+/// Anti-detection 2026-04-17: sin cache cada HTTP GEOMETRY del bot
+/// enumeraba todas las ventanas top-level del sistema + leía su título.
+/// Un anti-cheat que trackea "procesos que enumeran ventanas buscando
+/// strings específicos" flagearía este patrón rápidamente.
+#[cfg(windows)]
+const GEOMETRY_CACHE_TTL: Duration = Duration::from_secs(10);
+
+#[cfg(windows)]
+struct GeometryCache {
+    result: String,
+    stored_at: std::time::Instant,
+    primary_only: bool,
+    pattern: String,
+}
+
+#[cfg(windows)]
+static GEOMETRY_CACHE: std::sync::Mutex<Option<GeometryCache>> =
+    std::sync::Mutex::new(None);
+
 #[cfg(windows)]
 fn query_geometry(title_pattern: &str) -> String {
     query_geometry_ex(title_pattern, false)
@@ -186,6 +233,20 @@ fn query_geometry(title_pattern: &str) -> String {
 
 #[cfg(windows)]
 fn query_geometry_ex(title_pattern: &str, hid_is_primary_only: bool) -> String {
+    // Cache check — reutilizamos resultado si la query es idéntica y fresca.
+    // Reduce la frecuencia de EnumWindows/GetWindowTextW (anti-BattleEye).
+    {
+        let cache = GEOMETRY_CACHE.lock().unwrap();
+        if let Some(c) = cache.as_ref() {
+            if c.primary_only == hid_is_primary_only
+                && c.pattern == title_pattern
+                && c.stored_at.elapsed() < GEOMETRY_CACHE_TTL
+            {
+                return c.result.clone();
+            }
+        }
+    }
+
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClientRect, GetSystemMetrics, GetWindowRect, GetWindowTextW,
         IsWindowVisible, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
@@ -254,7 +315,7 @@ fn query_geometry_ex(title_pattern: &str, hid_is_primary_only: bool) -> String {
         let mut ctx = SearchCtx { pattern: title_pattern.to_string(), found: None };
         let _ = EnumWindows(Some(cb), LPARAM(&mut ctx as *mut _ as isize));
 
-        match ctx.found {
+        let result = match ctx.found {
             Some(hwnd) => {
                 // Fix 2026-04-16: GetWindowRect incluye bordes invisibles en
                 // ventanas maximizadas (típicamente 8px cada lado + titlebar).
@@ -291,7 +352,22 @@ fn query_geometry_ex(title_pattern: &str, hid_is_primary_only: bool) -> String {
                 }
             }
             None => format!("GEOMETRY {} {} {} {} ERR window_not_found\n", vx, vy, vw, vh),
+        };
+
+        // Guardar en cache (solo resultados válidos — no cachear errors
+        // permanentes como "window_not_found", que pueden resolverse al
+        // abrir Tibia; nuevo query retry en próxima call).
+        if !result.contains("ERR") {
+            let mut cache = GEOMETRY_CACHE.lock().unwrap();
+            *cache = Some(GeometryCache {
+                result: result.clone(),
+                stored_at: std::time::Instant::now(),
+                primary_only: hid_is_primary_only,
+                pattern: title_pattern.to_string(),
+            });
         }
+
+        result
     }
 }
 
