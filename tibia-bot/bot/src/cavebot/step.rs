@@ -336,6 +336,42 @@ pub enum StepKind {
         /// post-flujo espera `spacing_ms` antes de avanzar).
         spacing_ms: u64,
     },
+    /// Vender N unidades de un item en la trade window abierta (tab "Sell").
+    ///
+    /// Simétrico a `BuyItem`: el usuario debe haber clickeado el tab "Sell"
+    /// de la trade window antes (via un Click step). Este step solo maneja:
+    ///   1. Click en la fila del item en la sell list.
+    ///   2. Click en el Amount field (si está set) + type quantity.
+    ///   3. Click en el botón "Sell" (análogo a Buy).
+    ///
+    /// **Caso de uso típico**: vender non-stackables acumulados (magic rings,
+    /// armors de bajo nivel, trash loot) a un merchant NPC tras N horas de
+    /// hunt. Sin este step, el bag se llena en sesiones >2h y el cavebot
+    /// requiere intervención manual entre sesiones.
+    ///
+    /// **Verify típico**: `inventory_delta = { item = "magic_ring",
+    /// min_abs_delta = 1, require_positive = false }` — esperar que el item
+    /// haya bajado (delta negativo, abs ≥ 1).
+    ///
+    /// **Flujo idéntico a BuyItem** excepto el botón final es "Sell" en
+    /// vez de "Buy" (semántico; el step no sabe la diferencia, solo
+    /// clickea la coord configurada).
+    SellItem {
+        /// Row del item en la sell list.
+        item_vx:      i32,
+        item_vy:      i32,
+        /// Amount field (Tibia 12). Si ambos Some → type digits flow;
+        /// si None → legacy N clicks al sell button.
+        amount_vx:    Option<i32>,
+        amount_vy:    Option<i32>,
+        /// Botón "Sell" (análogo al Buy de BuyItem).
+        sell_vx:      i32,
+        sell_vy:      i32,
+        /// Cantidad a vender. Si el bag tiene menos, Tibia vende las que
+        /// haya — el step no verifica el exact count (usar verify para eso).
+        quantity:     u32,
+        spacing_ms:   u64,
+    },
     /// Verifica que todos los items en `requirements` tengan al menos
     /// `min_count` matches en inventario. Si alguno falla, salta a
     /// `on_fail_idx`. Si todos OK, advance.

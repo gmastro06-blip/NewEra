@@ -186,6 +186,11 @@ struct StepToml {
     confirm_vx: Option<i32>,
     #[serde(default)]
     confirm_vy: Option<i32>,
+    // SellItem (análogo a confirm_vx/vy pero semanticamente "Sell button")
+    #[serde(default)]
+    sell_vx: Option<i32>,
+    #[serde(default)]
+    sell_vy: Option<i32>,
     #[serde(default)]
     quantity: Option<u32>,
     #[serde(default)]
@@ -446,7 +451,7 @@ fn parse_step_toml(
         greeting_phrases, bag_button_vx, bag_button_vy, wait_button_ms,
         x, y, z,
         chest_vx, chest_vy, stow_vx, stow_vy, menu_wait_ms, process_ms,
-        item_vx, item_vy, amount_vx, amount_vy, confirm_vx, confirm_vy, quantity, spacing_ms,
+        item_vx, item_vy, amount_vx, amount_vy, confirm_vx, confirm_vy, sell_vx, sell_vy, quantity, spacing_ms,
         on_fail, requirements, from_profile,
         slot_vx, slot_vy, menu_offset_x, menu_offset_y, stow_process_ms, max_iterations,
         field_vx, field_vy, text, wait_after_click_ms, wait_after_type_ms, char_spacing_ms,
@@ -620,6 +625,28 @@ fn parse_step_toml(
                 confirm_vx: confirm_vx.context("buy_item: falta 'confirm_vx'")?,
                 confirm_vy: confirm_vy.context("buy_item: falta 'confirm_vy'")?,
                 quantity:   quantity.context("buy_item: falta 'quantity'")?,
+                spacing_ms: spacing_ms.unwrap_or(150),
+            }
+        }
+        "sell_item" => {
+            // Pareado con amount_vx/vy (mismo handling que buy_item).
+            match (amount_vx, amount_vy) {
+                (Some(_), None) => bail!(
+                    "sell_item: 'amount_vx' presente pero falta 'amount_vy'. Ambos o ninguno."
+                ),
+                (None, Some(_)) => bail!(
+                    "sell_item: 'amount_vy' presente pero falta 'amount_vx'. Ambos o ninguno."
+                ),
+                _ => {}
+            }
+            StepKind::SellItem {
+                item_vx:    item_vx.context("sell_item: falta 'item_vx'")?,
+                item_vy:    item_vy.context("sell_item: falta 'item_vy'")?,
+                amount_vx,
+                amount_vy,
+                sell_vx:    sell_vx.context("sell_item: falta 'sell_vx' (botón Sell de la trade window)")?,
+                sell_vy:    sell_vy.context("sell_item: falta 'sell_vy'")?,
+                quantity:   quantity.context("sell_item: falta 'quantity'")?,
                 spacing_ms: spacing_ms.unwrap_or(150),
             }
         }

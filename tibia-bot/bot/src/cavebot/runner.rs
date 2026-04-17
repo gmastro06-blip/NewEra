@@ -1243,6 +1243,172 @@ impl Cavebot {
                     }
                 }
 
+                // ── SellItem (estructuralmente idéntico a BuyItem) ─────
+                //
+                // Reutiliza `buy_*` state fields del Cavebot porque el
+                // step es mutuamente exclusivo con BuyItem y las transiciones
+                // son idénticas. La única diferencia es que el último click
+                // va al botón "Sell" en vez de "Buy" y el verify esperado
+                // sería `inventory_delta` negativo (require_positive=false).
+                //
+                // Ver docs completas en step.rs StepKind::SellItem y
+                // StepKind::BuyItem.
+                StepKind::SellItem {
+                    item_vx, item_vy,
+                    amount_vx, amount_vy,
+                    sell_vx, sell_vy,
+                    quantity, spacing_ms,
+                } => {
+                    let spacing_ticks = ms_to_ticks(spacing_ms, self.fps).max(1);
+                    const POST_ITEM_CLICK_MS: u64 = 200;
+                    const POST_AMOUNT_CLICK_MS: u64 = 150;
+                    const POST_DIGITS_MS: u64 = 150;
+
+                    let use_amount_flow = amount_vx.is_some() && amount_vy.is_some();
+
+                    if !use_amount_flow {
+                        match self.buy_phase {
+                            0 => {
+                                tracing::info!(
+                                    "SellItem[{}] legacy phase 0: select item at ({}, {}), quantity={}",
+                                    idx, item_vx, item_vy, quantity
+                                );
+                                self.buy_phase = 1;
+                                self.buy_last_click_tick = ctx.tick;
+                                self.buy_clicks_done = 0;
+                                return CavebotAction::Click { vx: item_vx, vy: item_vy };
+                            }
+                            1 => {
+                                if self.buy_clicks_done >= quantity {
+                                    tracing::info!(
+                                        "SellItem[{}] legacy complete: {} clicks done, advancing",
+                                        idx, self.buy_clicks_done
+                                    );
+                                    self.buy_phase = 0;
+                                    self.buy_clicks_done = 0;
+                                    self.advance(ctx.tick);
+                                    continue;
+                                }
+                                let elapsed = ctx.tick.saturating_sub(self.buy_last_click_tick);
+                                if elapsed >= spacing_ticks {
+                                    self.buy_clicks_done += 1;
+                                    if self.buy_clicks_done == 1 {
+                                        tracing::info!(
+                                            "SellItem[{}] legacy phase 1: Sell button click at ({}, {}) × {}",
+                                            idx, sell_vx, sell_vy, quantity
+                                        );
+                                    }
+                                    self.buy_last_click_tick = ctx.tick;
+                                    return CavebotAction::Click { vx: sell_vx, vy: sell_vy };
+                                }
+                                return CavebotAction::Idle;
+                            }
+                            _ => {
+                                tracing::warn!("SellItem[{}] legacy invalid phase {}, resetting", idx, self.buy_phase);
+                                self.buy_phase = 0;
+                                self.advance(ctx.tick);
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Amount flow (Tibia 12 UI).
+                    let amt_vx = amount_vx.expect("amount_vx guarded by use_amount_flow");
+                    let amt_vy = amount_vy.expect("amount_vy guarded by use_amount_flow");
+                    let qty_str = quantity.to_string();
+
+                    let post_item_ticks   = ms_to_ticks(POST_ITEM_CLICK_MS, self.fps).max(1);
+                    let post_amount_ticks = ms_to_ticks(POST_AMOUNT_CLICK_MS, self.fps).max(1);
+                    let post_digits_ticks = ms_to_ticks(POST_DIGITS_MS, self.fps).max(1);
+                    let inter_digit_ticks = ms_to_ticks(spacing_ms / 2, self.fps).max(1);
+
+                    match self.buy_phase {
+                        0 => {
+                            tracing::info!(
+                                "SellItem[{}] amount phase 0: select item at ({}, {}), qty={}",
+                                idx, item_vx, item_vy, quantity
+                            );
+                            self.buy_phase = 1;
+                            self.buy_last_click_tick = ctx.tick;
+                            self.buy_amount_digit_idx = 0;
+                            return CavebotAction::Click { vx: item_vx, vy: item_vy };
+                        }
+                        1 => {
+                            if ctx.tick.saturating_sub(self.buy_last_click_tick) < post_item_ticks {
+                                return CavebotAction::Idle;
+                            }
+                            self.buy_phase = 2;
+                            self.buy_last_click_tick = ctx.tick;
+                            return CavebotAction::Click { vx: amt_vx, vy: amt_vy };
+                        }
+                        2 => {
+                            if ctx.tick.saturating_sub(self.buy_last_click_tick) < post_amount_ticks {
+                                return CavebotAction::Idle;
+                            }
+                            self.buy_phase = 3;
+                            self.buy_last_click_tick = ctx.tick;
+                            continue;
+                        }
+                        3 => {
+                            if self.buy_amount_digit_idx >= qty_str.len() {
+                                self.buy_phase = 4;
+                                self.buy_last_click_tick = ctx.tick;
+                                return CavebotAction::Idle;
+                            }
+                            let ch = qty_str.as_bytes()[self.buy_amount_digit_idx] as char;
+                            let hid = crate::act::keycode::ascii_to_hid(ch)
+                                .expect("digit '0'-'9' siempre convertible a HID");
+                            self.buy_amount_digit_idx += 1;
+                            self.buy_phase = 4;
+                            self.buy_last_click_tick = ctx.tick;
+                            return CavebotAction::KeyTap(hid);
+                        }
+                        4 => {
+                            let more_digits = self.buy_amount_digit_idx < qty_str.len();
+                            let wait_ticks = if more_digits {
+                                inter_digit_ticks
+                            } else {
+                                post_digits_ticks
+                            };
+                            if ctx.tick.saturating_sub(self.buy_last_click_tick) < wait_ticks {
+                                return CavebotAction::Idle;
+                            }
+                            if more_digits {
+                                self.buy_phase = 3;
+                                continue;
+                            }
+                            self.buy_phase = 5;
+                            continue;
+                        }
+                        5 => {
+                            tracing::info!(
+                                "SellItem[{}] amount phase 5: Sell button click at ({}, {}) for qty={}",
+                                idx, sell_vx, sell_vy, quantity
+                            );
+                            self.buy_phase = 6;
+                            self.buy_last_click_tick = ctx.tick;
+                            return CavebotAction::Click { vx: sell_vx, vy: sell_vy };
+                        }
+                        6 => {
+                            if ctx.tick.saturating_sub(self.buy_last_click_tick) < spacing_ticks {
+                                return CavebotAction::Idle;
+                            }
+                            tracing::info!("SellItem[{}] amount complete, advancing", idx);
+                            self.buy_phase = 0;
+                            self.buy_amount_digit_idx = 0;
+                            self.advance(ctx.tick);
+                            continue;
+                        }
+                        _ => {
+                            tracing::warn!("SellItem[{}] amount invalid phase {}, resetting", idx, self.buy_phase);
+                            self.buy_phase = 0;
+                            self.buy_amount_digit_idx = 0;
+                            self.advance(ctx.tick);
+                            continue;
+                        }
+                    }
+                }
+
                 // ── CheckSupplies (verifica HasItem en lote) ──────────
                 StepKind::CheckSupplies { requirements, on_fail_label, on_fail_idx } => {
                     let mut all_ok = true;
@@ -3376,6 +3542,76 @@ mod tests {
         assert_eq!(cb.tick(&mut ctx(21)), CavebotAction::KeyTap(0xCC));
     }
 
+    #[test]
+    fn sell_item_amount_flow_emits_digits_then_sell_click() {
+        // SellItem amount flow con quantity=50 → 2 dígitos + 1 click Sell.
+        // Exactamente idéntico a BuyItem amount excepto:
+        //   - coord final es sell_vx/vy en vez de confirm_vx/vy
+        //   - verify esperado sería inventory_delta negativo
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::SellItem {
+                    item_vx: 10, item_vy: 20,
+                    amount_vx: Some(30), amount_vy: Some(40),
+                    sell_vx: 55, sell_vy: 65,
+                    quantity: 50, spacing_ms: 100,
+                }),
+                step(StepKind::Hotkey { hidcode: 0xEE }),
+            ],
+            false, 30,
+        );
+
+        let mut sell_click_count = 0;
+        let mut keytaps: Vec<u8> = Vec::new();
+        let mut advanced = false;
+        for t in 0..200 {
+            match cb.tick(&mut ctx(t)) {
+                CavebotAction::Click { vx: 55, vy: 65 } => sell_click_count += 1,
+                CavebotAction::KeyTap(hid) if hid == 0xEE => {
+                    advanced = true;
+                    break;
+                }
+                CavebotAction::KeyTap(hid) => keytaps.push(hid),
+                _ => {}
+            }
+        }
+        assert!(advanced, "SellItem amount flow no avanzó");
+        assert_eq!(sell_click_count, 1, "exactamente 1 Sell click");
+        // '5' → 0x22, '0' → 0x27.
+        assert_eq!(keytaps, vec![0x22, 0x27]);
+    }
+
+    #[test]
+    fn sell_item_legacy_flow_emits_select_then_n_sell_clicks() {
+        // Sin amount_* → legacy flow: select + N clicks al Sell button.
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::SellItem {
+                    item_vx: 10, item_vy: 20,
+                    amount_vx: None, amount_vy: None,
+                    sell_vx: 50, sell_vy: 60,
+                    quantity: 3, spacing_ms: 33, // 1 tick per click
+                }),
+                step(StepKind::Hotkey { hidcode: 0xCC }),
+            ],
+            false, 30,
+        );
+        let mut select_click = 0;
+        let mut sell_clicks = 0;
+        let mut advanced = false;
+        for t in 0..100 {
+            match cb.tick(&mut ctx(t)) {
+                CavebotAction::Click { vx: 10, vy: 20 } => select_click += 1,
+                CavebotAction::Click { vx: 50, vy: 60 } => sell_clicks += 1,
+                CavebotAction::KeyTap(0xCC) => { advanced = true; break; }
+                _ => {}
+            }
+        }
+        assert!(advanced);
+        assert_eq!(select_click, 1, "1 click al item (select)");
+        assert_eq!(sell_clicks, 3, "3 clicks al Sell button (quantity)");
+    }
+
     /// El flujo Amount debe emitir EXACTAMENTE un click de confirm,
     /// independientemente de quantity. Ese es el cambio semántico clave
     /// vs el legacy (que emitía N clicks).
@@ -3425,6 +3661,68 @@ mod tests {
         );
         // 3 dígitos tipeados: '1', '0', '0' → 0x1E, 0x27, 0x27.
         assert_eq!(keytaps, vec![0x1E, 0x27, 0x27]);
+    }
+
+    #[test]
+    fn sell_item_parser_accepts_amount_flow() {
+        use crate::cavebot::parser;
+        use std::io::Write;
+        use std::path::Path;
+
+        let tmp = std::env::temp_dir().join("sell_item_amount.toml");
+        let src = r#"
+            [[step]]
+            kind = "sell_item"
+            item_vx = 100
+            item_vy = 200
+            amount_vx = 300
+            amount_vy = 400
+            sell_vx = 500
+            sell_vy = 600
+            quantity = 50
+            spacing_ms = 150
+        "#;
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        drop(f);
+        let cb = parser::load(Path::new(&tmp), 30).expect("sell_item amount debe parsear");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(cb.steps.len(), 1);
+        match &cb.steps[0].kind {
+            StepKind::SellItem {
+                item_vx, item_vy, amount_vx, amount_vy, sell_vx, sell_vy, quantity, spacing_ms,
+            } => {
+                assert_eq!(*item_vx, 100); assert_eq!(*item_vy, 200);
+                assert_eq!(*amount_vx, Some(300)); assert_eq!(*amount_vy, Some(400));
+                assert_eq!(*sell_vx, 500); assert_eq!(*sell_vy, 600);
+                assert_eq!(*quantity, 50); assert_eq!(*spacing_ms, 150);
+            }
+            other => panic!("expected SellItem, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sell_item_parser_requires_sell_vx_vy() {
+        use crate::cavebot::parser;
+        use std::io::Write;
+        use std::path::Path;
+
+        let tmp = std::env::temp_dir().join("sell_item_missing_sell.toml");
+        let src = r#"
+            [[step]]
+            kind = "sell_item"
+            item_vx = 100
+            item_vy = 200
+            quantity = 10
+        "#;
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        drop(f);
+        let r = parser::load(Path::new(&tmp), 30);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(r.is_err(), "sell_item sin sell_vx/vy debe fallar");
+        let msg = format!("{:#}", r.unwrap_err());
+        assert!(msg.contains("sell_vx"), "error debería mencionar sell_vx: {}", msg);
     }
 
     /// Si solo uno de amount_vx/amount_vy está presente, el parser debe
