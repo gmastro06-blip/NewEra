@@ -61,6 +61,11 @@ depot_chest = { x = 1550, y = 0, w = 370, h = 500 }
 # stow_menu: menú de contexto aparece donde hagas click derecho.
 # Cubre toda la mitad derecha de la pantalla (inventario + containers).
 stow_menu   = { x = 900,  y = 0, w = 1020, h = 800 }
+# npc_trade: panel "Commerce" de shopkeeper en el sidebar izquierdo.
+# Usado por StepVerify (open_npc_trade, bye click) vía ctx.ui_matches.
+# Mismas coords que [prompts].prompt_npc_trade — necesario porque UiDetector
+# y PromptDetector son dos loaders separados; el verify solo mira ui_matches.
+npc_trade   = { x = 50,   y = 25, w = 420, h = 650 }
 
 # ── Inventory backpack strip (layout vertical con N backpacks stacked) ──────
 # Calibrado 2026-04-15 con GIMP sobre el layout real del usuario.

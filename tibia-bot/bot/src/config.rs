@@ -263,6 +263,30 @@ pub struct GameCoordsConfig {
     /// Setear a `false` para debug / A-B testing del comportamiento
     /// pre-fix.
     pub disambiguation_enabled: bool,
+    /// Coord inicial `[x, y, z]` para semillar el matcher en cold boot.
+    ///
+    /// Sin seed, la primera llamada a `detect()` hace full brute force
+    /// sobre todos los sectores cargados → puede elegir un false positive
+    /// lejano si varios sectores del mismo piso tienen patrones visuales
+    /// similares (validado 2026-04-17 live en Ab'dendriel depot: matcher
+    /// reportaba (33627, 31842, 6) en vez de (32681, 31686, 6), ~946
+    /// tiles al este, sin que la disambiguation lo rechazara).
+    ///
+    /// Con `starting_coord = [32681, 31686, 6]`, el bot arranca con
+    /// `last_game_coords = Some(seed)` → el primer detect() usa narrow
+    /// search (sector actual + 8 vecinos, ~256 tiles radius) limitando
+    /// al piso del seed. Los false positives lejanos quedan fuera del
+    /// search space.
+    ///
+    /// **Precondición**: el char debe estar físicamente cerca del seed
+    /// al arrancar el bot. Si el char está >256 tiles del seed, narrow
+    /// search no encuentra match → el matcher hace force_full después
+    /// del `COORDS_REVALIDATE_INTERVAL` y auto-recupera.
+    ///
+    /// Formato TOML: `starting_coord = [32681, 31686, 6]`.
+    /// `None` (default) = sin seed, comportamiento legacy (cold boot
+    /// full search).
+    pub starting_coord: Option<[i32; 3]>,
 }
 
 impl Default for GameCoordsConfig {
@@ -275,6 +299,7 @@ impl Default for GameCoordsConfig {
             matcher_threshold: 0.0,
             matcher_floors:    None,
             disambiguation_enabled: true,
+            starting_coord:    None,
         }
     }
 }

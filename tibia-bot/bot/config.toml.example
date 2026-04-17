@@ -147,6 +147,13 @@ map_index_path   = ""     # ruta al .bin generado. Vacío = deshabilitado.
 # matcher_threshold = 0.05  # SSD normed; lower=better. 0 = usar default (0.05)
 # disambiguation_enabled = true   # rechaza falsos positivos con segundo patch
                                  # (default ON). Setear false para A-B testing.
+# starting_coord = [32681, 31686, 6]   # seed [x, y, z] para narrow search desde
+                                 # el cold boot. Previene false positives lejanos
+                                 # cuando el patrón visual del char colisiona con
+                                 # otros sectores del mismo piso. El char debe
+                                 # estar <256 tiles del seed al arrancar el bot.
+                                 # Ajustar según dónde arranca el cavebot.
+                                 # Sin seed = full brute force en el 1er detect.
 
 [scripting]
 # ──────────────────────────────────────────────────────────────────────────────
