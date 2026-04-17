@@ -142,6 +142,11 @@ enabled = false
 # ──────────────────────────────────────────────────────────────────────────────
 map_index_path   = ""     # ruta al .bin generado. Vacío = deshabilitado.
 # detect_interval = 15    # frames entre detecciones (default 15 = ~500ms)
+# minimap_dir    = "assets/minimap/minimap"  # PNGs del cliente para CCORR fallback
+# matcher_floors = "6,7,8"  # CSV de floors a cargar. Vacío = todos.
+# matcher_threshold = 0.05  # SSD normed; lower=better. 0 = usar default (0.05)
+# disambiguation_enabled = true   # rechaza falsos positivos con segundo patch
+                                 # (default ON). Setear false para A-B testing.
 
 [scripting]
 # ──────────────────────────────────────────────────────────────────────────────

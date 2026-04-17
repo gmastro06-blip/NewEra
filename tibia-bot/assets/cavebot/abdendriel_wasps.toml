@@ -127,29 +127,28 @@ max_wait_ms = 30000
 #   - Validado live: RC (1585,150) abre context menu con "Stow all items of this type"
 #   - menu_offset re-medir con V7 live ahora que el click produce menu
 
-# Stow Green Backpack (bag 3)
-# menu_offset calibrados 2026-04-16 via brightness detection del menu abierto:
-#   RC @ (1585, 150) → menu "Stow all items of this type" en (1650, 395)
-#   offset_x = 1650-1585 = +65 (x al centro del menu text)
-#   offset_y = 395-150  = +245 (row del menu; 11 items × 18px + separators)
+# Stow Green Backpack (bag 3) — re-calibrado 2026-04-17 hover+GetCursorPos:
+#   slot_vx/vy       = (1636, 157)  — primer slot del bag
+#   menu @ stow row  = (1723, 415)  — "Stow all items of this type"
+#   offset           = (+87, +258)  — delta del slot al menu row
 [[step]]
 kind = "stow_all_items"
-slot_vx         = 1585
-slot_vy         = 150
-menu_offset_x   = 65
-menu_offset_y   = 245
+slot_vx         = 1636
+slot_vy         = 157
+menu_offset_x   = 87
+menu_offset_y   = 258
 menu_wait_ms    = 600
 stow_process_ms = 1200
 max_iterations  = 6
 
-# Stow Bag (bag 4) — mismos offsets de menu (click x similar, menu aparece
-# debajo con layout constante).
+# Stow Bag (bag 4) — mismos offsets de menu (Tibia 12 menu aparece
+# relativo al right-click con delta constante).
 [[step]]
 kind = "stow_all_items"
-slot_vx         = 1585
+slot_vx         = 1596
 slot_vy         = 215
-menu_offset_x   = 65
-menu_offset_y   = 245
+menu_offset_x   = 87
+menu_offset_y   = 258
 menu_wait_ms    = 600
 stow_process_ms = 1200
 max_iterations  = 6
@@ -189,36 +188,61 @@ max_wait_ms = 5000
 #
 # Alternativa futura: añadir sell_item step al cavebot runner.
 
-# Buy 100 mana potions
-# Este NPC (Ashari Aelzerand Neeymas) vende "magical equipment" — al decir
-# "trade" responde ofreciendo filtrar por "potions / wands / runes". Para
-# abrir la trade window con mana potions hay que decir "potions", no "trade".
-# "hi" abre el greeting + text dialog. Segunda frase "potions" filtra la
-# lista a potions y abre la trade window automáticamente.
-[[step]]
-kind = "npc_dialog"
-phrases = ["hi", "potions"]
-wait_prompt_ms = 1500
+# Buy 100 mana potions — Tibia 12 Shiriel flow.
+# Calibrado live 2026-04-17 con hover-mouse + GetCursorPos (ver session note
+# Obsidian). El NPC es Shiriel (el saludo "Ashari" es palabra druida de hola).
+# Flujo completo:
+#   1. OpenNpcTrade: say "hi" → click icono bag del greeting → abre trade
+#   2. TypeInField: click "Ty to search" → type "mana potion" → filtra lista
+#   3. BuyItem (amount flow): click row → click Amount → type "100" → click Buy
+#   4. Ladder (click bye): cerrar interacción con NPC
+#
+# Coords live calibrados:
+#   bag_button:          (163, 301)   — icono bag del greeting window
+#   search_field:        (426, 261)   — "Type to search" de la trade window
+#   mana_potion_row:     (380, 129)   — row mana potion en lista filtrada
+#   amount_field:        (394, 292)   — input Amount
+#   buy_button:          (480, 327)   — botón Buy
+#   bye_button:          (117, 298)   — icono mano rojo (cierra chat)
 
-# Calibrado live 2026-04-17 con hover mouse + GetCursorPos sobre la trade
-# window abierta (filtrada por "potions") del NPC Ashari Aelzerand Neeymas:
-#   - mana_potion row en la lista scrolleable: (446, 148)
-#   - Buy button "Buy 1x mana potion for 56 gold": (478, 322)
-# Nota: el NPC filter requirió decir "hi" → "potions" en chat (no "trade").
-# Abrir trade window directa vía click en botón bag también funciona (TBD en cavebot).
+# 1. Say "hi" + click bag icon
+[[step]]
+kind = "open_npc_trade"
+greeting_phrases = ["hi"]
+bag_button_vx    = 163
+bag_button_vy    = 301
+wait_button_ms   = 1500
+
+# 2. Click "Ty to search" + type "mana potion" para filtrar lista
+[[step]]
+kind = "type_in_field"
+field_vx            = 426
+field_vy            = 261
+text                = "mana potion"
+wait_after_click_ms = 200
+wait_after_type_ms  = 400
+
+# 3. Buy 100 mana potions con amount flow: click row → click amount → type "100" → click Buy
 [[step]]
 kind = "buy_item"
-item_vx    = 446
-item_vy    = 148
-confirm_vx = 478
-confirm_vy = 322
+item_vx    = 380
+item_vy    = 129
+amount_vx  = 394
+amount_vy  = 292
+confirm_vx = 480
+confirm_vy = 327
 quantity   = 100
-spacing_ms = 150
+spacing_ms = 250
+
+# 4. Click bye icon para cerrar chat con NPC (usamos Ladder semánticamente)
+[[step]]
+kind = "ladder"
+vx = 117
+vy = 298
 
 [[step]]
-kind = "npc_dialog"
-phrases = ["bye"]
-wait_prompt_ms = 500
+kind = "wait"
+duration_ms = 500
 
 # Step away from NPC
 [[step]]

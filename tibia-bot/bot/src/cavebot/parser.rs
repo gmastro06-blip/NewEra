@@ -84,6 +84,7 @@ struct SectionToml {
 struct StepToml {
     /// Nombre del tipo: "walk" | "wait" | "hotkey" | "stand" | "label"
     /// | "goto" | "goto_if" | "loot" | "skip_if_blocked" | "npc_dialog"
+    /// | "open_npc_trade" | "type_in_field"
     kind: String,
     /// Nombre opcional del step (para logs) y obligatorio si kind=label.
     #[serde(default)]
@@ -121,6 +122,15 @@ struct StepToml {
     phrases: Option<Vec<String>>,
     #[serde(default)]
     wait_prompt_ms: Option<u64>,
+    // OpenNpcTrade (greeting + click en botón bag del greeting window)
+    #[serde(default)]
+    greeting_phrases: Option<Vec<String>>,
+    #[serde(default)]
+    bag_button_vx: Option<i32>,
+    #[serde(default)]
+    bag_button_vy: Option<i32>,
+    #[serde(default)]
+    wait_button_ms: Option<u64>,
     // Node (coordenadas absolutas)
     #[serde(default)]
     x: Option<i32>,
@@ -159,6 +169,13 @@ struct StepToml {
     item_vx: Option<i32>,
     #[serde(default)]
     item_vy: Option<i32>,
+    /// Coords del input field "Amount" (Tibia 12). Opcionales: si ambos están
+    /// presentes, el runner usa el flujo moderno (tipear dígitos + 1 click);
+    /// si faltan, usa el legacy (N clicks de confirm).
+    #[serde(default)]
+    amount_vx: Option<i32>,
+    #[serde(default)]
+    amount_vy: Option<i32>,
     #[serde(default)]
     confirm_vx: Option<i32>,
     #[serde(default)]
@@ -172,6 +189,19 @@ struct StepToml {
     on_fail: Option<String>,
     #[serde(default)]
     requirements: Option<Vec<SupplyRequirement>>,
+    // TypeInField
+    #[serde(default)]
+    field_vx: Option<i32>,
+    #[serde(default)]
+    field_vy: Option<i32>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    wait_after_click_ms: Option<u64>,
+    #[serde(default)]
+    wait_after_type_ms: Option<u64>,
+    #[serde(default)]
+    char_spacing_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -265,11 +295,14 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
     let StepToml {
         kind, name, key, duration_ms, interval_ms,
         until, max_wait_ms, label, when, vx, vy, retry_count,
-        phrases, wait_prompt_ms, x, y, z,
+        phrases, wait_prompt_ms,
+        greeting_phrases, bag_button_vx, bag_button_vy, wait_button_ms,
+        x, y, z,
         chest_vx, chest_vy, stow_vx, stow_vy, menu_wait_ms, process_ms,
-        item_vx, item_vy, confirm_vx, confirm_vy, quantity, spacing_ms,
+        item_vx, item_vy, amount_vx, amount_vy, confirm_vx, confirm_vy, quantity, spacing_ms,
         on_fail, requirements,
         slot_vx, slot_vy, menu_offset_x, menu_offset_y, stow_process_ms, max_iterations,
+        field_vx, field_vy, text, wait_after_click_ms, wait_after_type_ms, char_spacing_ms,
     } = st;
 
     let kind_lower = kind.to_lowercase();
@@ -348,6 +381,21 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
                 wait_prompt_ms: wait_prompt_ms.unwrap_or(0),
             }
         }
+        "open_npc_trade" => {
+            let greeting_phrases = greeting_phrases
+                .context("open_npc_trade: falta 'greeting_phrases' (array de strings)")?;
+            if greeting_phrases.is_empty() {
+                bail!("open_npc_trade: 'greeting_phrases' no puede estar vacío");
+            }
+            StepKind::OpenNpcTrade {
+                greeting_phrases,
+                bag_button_vx: bag_button_vx
+                    .context("open_npc_trade: falta 'bag_button_vx'")?,
+                bag_button_vy: bag_button_vy
+                    .context("open_npc_trade: falta 'bag_button_vy'")?,
+                wait_button_ms: wait_button_ms.unwrap_or(800),
+            }
+        }
         "node" => StepKind::Node {
             x: x.context("node: falta 'x'")?,
             y: y.context("node: falta 'y'")?,
@@ -381,14 +429,32 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
             stow_process_ms: stow_process_ms.unwrap_or(800),
             max_iterations:  max_iterations.unwrap_or(8),
         },
-        "buy_item" => StepKind::BuyItem {
-            item_vx:    item_vx.context("buy_item: falta 'item_vx'")?,
-            item_vy:    item_vy.context("buy_item: falta 'item_vy'")?,
-            confirm_vx: confirm_vx.context("buy_item: falta 'confirm_vx'")?,
-            confirm_vy: confirm_vy.context("buy_item: falta 'confirm_vy'")?,
-            quantity:   quantity.context("buy_item: falta 'quantity'")?,
-            spacing_ms: spacing_ms.unwrap_or(150),
-        },
+        "buy_item" => {
+            // amount_vx y amount_vy son opcionales. Si sólo uno está presente
+            // es una config ambigua → error explícito para que el usuario
+            // complete o remueva el campo.
+            match (amount_vx, amount_vy) {
+                (Some(_), None) => bail!(
+                    "buy_item: 'amount_vx' presente pero falta 'amount_vy'. \
+                     Ambos deben estar o ninguno."
+                ),
+                (None, Some(_)) => bail!(
+                    "buy_item: 'amount_vy' presente pero falta 'amount_vx'. \
+                     Ambos deben estar o ninguno."
+                ),
+                _ => {}
+            }
+            StepKind::BuyItem {
+                item_vx:    item_vx.context("buy_item: falta 'item_vx'")?,
+                item_vy:    item_vy.context("buy_item: falta 'item_vy'")?,
+                amount_vx,
+                amount_vy,
+                confirm_vx: confirm_vx.context("buy_item: falta 'confirm_vx'")?,
+                confirm_vy: confirm_vy.context("buy_item: falta 'confirm_vy'")?,
+                quantity:   quantity.context("buy_item: falta 'quantity'")?,
+                spacing_ms: spacing_ms.unwrap_or(150),
+            }
+        }
         "check_supplies" => {
             let reqs = requirements.context("check_supplies: falta 'requirements' (array)")?;
             let fail_label = on_fail.context("check_supplies: falta 'on_fail'")?;
@@ -399,6 +465,20 @@ fn parse_step_toml(st: StepToml) -> Result<Step> {
                 requirements: reqs.into_iter().map(|r| (r.item, r.min_count)).collect(),
                 on_fail_label: fail_label,
                 on_fail_idx: 0, // resuelto en label pass
+            }
+        }
+        "type_in_field" => {
+            let text = text.context("type_in_field: falta 'text'")?;
+            if text.is_empty() {
+                bail!("type_in_field: 'text' no puede estar vacío");
+            }
+            StepKind::TypeInField {
+                field_vx:            field_vx.context("type_in_field: falta 'field_vx'")?,
+                field_vy:            field_vy.context("type_in_field: falta 'field_vy'")?,
+                text,
+                wait_after_click_ms: wait_after_click_ms.unwrap_or(150),
+                wait_after_type_ms:  wait_after_type_ms.unwrap_or(200),
+                char_spacing_ms:     char_spacing_ms.unwrap_or(80),
             }
         }
         other => bail!("kind desconocido: '{}'", other),
@@ -685,6 +765,123 @@ mod tests {
             phrases = []
         "#;
         assert!(parse(src).is_err());
+    }
+
+    // ── OpenNpcTrade parser tests ────────────────────────────────────
+
+    #[test]
+    fn parse_open_npc_trade_with_all_fields() {
+        let src = r#"
+            [[step]]
+            kind = "open_npc_trade"
+            greeting_phrases = ["hi"]
+            bag_button_vx    = 350
+            bag_button_vy    = 400
+            wait_button_ms   = 800
+        "#;
+        let cb = parse(src).unwrap();
+        assert_eq!(cb.steps.len(), 1);
+        match &cb.steps[0].kind {
+            StepKind::OpenNpcTrade {
+                greeting_phrases, bag_button_vx, bag_button_vy, wait_button_ms,
+            } => {
+                assert_eq!(greeting_phrases, &vec!["hi".to_string()]);
+                assert_eq!(*bag_button_vx, 350);
+                assert_eq!(*bag_button_vy, 400);
+                assert_eq!(*wait_button_ms, 800);
+            }
+            _ => panic!("not OpenNpcTrade"),
+        }
+    }
+
+    #[test]
+    fn parse_open_npc_trade_uses_default_wait_button_ms() {
+        // Sin wait_button_ms explícito → default 800.
+        let src = r#"
+            [[step]]
+            kind = "open_npc_trade"
+            greeting_phrases = ["hi", "yes"]
+            bag_button_vx    = 100
+            bag_button_vy    = 200
+        "#;
+        let cb = parse(src).unwrap();
+        match &cb.steps[0].kind {
+            StepKind::OpenNpcTrade { wait_button_ms, greeting_phrases, .. } => {
+                assert_eq!(*wait_button_ms, 800);
+                assert_eq!(greeting_phrases.len(), 2);
+            }
+            _ => panic!("not OpenNpcTrade"),
+        }
+    }
+
+    #[test]
+    fn parse_open_npc_trade_rejects_missing_greeting_phrases() {
+        let src = r#"
+            [[step]]
+            kind = "open_npc_trade"
+            bag_button_vx = 100
+            bag_button_vy = 200
+        "#;
+        assert!(
+            parse(src).is_err(),
+            "open_npc_trade sin greeting_phrases debe ser error"
+        );
+    }
+
+    #[test]
+    fn parse_open_npc_trade_rejects_empty_greeting_phrases() {
+        let src = r#"
+            [[step]]
+            kind = "open_npc_trade"
+            greeting_phrases = []
+            bag_button_vx = 100
+            bag_button_vy = 200
+        "#;
+        assert!(
+            parse(src).is_err(),
+            "open_npc_trade con greeting_phrases vacío debe ser error"
+        );
+    }
+
+    #[test]
+    fn parse_open_npc_trade_rejects_missing_bag_button_vx() {
+        let src = r#"
+            [[step]]
+            kind = "open_npc_trade"
+            greeting_phrases = ["hi"]
+            bag_button_vy = 200
+        "#;
+        assert!(
+            parse(src).is_err(),
+            "open_npc_trade sin bag_button_vx debe ser error"
+        );
+    }
+
+    #[test]
+    fn parse_open_npc_trade_rejects_missing_bag_button_vy() {
+        let src = r#"
+            [[step]]
+            kind = "open_npc_trade"
+            greeting_phrases = ["hi"]
+            bag_button_vx = 100
+        "#;
+        assert!(
+            parse(src).is_err(),
+            "open_npc_trade sin bag_button_vy debe ser error"
+        );
+    }
+
+    #[test]
+    fn parse_npc_dialog_still_works_after_open_npc_trade_added() {
+        // Backwards-compat: el viejo NpcDialog sigue parseando OK.
+        let src = r#"
+            [[step]]
+            kind = "npc_dialog"
+            phrases = ["hi", "trade"]
+            wait_prompt_ms = 500
+        "#;
+        let cb = parse(src).unwrap();
+        assert!(matches!(&cb.steps[0].kind, StepKind::NpcDialog { .. }));
     }
 
     #[test]
@@ -1011,6 +1208,104 @@ mod tests {
         "#;
         let r = parse(src);
         assert!(r.is_err(), "stow_all_items sin slot_vy debe ser error");
+    }
+
+    // ── TypeInField step parser tests ─────────────────────────────────
+
+    #[test]
+    fn parse_type_in_field_with_all_fields() {
+        let src = r#"
+            [[step]]
+            kind = "type_in_field"
+            field_vx            = 426
+            field_vy            = 261
+            text                = "mana potion"
+            wait_after_click_ms = 120
+            wait_after_type_ms  = 250
+            char_spacing_ms     = 60
+        "#;
+        let cb = parse(src).unwrap();
+        assert_eq!(cb.steps.len(), 1);
+        match &cb.steps[0].kind {
+            StepKind::TypeInField {
+                field_vx, field_vy, text,
+                wait_after_click_ms, wait_after_type_ms, char_spacing_ms,
+            } => {
+                assert_eq!(*field_vx, 426);
+                assert_eq!(*field_vy, 261);
+                assert_eq!(text, "mana potion");
+                assert_eq!(*wait_after_click_ms, 120);
+                assert_eq!(*wait_after_type_ms, 250);
+                assert_eq!(*char_spacing_ms, 60);
+            }
+            _ => panic!("expected TypeInField kind"),
+        }
+    }
+
+    #[test]
+    fn parse_type_in_field_rejects_empty_text() {
+        let src = r#"
+            [[step]]
+            kind = "type_in_field"
+            field_vx = 100
+            field_vy = 200
+            text     = ""
+        "#;
+        assert!(
+            parse(src).is_err(),
+            "type_in_field con text vacío debe ser error"
+        );
+    }
+
+    #[test]
+    fn parse_type_in_field_applies_defaults() {
+        // Sin wait/spacing explícitos → defaults 150 / 200 / 80 ms.
+        let src = r#"
+            [[step]]
+            kind = "type_in_field"
+            field_vx = 426
+            field_vy = 261
+            text     = "ab"
+        "#;
+        let cb = parse(src).unwrap();
+        match &cb.steps[0].kind {
+            StepKind::TypeInField {
+                wait_after_click_ms, wait_after_type_ms, char_spacing_ms, ..
+            } => {
+                assert_eq!(*wait_after_click_ms, 150);
+                assert_eq!(*wait_after_type_ms, 200);
+                assert_eq!(*char_spacing_ms, 80);
+            }
+            _ => panic!("expected TypeInField kind"),
+        }
+    }
+
+    #[test]
+    fn parse_type_in_field_rejects_missing_coords() {
+        // field_vx ausente.
+        let src_no_vx = r#"
+            [[step]]
+            kind = "type_in_field"
+            field_vy = 200
+            text     = "ab"
+        "#;
+        assert!(parse(src_no_vx).is_err(), "type_in_field sin field_vx debe ser error");
+        // field_vy ausente.
+        let src_no_vy = r#"
+            [[step]]
+            kind = "type_in_field"
+            field_vx = 100
+            text     = "ab"
+        "#;
+        assert!(parse(src_no_vy).is_err(), "type_in_field sin field_vy debe ser error");
+        // text ausente.
+        let src_no_text = r#"
+            [[step]]
+            kind = "type_in_field"
+            field_vx = 100
+            field_vy = 200
+        "#;
+        assert!(parse(src_no_text).is_err(), "type_in_field sin text debe ser error");
     }
 
     /// Smoke test: los 3 scripts MINOR completados en R10 deben parsear OK.

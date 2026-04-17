@@ -137,6 +137,35 @@ pub enum StepKind {
         wait_prompt_ms: u64,
     },
 
+    // ── Abrir trade window via botón bag del greeting ─────────────────
+    /// Saluda al NPC tipeando `greeting_phrases` en chat (típicamente
+    /// `["hi"]`) y luego CLICKEA el botón de bag del greeting window para
+    /// abrir la trade window. Usado para NPCs de Tibia 12 cuyo greeting
+    /// muestra un icono de bag que abre la trade window al clickearlo
+    /// (ej: Ashari Aelzerand Neeymas en Ab'dendriel — abre trade sin
+    /// tipear "trade"/"potions" en chat).
+    ///
+    /// Flujo de fases:
+    /// - Fase 0: tipear `greeting_phrases` una por una (equivalente a
+    ///   `NpcDialog`). Cada frase se emite en un tick separado via
+    ///   `CavebotAction::Say`.
+    /// - Fase 1: esperar `wait_button_ms` (default 800ms) para que Tibia
+    ///   renderice el greeting window con el botón de bag.
+    /// - Fase 2: emitir un `CavebotAction::Click { vx, vy }` sobre
+    ///   `(bag_button_vx, bag_button_vy)`.
+    /// - Fase 3: esperar 500ms post-click para que abra la trade window
+    ///   y avanzar al siguiente step.
+    ///
+    /// **Calibración**: abrir el cliente manualmente con el NPC, capturar
+    /// el frame con `/test/grab`, medir las coords del botón de bag en
+    /// GIMP y pegar en `bag_button_vx`/`bag_button_vy`.
+    OpenNpcTrade {
+        greeting_phrases: Vec<String>,
+        bag_button_vx:    i32,
+        bag_button_vy:    i32,
+        wait_button_ms:   u64,
+    },
+
     // ── Depot / trading ────────────────────────────────────────────────
     /// Right-click en depot chest, esperar menú, click en "Stow all".
     /// Usado para depositar contenido del backpack tras una hunt session.
@@ -208,15 +237,84 @@ pub enum StepKind {
         /// non-stackables). Default 8.
         max_iterations:  u8,
     },
+    /// Escribe texto en un campo de input (no chat) haciendo primero click
+    /// sobre el field para activarlo y luego emitiendo un `KeyTap` por cada
+    /// caracter del `text`. Pensado para el **search field de la trade
+    /// window de Tibia 12** — donde `OpenNpcTrade` abre la ventana y este
+    /// step filtra la lista de items por nombre antes del `BuyItem`.
+    ///
+    /// A diferencia de `NpcDialog` / `OpenNpcTrade`, este step NO tipea en
+    /// el chat de Tibia: no wrapea con Enter y no pasa por el typing buffer
+    /// de `bot.say()`. Emite los taps directamente al Pico/SendInput.
+    ///
+    /// Flujo de fases:
+    /// - Fase 0: emit `CavebotAction::Click { vx, vy }` sobre `(field_vx,
+    ///   field_vy)` para que el input tome focus.
+    /// - Fase 1: esperar `wait_after_click_ms` (default 150ms) para que
+    ///   Tibia procese el focus.
+    /// - Fase 2: loop sobre los caracteres de `text`:
+    ///     - Convertir cada char con `crate::act::keycode::ascii_to_hid`.
+    ///     - Chars sin mapping (mayúsculas, símbolos) → `tracing::warn!`
+    ///       y skip; no panic.
+    ///     - Emitir `CavebotAction::KeyTap(hid)` y esperar
+    ///       `char_spacing_ms` (default 80ms) antes del próximo tap.
+    /// - Fase 3: esperar `wait_after_type_ms` (default 200ms) para que la
+    ///   UI termine de aplicar el filtro.
+    /// - Fase 4: advance al siguiente step.
+    ///
+    /// **Limitación**: `ascii_to_hid` solo soporta `a-z`, `0-9`, `space` y
+    /// `\n`/`\r`. Mayúsculas y símbolos se ignoran (en la mayoría de casos
+    /// el match de la search bar es case-insensitive).
+    TypeInField {
+        field_vx:            i32,
+        field_vy:            i32,
+        text:                String,
+        wait_after_click_ms: u64,
+        wait_after_type_ms:  u64,
+        char_spacing_ms:     u64,
+    },
     /// Comprar N unidades de un item en la trade window abierta.
-    /// Emite: left-click en item → wait → N left-clicks en confirm.
+    ///
+    /// Soporta dos flujos según si `amount_vx`/`amount_vy` están presentes:
+    ///
+    /// **Legacy (Tibia clásico o NPCs sin Amount field)** — cuando ambos
+    /// `amount_vx` y `amount_vy` son `None`:
+    ///   1. Click en `(item_vx, item_vy)` para seleccionar la fila del item.
+    ///   2. Esperar `spacing_ms`.
+    ///   3. Emitir `quantity` left-clicks sobre `(confirm_vx, confirm_vy)`
+    ///      con `spacing_ms` de separación (cada click compra 1 unidad).
+    ///
+    /// **Tibia 12 con Amount field** — cuando ambos están `Some`:
+    ///   1. Click en `(item_vx, item_vy)` (selecciona la fila del item).
+    ///   2. Esperar 200ms para que la trade window reaccione al select.
+    ///   3. Click en `(amount_vx, amount_vy)` (focus al input Amount).
+    ///   4. Esperar 150ms para que el input tome focus.
+    ///   5. Por cada dígito decimal del string de `quantity` (en orden):
+    ///        - Emitir un `KeyTap` con el HID code del dígito.
+    ///        - Esperar `spacing_ms/2` entre dígitos (mínimo 1 tick).
+    ///   6. Esperar 150ms post-dígitos.
+    ///   7. UN solo click sobre `(confirm_vx, confirm_vy)` (compra todas las
+    ///      unidades de golpe porque el Amount field ya está escrito).
+    ///   8. Esperar `spacing_ms` para que la UI procese.
+    ///   9. Avanzar al siguiente step.
+    ///
+    /// El modo Amount es el correcto para la UI moderna de Tibia 12; el legacy
+    /// queda para retrocompatibilidad con scripts antiguos.
     BuyItem {
         item_vx:    i32,
         item_vy:    i32,
+        /// Input field "Amount" en la trade window. Si ambos son `Some`, se
+        /// usa el flujo moderno (tipeo de dígitos + 1 click); si ambos son
+        /// `None`, flujo legacy (N clicks de confirm).
+        amount_vx:  Option<i32>,
+        amount_vy:  Option<i32>,
         confirm_vx: i32,
         confirm_vy: i32,
         quantity:   u32,
-        spacing_ms: u64,    // tiempo entre clicks de confirm
+        /// En modo legacy: tiempo entre clicks de confirm.
+        /// En modo Amount: tiempo base (dígitos usan `spacing_ms/2`,
+        /// post-flujo espera `spacing_ms` antes de avanzar).
+        spacing_ms: u64,
     },
     /// Verifica que todos los items en `requirements` tengan al menos
     /// `min_count` matches en inventario. Si alguno falla, salta a

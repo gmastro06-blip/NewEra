@@ -260,16 +260,25 @@ impl BotLoop {
         // Session duration cap (opt-in via max_session_hours > 0).
         // Baseline = tick actual (normalmente 0 al arrancar, pero defensivo
         // por si el loop corre con estado pre-existente).
+        // `session_warning_min > 0` habilita el graceful refill: T-N min
+        // antes del cap, el loop fuerza un goto al label "refill" del
+        // cavebot (si existe) para vaciar el bag antes de pausar.
         let session_start_tick = self.state.read().tick;
         let mut session_limit = SessionLimit::new(
             safety.max_session_hours,
             target_fps,
             session_start_tick,
-        );
+        )
+        .map(|sl| sl.with_warning_min(safety.session_warning_min, target_fps));
+        // Latch: una vez disparado el warning no volvemos a inyectar el
+        // goto "refill" cada tick. El FSM/cavebot siguen su camino hasta
+        // que is_expired aplique el hard pause, o hasta que el operador
+        // reanude manualmente.
+        let mut session_warning_active = false;
         if session_limit.is_some() {
             info!(
-                "Safety: session cap activo — {:.2}h (baseline tick={})",
-                safety.max_session_hours, session_start_tick,
+                "Safety: session cap activo — {:.2}h (baseline tick={}, warning_min={:.1})",
+                safety.max_session_hours, session_start_tick, safety.session_warning_min,
             );
         }
 
@@ -795,11 +804,43 @@ impl BotLoop {
             }
 
             // ── SAFETY: Session duration cap (Task 2.2) ──────────────────
-            // Dispara una sola vez cuando el runtime excede max_session_hours.
-            // Tras disparar, `session_limit = None` para no re-loggear cada
-            // tick. La pausa persiste (current_pause_reason) hasta intervención
-            // manual — el operador decide si reanudar o cerrar la sesión.
+            // Dos fases:
+            //   1. is_warning (graceful): T-N min antes del cap. Si el
+            //      cavebot está enabled y tiene un label "refill", forzamos
+            //      un goto para vaciar bag antes de pausar. One-shot via
+            //      `session_warning_active`.
+            //   2. is_expired (hard): se dispara al pasar max_session_hours.
+            //      Setea pause reason y descarta session_limit para no
+            //      re-loggear. La pausa persiste hasta intervención manual.
             if let Some(ref sl) = session_limit {
+                if !session_warning_active && sl.is_warning(tick_num) {
+                    session_warning_active = true;
+                    if self.cavebot_enabled {
+                        if let Some(cb) = self.cavebot.as_mut() {
+                            if cb.force_goto_label("refill", tick_num) {
+                                warn!(
+                                    "Session warning ({:.1} min margin): forcing goto refill before cap",
+                                    safety.session_warning_min,
+                                );
+                            } else {
+                                warn!(
+                                    "Session warning ({:.1} min margin): no 'refill' label in cavebot — cap hará pause directo",
+                                    safety.session_warning_min,
+                                );
+                            }
+                        } else {
+                            warn!(
+                                "Session warning ({:.1} min margin): no cavebot loaded — cap hará pause directo",
+                                safety.session_warning_min,
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "Session warning ({:.1} min margin): cavebot disabled — cap hará pause directo",
+                            safety.session_warning_min,
+                        );
+                    }
+                }
                 if sl.is_expired(tick_num) {
                     let elapsed = sl.elapsed_hours(tick_num, target_fps);
                     warn!(

@@ -319,6 +319,20 @@ impl Vision {
                 self.minimap_matcher.match_threshold = cfg.matcher_threshold;
                 tracing::info!("MinimapMatcher threshold = {:.4}", cfg.matcher_threshold);
             }
+            // Disambiguation: log explícitamente ON/OFF al boot para que
+            // sea fácil correlacionar comportamiento en sesiones live.
+            self.minimap_matcher.disambiguation_enabled = cfg.disambiguation_enabled;
+            if cfg.disambiguation_enabled {
+                tracing::info!(
+                    "MinimapMatcher disambiguation = ON (segundo patch de esquina opuesta \
+                     valida top-K candidates; false positives se rechazan con None)"
+                );
+            } else {
+                tracing::info!(
+                    "MinimapMatcher disambiguation = OFF (comportamiento legacy: top-1 ganador \
+                     sin segunda verificación)"
+                );
+            }
         }
     }
 

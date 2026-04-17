@@ -174,6 +174,14 @@ pub struct Cavebot {
     /// Tick en que se empezó la espera post-tipeo del NpcDialog (si aplica).
     /// `None` = aún tipeando frases.
     npc_wait_start: Option<u64>,
+    // ── Estado de OpenNpcTrade step ──────────────────────────────────
+    /// Fase del OpenNpcTrade: 0=tipeando greeting_phrases, 1=wait_button_ms,
+    /// 2=click botón bag, 3=wait 500ms post-click.
+    open_trade_phase: u8,
+    /// Índice de la frase actual en greeting_phrases.
+    open_trade_phrase_idx: usize,
+    /// Tick en que se empezó la fase actual (wait o post-click).
+    open_trade_phase_start: u64,
     /// Ticks consecutivos donde `ctx.is_moving == false` durante un Walk.
     /// Se resetea en 0 al entrar a cada step. Si supera STUCK_THRESHOLD_TICKS
     /// durante un Walk activo, el bot avanza al siguiente step (da por perdida
@@ -220,12 +228,30 @@ pub struct Cavebot {
     /// Tick en el que se entró a la fase actual de deposit.
     deposit_phase_start: u64,
     // ── Estado de BuyItem step ───────────────────────────────────────
-    /// 0=select item, 1=wait, 2=confirming
+    //
+    // Legacy flow (sin amount fields):
+    //   phase 0 = select item click
+    //   phase 1 = loop N clicks de confirm (buy_clicks_done)
+    //
+    // Amount flow (con amount_vx/vy):
+    //   phase 0 = click item (select)
+    //   phase 1 = wait 200ms → click amount field (focus)
+    //   phase 2 = wait 150ms → entrar loop de dígitos
+    //   phase 3 = tipear un dígito (incrementa buy_amount_digit_idx)
+    //   phase 4 = wait spacing_ms/2 entre dígitos (o post-last 150ms)
+    //   phase 5 = click confirm (1 solo)
+    //   phase 6 = wait spacing_ms post-confirm → advance
+    //
+    /// Fase del flujo. Semántica distinta en legacy vs amount (ver arriba).
     buy_phase: u8,
-    /// Clicks de confirm ya emitidos.
+    /// Clicks de confirm ya emitidos (solo usado en legacy flow).
     buy_clicks_done: u32,
-    /// Tick del último click de confirm (para spacing).
+    /// Tick del último click (para spacing en legacy) o del último cambio
+    /// de fase (para timers en amount flow).
     buy_last_click_tick: u64,
+    /// Índice del próximo dígito a tipear en el amount flow. Se resetea
+    /// al entrar al step y avanza cada vez que se emite un KeyTap de dígito.
+    buy_amount_digit_idx: usize,
     // ── Estado de StowAllItems step (iterativo per-item) ────────────
     /// 0=right-click slot 0, 1=wait menu, 2=click "Stow all items of this type", 3=wait process + next iter
     stow_phase: u8,
@@ -243,6 +269,21 @@ pub struct Cavebot {
     /// (stash lleno o no hay más stackables). Reset cuando hay drop en
     /// cualquier item del baseline.
     stow_stale_iters: u8,
+    // ── Estado de TypeInField step ───────────────────────────────────
+    /// Fase del TypeInField:
+    ///   0 = click al field_vx/vy + transicionar a wait
+    ///   1 = wait wait_after_click_ms (focus del input)
+    ///   2 = loop: tap HID del char actual + wait char_spacing_ms
+    ///   3 = wait wait_after_type_ms (la UI aplica el filtro)
+    ///   4 = advance
+    type_field_phase: u8,
+    /// Índice del próximo caracter a tipear dentro de `text`. Avanza al
+    /// emitir cada `KeyTap` y también al skipear chars no mapeables.
+    type_field_char_idx: usize,
+    /// Tick en el que se entró a la fase actual, usado para medir los
+    /// timers de `wait_after_click_ms`, `char_spacing_ms` y
+    /// `wait_after_type_ms`.
+    type_field_phase_start: u64,
 }
 
 impl Cavebot {
@@ -266,6 +307,9 @@ impl Cavebot {
             loot_clicks_done: 0,
             npc_phrase_idx: 0,
             npc_wait_start: None,
+            open_trade_phase: 0,
+            open_trade_phrase_idx: 0,
+            open_trade_phase_start: 0,
             stuck_walk_ticks: 0,
             needs_kills_baseline: true,
             prev_node: None,
@@ -293,6 +337,10 @@ impl Cavebot {
             buy_phase: 0,
             buy_clicks_done: 0,
             buy_last_click_tick: 0,
+            buy_amount_digit_idx: 0,
+            type_field_phase: 0,
+            type_field_char_idx: 0,
+            type_field_phase_start: 0,
         }
     }
 
@@ -481,6 +529,88 @@ impl Cavebot {
                                 continue;
                             }
                             return CavebotAction::Idle;
+                        }
+                    }
+                }
+
+                // ── OpenNpcTrade ───────────────────────────────────────
+                //
+                // Saludo via chat + click en el botón de bag del greeting
+                // window. Fases:
+                //   0: tipeando `greeting_phrases` (una por tick vía Say)
+                //   1: wait `wait_button_ms` para que renderice el greeting
+                //   2: emitir Click en (bag_button_vx, bag_button_vy)
+                //   3: wait ~500ms post-click para que abra la trade window
+                //
+                // Usado por NPCs de Tibia 12 cuyo greeting expone un icono
+                // de bag (alternativa a decir "trade" / "potions" / etc).
+                StepKind::OpenNpcTrade {
+                    greeting_phrases, bag_button_vx, bag_button_vy, wait_button_ms,
+                } => {
+                    // Ticks de espera post-click — hardcoded 500ms para que
+                    // la trade window termine de renderizarse antes del
+                    // siguiente step (típicamente un BuyItem).
+                    const POST_CLICK_WAIT_MS: u64 = 500;
+                    match self.open_trade_phase {
+                        0 => {
+                            // Fase 0: tipear greeting_phrases una por tick.
+                            if self.open_trade_phrase_idx < greeting_phrases.len() {
+                                let phrase = greeting_phrases[self.open_trade_phrase_idx].clone();
+                                self.open_trade_phrase_idx += 1;
+                                return CavebotAction::Say(phrase);
+                            }
+                            // Todas las frases emitidas → pasar a fase 1.
+                            self.open_trade_phase = 1;
+                            self.open_trade_phase_start = ctx.tick;
+                            tracing::info!(
+                                "OpenNpcTrade[{}] phase 1: esperando {}ms para render del greeting window",
+                                idx, wait_button_ms
+                            );
+                            // Si wait_button_ms == 0, fall-through al próximo
+                            // tick evitaría esperar — devolvemos Idle para
+                            // chequear el timer en el siguiente tick.
+                            return CavebotAction::Idle;
+                        }
+                        1 => {
+                            // Fase 1: esperar wait_button_ms para que Tibia
+                            // renderice el greeting window con el bag button.
+                            let wait_ticks = ms_to_ticks(wait_button_ms, self.fps);
+                            if ctx.tick.saturating_sub(self.open_trade_phase_start) >= wait_ticks {
+                                self.open_trade_phase = 2;
+                                self.open_trade_phase_start = ctx.tick;
+                                tracing::info!(
+                                    "OpenNpcTrade[{}] phase 2: click bag button at ({}, {}). \
+                                     If wrong position, edit script: bag_button_vx={}, bag_button_vy={}",
+                                    idx, bag_button_vx, bag_button_vy, bag_button_vx, bag_button_vy
+                                );
+                                return CavebotAction::Click {
+                                    vx: bag_button_vx, vy: bag_button_vy,
+                                };
+                            }
+                            return CavebotAction::Idle;
+                        }
+                        2 => {
+                            // Fase 2: click emitido, esperar POST_CLICK_WAIT_MS
+                            // para que la trade window abra antes de avanzar.
+                            let wait_ticks = ms_to_ticks(POST_CLICK_WAIT_MS, self.fps);
+                            if ctx.tick.saturating_sub(self.open_trade_phase_start) >= wait_ticks {
+                                tracing::info!(
+                                    "OpenNpcTrade[{}] complete, advancing", idx
+                                );
+                                self.advance(ctx.tick);
+                                continue;
+                            }
+                            return CavebotAction::Idle;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "OpenNpcTrade[{}] invalid phase {}, resetting",
+                                idx, self.open_trade_phase
+                            );
+                            self.open_trade_phase = 0;
+                            self.open_trade_phrase_idx = 0;
+                            self.advance(ctx.tick);
+                            continue;
                         }
                     }
                 }
@@ -679,51 +809,204 @@ impl Cavebot {
                     }
                 }
 
-                // ── BuyItem (click item → wait → N clicks confirm) ────
-                StepKind::BuyItem { item_vx, item_vy, confirm_vx, confirm_vy, quantity, spacing_ms } => {
+                // ── BuyItem (dos flujos según amount_vx/vy) ──────────
+                //
+                // Ver `StepKind::BuyItem` en step.rs para la semántica
+                // completa de cada fase. Resumen:
+                //
+                // Legacy (amount_* = None):
+                //   phase 0 = click item → phase 1
+                //   phase 1 = loop N clicks confirm con spacing_ms
+                //
+                // Amount flow (ambos amount_* = Some):
+                //   phase 0 = click item → phase 1 (+ 200ms)
+                //   phase 1 = wait 200ms → click amount field → phase 2 (+ 150ms)
+                //   phase 2 = wait 150ms → phase 3 (tipear dígitos)
+                //   phase 3 = emitir KeyTap del dígito actual → phase 4
+                //   phase 4 = wait spacing_ms/2 entre dígitos, o 150ms post-last
+                //   phase 5 = click confirm (1 sola vez) → phase 6
+                //   phase 6 = wait spacing_ms → advance
+                StepKind::BuyItem {
+                    item_vx, item_vy,
+                    amount_vx, amount_vy,
+                    confirm_vx, confirm_vy,
+                    quantity, spacing_ms,
+                } => {
                     let spacing_ticks = ms_to_ticks(spacing_ms, self.fps).max(1);
-                    match self.buy_phase {
-                        0 => {
-                            // Phase 0: select item.
-                            tracing::info!(
-                                "BuyItem[{}] phase 0: select item at ({}, {}), quantity={}. If wrong position, edit script: item_vx={}, item_vy={}",
-                                idx, item_vx, item_vy, quantity, item_vx, item_vy
-                            );
-                            self.buy_phase = 1;
-                            self.buy_last_click_tick = ctx.tick;
-                            self.buy_clicks_done = 0;
-                            return CavebotAction::Click { vx: item_vx, vy: item_vy };
-                        }
-                        1 => {
-                            // Phase 1: confirm loop con spacing.
-                            if self.buy_clicks_done >= quantity {
+                    // Waits hardcoded del flujo Amount (ver docs en step.rs).
+                    const POST_ITEM_CLICK_MS: u64 = 200;
+                    const POST_AMOUNT_CLICK_MS: u64 = 150;
+                    const POST_DIGITS_MS: u64 = 150;
+
+                    // Decidir el flujo en base a si ambos amount_* están Some.
+                    // Un solo Some ya fue rechazado por el parser con error
+                    // explícito, así que aquí es un match binario limpio.
+                    let use_amount_flow = amount_vx.is_some() && amount_vy.is_some();
+
+                    if !use_amount_flow {
+                        // ── Flujo legacy: N clicks de confirm ─────────
+                        match self.buy_phase {
+                            0 => {
                                 tracing::info!(
-                                    "BuyItem[{}] complete: {} clicks done, advancing",
-                                    idx, self.buy_clicks_done
+                                    "BuyItem[{}] legacy phase 0: select item at ({}, {}), quantity={}. If wrong position, edit script: item_vx={}, item_vy={}",
+                                    idx, item_vx, item_vy, quantity, item_vx, item_vy
                                 );
-                                self.buy_phase = 0;
+                                self.buy_phase = 1;
+                                self.buy_last_click_tick = ctx.tick;
                                 self.buy_clicks_done = 0;
+                                return CavebotAction::Click { vx: item_vx, vy: item_vy };
+                            }
+                            1 => {
+                                if self.buy_clicks_done >= quantity {
+                                    tracing::info!(
+                                        "BuyItem[{}] legacy complete: {} clicks done, advancing",
+                                        idx, self.buy_clicks_done
+                                    );
+                                    self.buy_phase = 0;
+                                    self.buy_clicks_done = 0;
+                                    self.advance(ctx.tick);
+                                    continue;
+                                }
+                                let elapsed = ctx.tick.saturating_sub(self.buy_last_click_tick);
+                                if elapsed >= spacing_ticks {
+                                    self.buy_clicks_done += 1;
+                                    if self.buy_clicks_done == 1 {
+                                        tracing::info!(
+                                            "BuyItem[{}] legacy phase 1: confirm at ({}, {}) × {}. If wrong, edit: confirm_vx={}, confirm_vy={}",
+                                            idx, confirm_vx, confirm_vy, quantity, confirm_vx, confirm_vy
+                                        );
+                                    }
+                                    self.buy_last_click_tick = ctx.tick;
+                                    return CavebotAction::Click { vx: confirm_vx, vy: confirm_vy };
+                                }
+                                return CavebotAction::Idle;
+                            }
+                            _ => {
+                                tracing::warn!("BuyItem[{}] legacy invalid phase {}, resetting", idx, self.buy_phase);
+                                self.buy_phase = 0;
                                 self.advance(ctx.tick);
                                 continue;
                             }
-                            let elapsed = ctx.tick.saturating_sub(self.buy_last_click_tick);
-                            if elapsed >= spacing_ticks {
-                                self.buy_clicks_done += 1;
-                                if self.buy_clicks_done == 1 {
-                                    // Solo loggear el primer click para no spammear.
-                                    tracing::info!(
-                                        "BuyItem[{}] phase 1: confirm at ({}, {}) × {}. If wrong, edit: confirm_vx={}, confirm_vy={}",
-                                        idx, confirm_vx, confirm_vy, quantity, confirm_vx, confirm_vy
-                                    );
-                                }
-                                self.buy_last_click_tick = ctx.tick;
-                                return CavebotAction::Click { vx: confirm_vx, vy: confirm_vy };
+                        }
+                    }
+
+                    // ── Flujo Amount (Tibia 12): tipear dígitos + 1 click ─
+                    //
+                    // Los amount_* son Some por el check de arriba; unwrap
+                    // es seguro en este branch.
+                    let amt_vx = amount_vx.expect("amount_vx guarded by use_amount_flow");
+                    let amt_vy = amount_vy.expect("amount_vy guarded by use_amount_flow");
+                    let qty_str = quantity.to_string();
+
+                    let post_item_ticks   = ms_to_ticks(POST_ITEM_CLICK_MS, self.fps).max(1);
+                    let post_amount_ticks = ms_to_ticks(POST_AMOUNT_CLICK_MS, self.fps).max(1);
+                    let post_digits_ticks = ms_to_ticks(POST_DIGITS_MS, self.fps).max(1);
+                    let inter_digit_ticks = ms_to_ticks(spacing_ms / 2, self.fps).max(1);
+
+                    match self.buy_phase {
+                        0 => {
+                            // Phase 0: click item (select row).
+                            tracing::info!(
+                                "BuyItem[{}] amount phase 0: select item at ({}, {}), quantity={}. amount_field=({}, {})",
+                                idx, item_vx, item_vy, quantity, amt_vx, amt_vy
+                            );
+                            self.buy_phase = 1;
+                            self.buy_last_click_tick = ctx.tick;
+                            self.buy_amount_digit_idx = 0;
+                            return CavebotAction::Click { vx: item_vx, vy: item_vy };
+                        }
+                        1 => {
+                            // Phase 1: esperar 200ms → click amount field.
+                            if ctx.tick.saturating_sub(self.buy_last_click_tick) < post_item_ticks {
+                                return CavebotAction::Idle;
                             }
-                            return CavebotAction::Idle;
+                            tracing::info!(
+                                "BuyItem[{}] amount phase 1: click amount field at ({}, {})",
+                                idx, amt_vx, amt_vy
+                            );
+                            self.buy_phase = 2;
+                            self.buy_last_click_tick = ctx.tick;
+                            return CavebotAction::Click { vx: amt_vx, vy: amt_vy };
+                        }
+                        2 => {
+                            // Phase 2: esperar 150ms → entrar loop de dígitos.
+                            if ctx.tick.saturating_sub(self.buy_last_click_tick) < post_amount_ticks {
+                                return CavebotAction::Idle;
+                            }
+                            self.buy_phase = 3;
+                            self.buy_last_click_tick = ctx.tick;
+                            continue; // re-entrar en phase 3 en este mismo tick
+                        }
+                        3 => {
+                            // Phase 3: emitir KeyTap del dígito actual.
+                            if self.buy_amount_digit_idx >= qty_str.len() {
+                                // Ya no quedan dígitos → pasar a wait post-digits.
+                                self.buy_phase = 4;
+                                self.buy_last_click_tick = ctx.tick;
+                                return CavebotAction::Idle;
+                            }
+                            let ch = qty_str.as_bytes()[self.buy_amount_digit_idx] as char;
+                            // Convertir '0'-'9' a HID code via helper compartido.
+                            let hid = crate::act::keycode::ascii_to_hid(ch)
+                                .expect("digit '0'-'9' siempre convertible a HID");
+                            tracing::info!(
+                                "BuyItem[{}] amount phase 3: typing digit '{}' (HID 0x{:02X}), idx {}/{}",
+                                idx, ch, hid, self.buy_amount_digit_idx + 1, qty_str.len()
+                            );
+                            self.buy_amount_digit_idx += 1;
+                            self.buy_phase = 4;
+                            self.buy_last_click_tick = ctx.tick;
+                            return CavebotAction::KeyTap(hid);
+                        }
+                        4 => {
+                            // Phase 4: spacing entre dígitos o post-last.
+                            let more_digits = self.buy_amount_digit_idx < qty_str.len();
+                            let wait_ticks = if more_digits {
+                                inter_digit_ticks
+                            } else {
+                                post_digits_ticks
+                            };
+                            if ctx.tick.saturating_sub(self.buy_last_click_tick) < wait_ticks {
+                                return CavebotAction::Idle;
+                            }
+                            if more_digits {
+                                // Volver a phase 3 para el siguiente dígito.
+                                self.buy_phase = 3;
+                                continue;
+                            }
+                            // Todos los dígitos tipeados + wait post-digits
+                            // cumplido → click de confirm.
+                            self.buy_phase = 5;
+                            continue;
+                        }
+                        5 => {
+                            // Phase 5: click confirm (1 sola vez).
+                            tracing::info!(
+                                "BuyItem[{}] amount phase 5: single confirm click at ({}, {}) for quantity={}",
+                                idx, confirm_vx, confirm_vy, quantity
+                            );
+                            self.buy_phase = 6;
+                            self.buy_last_click_tick = ctx.tick;
+                            return CavebotAction::Click { vx: confirm_vx, vy: confirm_vy };
+                        }
+                        6 => {
+                            // Phase 6: wait spacing_ms post-confirm → advance.
+                            if ctx.tick.saturating_sub(self.buy_last_click_tick) < spacing_ticks {
+                                return CavebotAction::Idle;
+                            }
+                            tracing::info!(
+                                "BuyItem[{}] amount complete: typed '{}' + 1 confirm click, advancing",
+                                idx, qty_str
+                            );
+                            self.buy_phase = 0;
+                            self.buy_amount_digit_idx = 0;
+                            self.advance(ctx.tick);
+                            continue;
                         }
                         _ => {
-                            tracing::warn!("BuyItem[{}] invalid phase {}, resetting", idx, self.buy_phase);
+                            tracing::warn!("BuyItem[{}] amount invalid phase {}, resetting", idx, self.buy_phase);
                             self.buy_phase = 0;
+                            self.buy_amount_digit_idx = 0;
                             self.advance(ctx.tick);
                             continue;
                         }
@@ -753,6 +1036,111 @@ impl Cavebot {
                     );
                     self.jump_to(on_fail_idx, ctx.tick);
                     continue;
+                }
+
+                // ── TypeInField ───────────────────────────────────────
+                //
+                // Click al field + tipear `text` char a char + wait final +
+                // advance. Pensado para el search field de la trade window
+                // de Tibia 12 (a diferencia del chat, no wrapea con Enter).
+                //
+                // Fases (ver doc de `StepKind::TypeInField`):
+                //   0 = emit Click en (field_vx, field_vy)
+                //   1 = wait wait_after_click_ms
+                //   2 = loop: emit KeyTap del char actual + wait char_spacing_ms
+                //   3 = wait wait_after_type_ms
+                //   4 = advance (handled by fall-through a phase 3 terminando)
+                //
+                // Chars no-mapeables (mayúsculas, símbolos) → log warn y skip.
+                StepKind::TypeInField {
+                    field_vx, field_vy, text,
+                    wait_after_click_ms, wait_after_type_ms, char_spacing_ms,
+                } => {
+                    match self.type_field_phase {
+                        0 => {
+                            // Phase 0: click al field para que tome focus.
+                            tracing::info!(
+                                "TypeInField[{}] phase 0: click field at ({}, {}), will type '{}' ({} chars)",
+                                idx, field_vx, field_vy, text, text.chars().count()
+                            );
+                            self.type_field_phase = 1;
+                            self.type_field_phase_start = ctx.tick;
+                            self.type_field_char_idx = 0;
+                            return CavebotAction::Click { vx: field_vx, vy: field_vy };
+                        }
+                        1 => {
+                            // Phase 1: wait wait_after_click_ms.
+                            let wait_ticks = ms_to_ticks(wait_after_click_ms, self.fps);
+                            if ctx.tick.saturating_sub(self.type_field_phase_start) >= wait_ticks {
+                                self.type_field_phase = 2;
+                                self.type_field_phase_start = ctx.tick;
+                                continue; // re-entrar en phase 2 este mismo tick
+                            }
+                            return CavebotAction::Idle;
+                        }
+                        2 => {
+                            // Phase 2: tipear chars uno a uno. Skipea los
+                            // no-mapeables con warn.
+                            let text_bytes = text.as_bytes();
+                            // Skip chars no-mapeables hasta encontrar uno válido o fin de string.
+                            while self.type_field_char_idx < text_bytes.len() {
+                                let ch = text_bytes[self.type_field_char_idx] as char;
+                                if let Some(hid) = crate::act::keycode::ascii_to_hid(ch) {
+                                    // Respetar spacing: solo emitir si ya pasaron
+                                    // char_spacing_ms desde el último tap. El primer
+                                    // tap (char_idx=0) emite inmediatamente porque
+                                    // el phase_start se seteó al entrar a phase 2.
+                                    let spacing_ticks = ms_to_ticks(char_spacing_ms, self.fps);
+                                    let first_char = self.type_field_char_idx == 0;
+                                    let elapsed = ctx.tick.saturating_sub(self.type_field_phase_start);
+                                    if !first_char && elapsed < spacing_ticks {
+                                        return CavebotAction::Idle;
+                                    }
+                                    tracing::debug!(
+                                        "TypeInField[{}] phase 2: tap '{}' (HID 0x{:02X}), idx {}/{}",
+                                        idx, ch, hid,
+                                        self.type_field_char_idx + 1, text_bytes.len()
+                                    );
+                                    self.type_field_char_idx += 1;
+                                    self.type_field_phase_start = ctx.tick;
+                                    return CavebotAction::KeyTap(hid);
+                                }
+                                // No-mapeable: warn + skip SIN consumir tick
+                                // para que no degrademos la cadencia.
+                                tracing::warn!(
+                                    "TypeInField[{}]: char '{}' (idx {}) no mapeable a HID — skipping",
+                                    idx, ch, self.type_field_char_idx
+                                );
+                                self.type_field_char_idx += 1;
+                            }
+                            // Todos los chars procesados → pasar a wait_after_type.
+                            self.type_field_phase = 3;
+                            self.type_field_phase_start = ctx.tick;
+                            return CavebotAction::Idle;
+                        }
+                        3 => {
+                            // Phase 3: wait wait_after_type_ms → advance.
+                            let wait_ticks = ms_to_ticks(wait_after_type_ms, self.fps);
+                            if ctx.tick.saturating_sub(self.type_field_phase_start) >= wait_ticks {
+                                tracing::info!("TypeInField[{}] complete, advancing", idx);
+                                self.type_field_phase = 0;
+                                self.type_field_char_idx = 0;
+                                self.advance(ctx.tick);
+                                continue;
+                            }
+                            return CavebotAction::Idle;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "TypeInField[{}] invalid phase {}, resetting",
+                                idx, self.type_field_phase
+                            );
+                            self.type_field_phase = 0;
+                            self.type_field_char_idx = 0;
+                            self.advance(ctx.tick);
+                            continue;
+                        }
+                    }
                 }
 
                 // ── SkipIfBlocked ──────────────────────────────────────
@@ -805,6 +1193,9 @@ impl Cavebot {
         self.loot_clicks_done = 0;
         self.npc_phrase_idx = 0;
         self.npc_wait_start = None;
+        self.open_trade_phase = 0;
+        self.open_trade_phrase_idx = 0;
+        self.open_trade_phase_start = 0;
         self.stuck_walk_ticks = 0;
         self.needs_kills_baseline = true;
         self.deposit_phase = 0;
@@ -812,11 +1203,15 @@ impl Cavebot {
         self.buy_phase = 0;
         self.buy_clicks_done = 0;
         self.buy_last_click_tick = 0;
+        self.buy_amount_digit_idx = 0;
         self.stow_phase = 0;
         self.stow_phase_start = 0;
         self.stow_iterations_done = 0;
         self.stow_baseline_counts = None;
         self.stow_stale_iters = 0;
+        self.type_field_phase = 0;
+        self.type_field_char_idx = 0;
+        self.type_field_phase_start = 0;
         self.reset_node_state();
     }
 
@@ -864,17 +1259,24 @@ impl Cavebot {
             self.loot_clicks_done = 0;
             self.npc_phrase_idx = 0;
             self.npc_wait_start = None;
+            self.open_trade_phase = 0;
+            self.open_trade_phrase_idx = 0;
+            self.open_trade_phase_start = 0;
             self.stuck_walk_ticks = 0;
             self.deposit_phase = 0;
             self.deposit_phase_start = 0;
             self.buy_phase = 0;
             self.buy_clicks_done = 0;
             self.buy_last_click_tick = 0;
+            self.buy_amount_digit_idx = 0;
             self.stow_phase = 0;
             self.stow_phase_start = 0;
             self.stow_iterations_done = 0;
             self.stow_baseline_counts = None;
             self.stow_stale_iters = 0;
+            self.type_field_phase = 0;
+            self.type_field_char_idx = 0;
+            self.type_field_phase_start = 0;
             self.needs_kills_baseline = true;
             self.reset_node_state();
         } else {
@@ -1333,10 +1735,32 @@ impl Cavebot {
                 self.loot_clicks_done = 0;
                 self.npc_phrase_idx = 0;
                 self.npc_wait_start = None;
+                self.open_trade_phase = 0;
+                self.open_trade_phrase_idx = 0;
+                self.open_trade_phase_start = 0;
                 self.stuck_walk_ticks = 0;
+                self.buy_phase = 0;
+                self.buy_clicks_done = 0;
+                self.buy_last_click_tick = 0;
+                self.buy_amount_digit_idx = 0;
+                self.type_field_phase = 0;
+                self.type_field_char_idx = 0;
+                self.type_field_phase_start = 0;
                 self.reset_node_state();
             }
         }
+    }
+
+    /// Salto forzado a un label nombrado, usado por el graceful session-cap.
+    ///
+    /// A diferencia de `jump_to_label` (pensado para hot-reload), este método
+    /// existe para inyecciones externas al cavebot (p. ej. emergency refill
+    /// disparado desde el game loop). Semánticamente es un wrapper fino pero
+    /// deja explícito el call-site. Retorna `false` si el label no existe en
+    /// el script actual; el llamante debe decidir qué hacer (loggear, pausar).
+    #[allow(dead_code)] // wired desde core::loop_ (session warning)
+    pub fn force_goto_label(&mut self, name: &str, tick: u64) -> bool {
+        self.jump_to_label(name, tick)
     }
 
 }
@@ -1814,6 +2238,130 @@ mod tests {
         // Simular interrupción por combate + restart.
         cb.restart_current_step(100);
         // Tras restart, debe reemitir desde la primera frase.
+        let mut c = ctx(100);
+        assert_eq!(cb.tick(&mut c), CavebotAction::Say("hi".into()));
+    }
+
+    // ── OpenNpcTrade (greeting + click en bag button) ─────────────────
+
+    /// Fase 0 → 1 → 2 → 3 → advance con 1 sola frase:
+    ///   tick 0: Say("hi"), phase→1 no aún (phrase_idx++, sigue en 0)
+    ///   tick 1: transición a phase 1, registra phase_start=1, Idle
+    ///   tick 2..24: Idle (wait_button_ms=800 → 24 ticks @ 30Hz)
+    ///   tick 25: Click bag button, phase→2, phase_start=25
+    ///   tick 26..39: Idle (POST_CLICK_WAIT_MS=500 → 15 ticks @ 30Hz)
+    ///   tick 40: advance → next step emits
+    #[test]
+    fn open_npc_trade_full_phase_progression() {
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::OpenNpcTrade {
+                    greeting_phrases: vec!["hi".into()],
+                    bag_button_vx: 350,
+                    bag_button_vy: 400,
+                    wait_button_ms: 800,
+                }),
+                step(StepKind::Hotkey { hidcode: 0xBB }),
+            ],
+            false, 30,
+        );
+        // Tick 0: primera frase → Say("hi"). phrase_idx=1 pero aún en fase 0.
+        assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::Say("hi".into()));
+
+        // Tick 1: sin más frases, transiciona a fase 1 con phase_start=1
+        // y devuelve Idle.
+        assert_eq!(cb.tick(&mut ctx(1)), CavebotAction::Idle);
+
+        // 800ms @ 30fps = 24 ticks. phase_start=1 → click emite en tick 25
+        // (25-1=24 >= 24).
+        for t in 2..25 {
+            assert_eq!(
+                cb.tick(&mut ctx(t)), CavebotAction::Idle,
+                "phase 1 wait tick {}", t
+            );
+        }
+        // Tick 25: wait cumplido → Click bag button → phase→2.
+        assert_eq!(
+            cb.tick(&mut ctx(25)),
+            CavebotAction::Click { vx: 350, vy: 400 }
+        );
+
+        // 500ms @ 30fps = 15 ticks. phase_start=25 → advance en tick 40.
+        for t in 26..40 {
+            assert_eq!(
+                cb.tick(&mut ctx(t)), CavebotAction::Idle,
+                "phase 2 wait tick {}", t
+            );
+        }
+        // Tick 40: post-click wait cumplido → advance al Hotkey → emit.
+        assert_eq!(cb.tick(&mut ctx(40)), CavebotAction::KeyTap(0xBB));
+    }
+
+    /// Con múltiples greeting_phrases, se emiten una por tick antes de
+    /// pasar a fase 1.
+    #[test]
+    fn open_npc_trade_emits_multiple_greeting_phrases_in_order() {
+        let mut cb = Cavebot::new(
+            vec![step(StepKind::OpenNpcTrade {
+                greeting_phrases: vec!["hi".into(), "yes".into()],
+                bag_button_vx: 100,
+                bag_button_vy: 200,
+                wait_button_ms: 0, // sin wait para test focused en fase 0
+            })],
+            false, 30,
+        );
+        // Tick 0: primera frase.
+        assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::Say("hi".into()));
+        // Tick 1: segunda frase.
+        assert_eq!(cb.tick(&mut ctx(1)), CavebotAction::Say("yes".into()));
+    }
+
+    /// Con wait_button_ms=0, fase 1 cumple en el tick de transición (wait=0).
+    #[test]
+    fn open_npc_trade_with_zero_wait_button_ms_advances_fast() {
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::OpenNpcTrade {
+                    greeting_phrases: vec!["hi".into()],
+                    bag_button_vx: 42,
+                    bag_button_vy: 43,
+                    wait_button_ms: 0,
+                }),
+                step(StepKind::Hotkey { hidcode: 0xAA }),
+            ],
+            false, 30,
+        );
+        // Tick 0: Say.
+        assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::Say("hi".into()));
+        // Tick 1: transición a fase 1 → Idle (el click no se emite el mismo
+        // tick; se chequea el timer en el siguiente tick).
+        assert_eq!(cb.tick(&mut ctx(1)), CavebotAction::Idle);
+        // Tick 2: fase 1 chequea wait_ticks=0 → cumple → emit Click.
+        assert_eq!(
+            cb.tick(&mut ctx(2)),
+            CavebotAction::Click { vx: 42, vy: 43 }
+        );
+    }
+
+    /// restart_current_step (tras salir de Fighting/Emergency) debe
+    /// resetear el estado interno del step — debe re-emitir desde la
+    /// primera frase.
+    #[test]
+    fn open_npc_trade_resets_on_restart_current_step() {
+        let mut cb = Cavebot::new(
+            vec![step(StepKind::OpenNpcTrade {
+                greeting_phrases: vec!["hi".into(), "yes".into()],
+                bag_button_vx: 1,
+                bag_button_vy: 2,
+                wait_button_ms: 500,
+            })],
+            false, 30,
+        );
+        // Consumir la primera frase.
+        assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::Say("hi".into()));
+        // Simular restart (combate + return to walking).
+        cb.restart_current_step(100);
+        // Tras restart, debe re-emitir desde la primera frase.
         let mut c = ctx(100);
         assert_eq!(cb.tick(&mut c), CavebotAction::Say("hi".into()));
     }
@@ -2385,11 +2933,13 @@ mod tests {
     }
 
     #[test]
-    fn buy_item_emits_select_then_confirm_loop() {
+    fn buy_item_legacy_emits_select_then_confirm_loop() {
+        // Flujo legacy: amount_* = None → N clicks de confirm.
         let mut cb = Cavebot::new(
             vec![
                 step(StepKind::BuyItem {
                     item_vx: 120, item_vy: 340,
+                    amount_vx: None, amount_vy: None,
                     confirm_vx: 300, confirm_vy: 520,
                     quantity: 3, spacing_ms: 100,
                 }),
@@ -2418,6 +2968,230 @@ mod tests {
         assert_eq!(cb.buy_clicks_done, 3);
         // Tick 10: advance → Hotkey 0xBB.
         assert_eq!(cb.tick(&mut ctx(10)), CavebotAction::KeyTap(0xBB));
+    }
+
+    /// Flujo Amount (Tibia 12): valida que las 9 fases se ejecuten en orden
+    /// con los KeyTap de cada dígito en medio y un solo click de confirm al
+    /// final. Usa quantity=12 → tipea '1', '2' (HID 0x1E, 0x1F).
+    ///
+    /// Timing con fps=30, spacing_ms=100:
+    ///   - spacing_ticks        = 3
+    ///   - post_item_ticks      = 6  (200ms)
+    ///   - post_amount_ticks    = 5  (150ms, ceil)
+    ///   - post_digits_ticks    = 5  (150ms, ceil)
+    ///   - inter_digit_ticks    = 2  (50ms, ceil)
+    #[test]
+    fn buy_item_amount_flow_types_digits_then_single_confirm() {
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::BuyItem {
+                    item_vx: 120, item_vy: 340,
+                    amount_vx: Some(500), amount_vy: Some(500),
+                    confirm_vx: 900, confirm_vy: 700,
+                    quantity: 12, spacing_ms: 100,
+                }),
+                step(StepKind::Hotkey { hidcode: 0xCC }),
+            ],
+            false, 30,
+        );
+
+        // t=0: phase 0 → click item, phase=1.
+        assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::Click { vx: 120, vy: 340 });
+        assert_eq!(cb.buy_phase, 1);
+
+        // t=1..5: phase 1 esperando post_item (6 ticks) → Idle.
+        for t in 1..=5 {
+            assert_eq!(cb.tick(&mut ctx(t)), CavebotAction::Idle, "t={}", t);
+        }
+
+        // t=6: phase 1 cumplido → click amount, phase=2.
+        assert_eq!(cb.tick(&mut ctx(6)), CavebotAction::Click { vx: 500, vy: 500 });
+        assert_eq!(cb.buy_phase, 2);
+
+        // t=7..10: phase 2 esperando post_amount (5 ticks) → Idle.
+        for t in 7..=10 {
+            assert_eq!(cb.tick(&mut ctx(t)), CavebotAction::Idle, "t={}", t);
+        }
+
+        // t=11: phase 2 cumplido → continue → phase 3 emite KeyTap('1').
+        //       '1' → HID 0x1E.
+        assert_eq!(cb.tick(&mut ctx(11)), CavebotAction::KeyTap(0x1E));
+        assert_eq!(cb.buy_amount_digit_idx, 1);
+        assert_eq!(cb.buy_phase, 4);
+
+        // t=12: phase 4 entre dígitos, elapsed=1 < 2 → Idle.
+        assert_eq!(cb.tick(&mut ctx(12)), CavebotAction::Idle);
+
+        // t=13: phase 4 cumplido → phase 3 → KeyTap('2') = HID 0x1F.
+        assert_eq!(cb.tick(&mut ctx(13)), CavebotAction::KeyTap(0x1F));
+        assert_eq!(cb.buy_amount_digit_idx, 2);
+        assert_eq!(cb.buy_phase, 4);
+
+        // t=14..17: phase 4 post-digits wait (5 ticks) → Idle.
+        for t in 14..=17 {
+            assert_eq!(cb.tick(&mut ctx(t)), CavebotAction::Idle, "t={}", t);
+        }
+
+        // t=18: phase 4 cumplido → phase 5 → Click confirm (UNA sola vez).
+        assert_eq!(cb.tick(&mut ctx(18)), CavebotAction::Click { vx: 900, vy: 700 });
+        assert_eq!(cb.buy_phase, 6);
+
+        // t=19, 20: phase 6 esperando spacing_ms (3 ticks) → Idle.
+        assert_eq!(cb.tick(&mut ctx(19)), CavebotAction::Idle);
+        assert_eq!(cb.tick(&mut ctx(20)), CavebotAction::Idle);
+
+        // t=21: phase 6 cumplido → advance → Hotkey 0xCC.
+        assert_eq!(cb.tick(&mut ctx(21)), CavebotAction::KeyTap(0xCC));
+    }
+
+    /// El flujo Amount debe emitir EXACTAMENTE un click de confirm,
+    /// independientemente de quantity. Ese es el cambio semántico clave
+    /// vs el legacy (que emitía N clicks).
+    #[test]
+    fn buy_item_amount_flow_emits_exactly_one_confirm_click() {
+        // quantity=100 → 3 dígitos '1','0','0'. Si el flujo legacy se
+        // activara por error, vendrían 100 clicks al confirm.
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::BuyItem {
+                    item_vx: 10, item_vy: 20,
+                    amount_vx: Some(30), amount_vy: Some(40),
+                    confirm_vx: 50, confirm_vy: 60,
+                    quantity: 100, spacing_ms: 100,
+                }),
+                step(StepKind::Hotkey { hidcode: 0xDD }),
+            ],
+            false, 30,
+        );
+
+        let mut confirm_click_count = 0;
+        let mut keytaps: Vec<u8> = Vec::new();
+        let mut advanced = false;
+
+        // Simular hasta advance o un límite generoso.
+        for t in 0..200 {
+            let action = cb.tick(&mut ctx(t));
+            match action {
+                CavebotAction::Click { vx: 50, vy: 60 } => confirm_click_count += 1,
+                CavebotAction::KeyTap(hid) => {
+                    if hid == 0xDD {
+                        // Llegamos al Hotkey siguiente → advance ejecutado.
+                        advanced = true;
+                        break;
+                    }
+                    keytaps.push(hid);
+                }
+                _ => {}
+            }
+        }
+
+        assert!(advanced, "BuyItem amount flow no avanzó tras 200 ticks");
+        assert_eq!(
+            confirm_click_count, 1,
+            "amount flow debe emitir EXACTAMENTE 1 click al confirm, no {}",
+            confirm_click_count
+        );
+        // 3 dígitos tipeados: '1', '0', '0' → 0x1E, 0x27, 0x27.
+        assert_eq!(keytaps, vec![0x1E, 0x27, 0x27]);
+    }
+
+    /// Si solo uno de amount_vx/amount_vy está presente, el parser debe
+    /// rechazar explícitamente para evitar ambigüedad silenciosa.
+    #[test]
+    fn buy_item_parser_rejects_only_one_amount_coord() {
+        use crate::cavebot::parser;
+        use std::io::Write;
+        use std::path::Path;
+
+        let tmp = std::env::temp_dir().join("buy_item_half_amount.toml");
+        let src = r#"
+            [[step]]
+            kind = "buy_item"
+            item_vx = 100
+            item_vy = 200
+            amount_vx = 300
+            confirm_vx = 400
+            confirm_vy = 500
+            quantity = 10
+        "#;
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        drop(f);
+        let r = parser::load(Path::new(&tmp), 30);
+        let _ = std::fs::remove_file(&tmp);
+        assert!(r.is_err(), "buy_item con solo amount_vx debe ser error");
+    }
+
+    /// Backward-compat del parser: un buy_item sin amount_* debe parsear OK
+    /// y crear un StepKind::BuyItem con amount_vx=None, amount_vy=None.
+    #[test]
+    fn buy_item_parser_accepts_no_amount_fields_legacy() {
+        use crate::cavebot::parser;
+        use std::io::Write;
+        use std::path::Path;
+
+        let tmp = std::env::temp_dir().join("buy_item_legacy.toml");
+        let src = r#"
+            [[step]]
+            kind = "buy_item"
+            item_vx = 100
+            item_vy = 200
+            confirm_vx = 400
+            confirm_vy = 500
+            quantity = 5
+            spacing_ms = 200
+        "#;
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        drop(f);
+        let cb = parser::load(Path::new(&tmp), 30).expect("legacy buy_item debe parsear");
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(cb.steps.len(), 1);
+        match &cb.steps[0].kind {
+            StepKind::BuyItem { amount_vx, amount_vy, quantity, spacing_ms, .. } => {
+                assert_eq!(*amount_vx, None);
+                assert_eq!(*amount_vy, None);
+                assert_eq!(*quantity, 5);
+                assert_eq!(*spacing_ms, 200);
+            }
+            _ => panic!("expected BuyItem"),
+        }
+    }
+
+    /// Parser acepta buy_item con AMBOS amount_vx y amount_vy presentes
+    /// y construye el StepKind con Some(_) en ambos.
+    #[test]
+    fn buy_item_parser_accepts_full_amount_fields() {
+        use crate::cavebot::parser;
+        use std::io::Write;
+        use std::path::Path;
+
+        let tmp = std::env::temp_dir().join("buy_item_amount.toml");
+        let src = r#"
+            [[step]]
+            kind = "buy_item"
+            item_vx = 100
+            item_vy = 200
+            amount_vx = 300
+            amount_vy = 310
+            confirm_vx = 400
+            confirm_vy = 500
+            quantity = 100
+            spacing_ms = 250
+        "#;
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        drop(f);
+        let cb = parser::load(Path::new(&tmp), 30).expect("amount buy_item debe parsear");
+        let _ = std::fs::remove_file(&tmp);
+        match &cb.steps[0].kind {
+            StepKind::BuyItem { amount_vx, amount_vy, quantity, .. } => {
+                assert_eq!(*amount_vx, Some(300));
+                assert_eq!(*amount_vy, Some(310));
+                assert_eq!(*quantity, 100);
+            }
+            _ => panic!("expected BuyItem"),
+        }
     }
 
     #[test]
@@ -2730,5 +3504,130 @@ mod tests {
     fn node_no_minimap_skips() {
         let mut cb = cavebot_with_prev_node((110, 200, 7), (100, 200, 7));
         assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::KeyTap(0xCC));
+    }
+
+    // ── TypeInField (click + tipeo en input field no-chat) ───────────
+
+    /// Fase 0 emite Click al field; luego, tras el wait post-click, la
+    /// fase 2 emite un KeyTap por cada caracter mapeable respetando
+    /// `char_spacing_ms` entre ellos; al final wait_after_type_ms + advance.
+    #[test]
+    fn type_in_field_clicks_then_types_each_char_with_spacing() {
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::TypeInField {
+                    field_vx: 426,
+                    field_vy: 261,
+                    text: "abc".into(),
+                    wait_after_click_ms: 100, // 3 ticks @ 30Hz
+                    wait_after_type_ms:  100, // 3 ticks @ 30Hz
+                    char_spacing_ms:     100, // 3 ticks @ 30Hz
+                }),
+                step(StepKind::Hotkey { hidcode: 0xCC }),
+            ],
+            false, 30,
+        );
+        // Tick 0: phase 0 → Click al field.
+        assert_eq!(
+            cb.tick(&mut ctx(0)),
+            CavebotAction::Click { vx: 426, vy: 261 }
+        );
+        // Phase 1 wait_after_click_ms = 100ms @ 30fps = 3 ticks.
+        // phase_start=0, cumple en tick 3 (3-0 >= 3) → re-entra phase 2 y
+        // emite inmediatamente el primer char 'a' (HID 0x04).
+        assert_eq!(cb.tick(&mut ctx(1)), CavebotAction::Idle);
+        assert_eq!(cb.tick(&mut ctx(2)), CavebotAction::Idle);
+        assert_eq!(cb.tick(&mut ctx(3)), CavebotAction::KeyTap(0x04));
+        // Spacing 100ms = 3 ticks entre taps. Idle ticks 4..5, tap en tick 6.
+        assert_eq!(cb.tick(&mut ctx(4)), CavebotAction::Idle);
+        assert_eq!(cb.tick(&mut ctx(5)), CavebotAction::Idle);
+        assert_eq!(cb.tick(&mut ctx(6)), CavebotAction::KeyTap(0x05)); // 'b'
+        // Spacing otra vez → tap 'c' en tick 9.
+        assert_eq!(cb.tick(&mut ctx(7)), CavebotAction::Idle);
+        assert_eq!(cb.tick(&mut ctx(8)), CavebotAction::Idle);
+        assert_eq!(cb.tick(&mut ctx(9)), CavebotAction::KeyTap(0x06)); // 'c'
+        // Transición a phase 3 (wait_after_type) → Idle, luego 3 ticks.
+        // tick 10 re-entra phase 2, ve char_idx fuera de rango, pasa a phase 3
+        // con phase_start=10, devuelve Idle.
+        assert_eq!(cb.tick(&mut ctx(10)), CavebotAction::Idle);
+        assert_eq!(cb.tick(&mut ctx(11)), CavebotAction::Idle);
+        assert_eq!(cb.tick(&mut ctx(12)), CavebotAction::Idle);
+        // Tick 13: wait cumplido → advance al Hotkey → emit 0xCC.
+        assert_eq!(cb.tick(&mut ctx(13)), CavebotAction::KeyTap(0xCC));
+    }
+
+    /// text="ab" → exactamente KeyTap(0x04) para 'a' y KeyTap(0x05) para 'b'
+    /// tras el Click inicial. Verifica el mapeo ASCII→HID del subset soportado.
+    #[test]
+    fn type_in_field_text_ab_emits_exact_hid_codes() {
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::TypeInField {
+                    field_vx: 10,
+                    field_vy: 20,
+                    text: "ab".into(),
+                    wait_after_click_ms: 0,
+                    wait_after_type_ms:  0,
+                    char_spacing_ms:     0, // sin espera entre chars
+                }),
+                step(StepKind::Hotkey { hidcode: 0xEE }),
+            ],
+            false, 30,
+        );
+        // Tick 0: Click.
+        assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::Click { vx: 10, vy: 20 });
+        // Tick 1: phase 1 wait=0 cumple, continue a phase 2, tap 'a' → 0x04.
+        assert_eq!(cb.tick(&mut ctx(1)), CavebotAction::KeyTap(0x04));
+        // Tick 2: spacing=0 → primer tick ya cumple threshold, tap 'b' → 0x05.
+        assert_eq!(cb.tick(&mut ctx(2)), CavebotAction::KeyTap(0x05));
+    }
+
+    /// Chars no-mapeables (mayúsculas, símbolos) se skipean con warn sin panic.
+    /// Solo emite KeyTaps por los chars soportados.
+    #[test]
+    fn type_in_field_skips_unmappable_chars_without_panic() {
+        // 'A' (mayúscula) y '!' no son mapeables; 'b' sí.
+        let mut cb = Cavebot::new(
+            vec![step(StepKind::TypeInField {
+                field_vx: 0, field_vy: 0,
+                text: "A!b".into(),
+                wait_after_click_ms: 0,
+                wait_after_type_ms:  0,
+                char_spacing_ms:     0,
+            })],
+            false, 30,
+        );
+        // Click.
+        assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::Click { vx: 0, vy: 0 });
+        // Phase 2 skipea 'A' y '!' en el mismo tick y emite KeyTap para 'b'.
+        assert_eq!(cb.tick(&mut ctx(1)), CavebotAction::KeyTap(0x05)); // 'b'
+    }
+
+    /// Tras restart_current_step, el step debe re-emitir desde la fase 0
+    /// (el click inicial) porque el focus del input no está garantizado tras
+    /// una interrupción de combate.
+    #[test]
+    fn type_in_field_resets_on_restart_current_step() {
+        let mut cb = Cavebot::new(
+            vec![step(StepKind::TypeInField {
+                field_vx: 1, field_vy: 2,
+                text: "ab".into(),
+                wait_after_click_ms: 0,
+                wait_after_type_ms:  0,
+                char_spacing_ms:     0,
+            })],
+            false, 30,
+        );
+        // Consumir click + primer tap.
+        assert_eq!(cb.tick(&mut ctx(0)), CavebotAction::Click { vx: 1, vy: 2 });
+        assert_eq!(cb.tick(&mut ctx(1)), CavebotAction::KeyTap(0x04)); // 'a'
+        // Restart: debe volver a fase 0 (click), NO seguir tipeando 'b'.
+        cb.restart_current_step(100);
+        assert_eq!(cb.type_field_phase, 0);
+        assert_eq!(cb.type_field_char_idx, 0);
+        assert_eq!(
+            cb.tick(&mut ctx(100)),
+            CavebotAction::Click { vx: 1, vy: 2 }
+        );
     }
 }

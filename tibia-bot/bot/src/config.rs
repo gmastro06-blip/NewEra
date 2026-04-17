@@ -256,6 +256,13 @@ pub struct GameCoordsConfig {
     /// CSV de pisos a cargar en el matcher (ej "6,7,8"). Vacío/None = todos
     /// los pisos del directorio (consume más RAM, ~70 MB vs ~15 MB por piso).
     pub matcher_floors: Option<String>,
+    /// Si true (default), el matcher valida cada candidato ganador con un
+    /// segundo patch de la esquina opuesta del minimap. Rechaza falsos
+    /// positivos donde varios sectores muestran score SSD similar.
+    ///
+    /// Setear a `false` para debug / A-B testing del comportamiento
+    /// pre-fix.
+    pub disambiguation_enabled: bool,
 }
 
 impl Default for GameCoordsConfig {
@@ -267,6 +274,7 @@ impl Default for GameCoordsConfig {
             minimap_dir:       String::new(),
             matcher_threshold: 0.0,
             matcher_floors:    None,
+            disambiguation_enabled: true,
         }
     }
 }
@@ -402,6 +410,12 @@ pub struct SafetyConfig {
     /// Previene farmeo indefinido (detección estadística) + da ventana
     /// de recovery natural. `0.0` = deshabilitado (no cap).
     pub max_session_hours: f64,
+    /// Margen (en minutos) antes del cap durante el cual el bot fuerza un
+    /// emergency refill cycle saltando al label "refill" del cavebot, si
+    /// existe. Objetivo: llegar al depot y vaciar el bag antes del hard
+    /// cap, en lugar de pausar con loot expuesto mid-hunt. `0.0` =
+    /// deshabilitado (solo dispara el hard cap vía `is_expired`).
+    pub session_warning_min: f64,
 
     // ── Human noise ──────────────────────────────────────────────────────
     pub human_noise_enabled: bool,
@@ -436,6 +450,7 @@ impl Default for SafetyConfig {
             heal_potion_weight:     30,
             breaks_enabled:         false, // off por default, opt-in
             max_session_hours:      0.0,   // 0 = deshabilitado por default
+            session_warning_min:    5.0,   // 5 min de margen para graceful refill
             human_noise_enabled:    false,
             human_noise_keys:       vec![],
             human_noise_interval_mean_s: 180.0,

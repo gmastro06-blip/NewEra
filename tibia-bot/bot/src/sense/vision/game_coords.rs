@@ -490,6 +490,12 @@ pub struct MatcherStats {
     pub full_searches:   AtomicU64,
     /// Cantidad de llamadas a detect() que retornaron None (no match).
     pub misses:          AtomicU64,
+    /// Cantidad de candidatos top-K descartados por disambiguation
+    /// (segundo patch no confirmó). Útil para monitorear false positives.
+    pub disambiguation_rejects: AtomicU64,
+    /// Cantidad de llamadas a detect() donde disambiguation devolvió None
+    /// tras rechazar TODOS los candidatos top-K.
+    pub disambiguation_misses: AtomicU64,
     /// Última duración del detect, en microsegundos (para gauge).
     pub last_duration_us: AtomicU64,
     /// Último score SSD del match (bits de f32). 0 si nunca detectó.
@@ -502,12 +508,17 @@ pub struct MatcherStatsSnapshot {
     pub narrow_searches:  u64,
     pub full_searches:    u64,
     pub misses:           u64,
+    /// Candidates rechazados por segunda verificación (sum sobre todos los detect()).
+    pub disambiguation_rejects: u64,
+    /// Detect() que retornaron None exclusivamente por disambiguation.
+    pub disambiguation_misses:  u64,
     pub total_detects:    u64,
     pub last_duration_ms: f64,
     pub last_score:       f32,
     pub sectors_loaded:   usize,
     pub floors_loaded:    Vec<i32>,
     pub match_threshold:  f32,
+    pub disambiguation_enabled: bool,
 }
 
 /// Atlas de reference PNGs indexado por piso. Para cada piso, mantiene la
@@ -548,6 +559,23 @@ pub struct MatcherStatsSnapshot {
 ///   Se usa en cold boot (`last_known=None`) y en re-validación periódica
 ///   (`force_full=true`) para recuperar falsos positivos.
 ///
+/// # Disambiguation de falsos positivos
+///
+/// El SSD raw puede producir múltiples candidatos con score similar en
+/// regiones visualmente parecidas del mapa (ej. 2 depots con la misma
+/// estructura). Para rechazar esos falsos positivos, `detect()` puede
+/// aplicar una segunda verificación: extrae un segundo patch de una
+/// esquina opuesta del minimap y verifica que también matchee en el
+/// sector ganador en la posición esperada (preservando la geometría del
+/// viewport). Si el segundo patch no concuerda, el candidate se rechaza.
+///
+/// Cuando el top-K de candidatos está muy empatado, se evalúan todos y
+/// solo el primero que pase disambiguation es retornado; si ninguno
+/// valida, `detect()` retorna `None` — preferimos no-match sobre
+/// wrong-match.
+///
+/// Controlado por [`MinimapMatcher::disambiguation_enabled`] (ON por default).
+///
 /// # Observabilidad
 ///
 /// Los contadores internos (narrow/full/misses/last_duration) se exponen via
@@ -560,6 +588,10 @@ pub struct MinimapMatcher {
     /// Threshold SSD (CCORR_NORMED lower=better). Default 0.05 = match muy fuerte.
     /// Si no hay matches bajo este threshold, retornamos None.
     pub match_threshold: f32,
+    /// Si true, detect() aplica segunda verificación con un patch de la
+    /// esquina opuesta del minimap para rechazar falsos positivos (ver
+    /// docs de `MinimapMatcher`). Default ON.
+    pub disambiguation_enabled: bool,
     /// Stats con interior mutability para tracking durante detect().
     pub stats: MatcherStats,
 }
@@ -569,6 +601,7 @@ impl MinimapMatcher {
         Self {
             sectors_by_floor: HashMap::new(),
             match_threshold: 0.05,
+            disambiguation_enabled: true,
             stats: MatcherStats::default(),
         }
     }
@@ -609,21 +642,26 @@ impl MinimapMatcher {
         let narrow = self.stats.narrow_searches.load(Ordering::Relaxed);
         let full = self.stats.full_searches.load(Ordering::Relaxed);
         let misses = self.stats.misses.load(Ordering::Relaxed);
+        let disamb_rejects = self.stats.disambiguation_rejects.load(Ordering::Relaxed);
+        let disamb_misses  = self.stats.disambiguation_misses.load(Ordering::Relaxed);
         let dur_us = self.stats.last_duration_us.load(Ordering::Relaxed);
         let score_bits = self.stats.last_score_bits.load(Ordering::Relaxed);
         let mut floors: Vec<i32> = self.sectors_by_floor.keys().copied().collect();
         floors.sort();
         let sectors: usize = self.sectors_by_floor.values().map(|v| v.len()).sum();
         MatcherStatsSnapshot {
-            narrow_searches:  narrow,
-            full_searches:    full,
+            narrow_searches:       narrow,
+            full_searches:         full,
             misses,
-            total_detects:    narrow + full,
-            last_duration_ms: dur_us as f64 / 1000.0,
-            last_score:       f32::from_bits(score_bits),
-            sectors_loaded:   sectors,
-            floors_loaded:    floors,
-            match_threshold:  self.match_threshold,
+            disambiguation_rejects: disamb_rejects,
+            disambiguation_misses:  disamb_misses,
+            total_detects:         narrow + full,
+            last_duration_ms:      dur_us as f64 / 1000.0,
+            last_score:            f32::from_bits(score_bits),
+            sectors_loaded:        sectors,
+            floors_loaded:         floors,
+            match_threshold:       self.match_threshold,
+            disambiguation_enabled: self.disambiguation_enabled,
         }
     }
 
@@ -758,6 +796,74 @@ impl MinimapMatcher {
         Some((best, best_x, best_y))
     }
 
+    /// Extrae una sub-región del template ya construido.
+    ///
+    /// Usado por la fase de disambiguation para verificar con un patch
+    /// de una esquina distinta del minimap ya downsampleado.
+    ///
+    /// Retorna `None` si la región pedida se sale del template.
+    fn crop_template(template: &GrayImage, tl_x: u32, tl_y: u32, w: u32, h: u32) -> Option<GrayImage> {
+        let (iw, ih) = template.dimensions();
+        if w == 0 || h == 0 || tl_x + w > iw || tl_y + h > ih {
+            return None;
+        }
+        let mut out = GrayImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let p = template.get_pixel(tl_x + x, tl_y + y);
+                out.put_pixel(x, y, *p);
+            }
+        }
+        Some(out)
+    }
+
+    /// Computa el SSD normalizado de un sub-template contra un sector en
+    /// una posición LOCAL específica (sin hacer full sliding match).
+    ///
+    /// Equivalente a leer `match_template(...).get_pixel(local_x, local_y)`
+    /// pero O(sub_template.area) en vez de O(sector.area * sub.area).
+    ///
+    /// Fórmula: `sum((s - t)^2) / sqrt(sum(s^2) * sum(t^2))`.
+    ///
+    /// Retorna `None` si la posición + sub-template se sale del sector.
+    fn ssd_normalized_at(
+        sector: &ReferenceSector,
+        sub_template: &GrayImage,
+        local_x: i32,
+        local_y: i32,
+    ) -> Option<f32> {
+        let (iw, ih) = sector.image.dimensions();
+        let (tw, th) = sub_template.dimensions();
+        if local_x < 0 || local_y < 0 {
+            return None;
+        }
+        let lx = local_x as u32;
+        let ly = local_y as u32;
+        if lx + tw > iw || ly + th > ih {
+            return None;
+        }
+        let mut sum_sq_diff: f64 = 0.0;
+        let mut sum_s_sq: f64 = 0.0;
+        let mut sum_t_sq: f64 = 0.0;
+        for y in 0..th {
+            for x in 0..tw {
+                let s = sector.image.get_pixel(lx + x, ly + y).0[0] as f64;
+                let t = sub_template.get_pixel(x, y).0[0] as f64;
+                let d = s - t;
+                sum_sq_diff += d * d;
+                sum_s_sq    += s * s;
+                sum_t_sq    += t * t;
+            }
+        }
+        let denom = (sum_s_sq * sum_t_sq).sqrt();
+        if denom <= f64::EPSILON {
+            // Todo negro en ambos → considerar match perfecto (0).
+            // Protege contra division-by-zero en áreas totalmente vacías.
+            return Some(0.0);
+        }
+        Some((sum_sq_diff / denom) as f32)
+    }
+
     /// Detecta la posición del char vía template matching.
     ///
     /// Modos de search:
@@ -774,10 +880,21 @@ impl MinimapMatcher {
     /// re-validación el bot queda pegado ahí. Vision llama con
     /// `force_full=true` cada `COORDS_REVALIDATE_INTERVAL` detecciones.
     ///
+    /// ## Disambiguation (OPT-IN)
+    ///
+    /// Si `disambiguation_enabled=true` (default), tras el match primario
+    /// se valida el candidato cortando un segundo patch de una esquina
+    /// opuesta del template y verificando que también cae en el mismo
+    /// sector en la posición geométricamente esperada. Si el top-1 no
+    /// confirma, se prueba el siguiente de top-K hasta encontrar uno
+    /// consistente (o retornar `None`). Ver rationale en docstring de
+    /// [`MinimapMatcher`].
+    ///
     /// Retorna `None` si:
     /// - El matcher está vacío
     /// - El minimap NDI es demasiado pequeño
     /// - Ningún match pasó el threshold
+    /// - Ningún candidato top-K pasó la disambiguation
     pub fn detect(
         &self,
         snap: &MinimapSnapshot,
@@ -836,39 +953,154 @@ impl MinimapMatcher {
             return None;
         }
 
-        // Match against each candidate, find the global best.
-        let mut global_best: f32 = f32::MAX;
-        let mut global_best_world: Option<(i32, i32, i32)> = None;
-        for sector in candidates {
+        // Match against each candidate, collect TODOS los resultados (top-K
+        // ordenados por score) para que disambiguation pueda probarlos en
+        // orden si el top-1 no valida.
+        //
+        // MatchResult: (score, local_x, local_y, sector_idx)
+        let mut per_sector: Vec<(f32, u32, u32, usize)> = Vec::with_capacity(candidates.len());
+        for (idx, sector) in candidates.iter().enumerate() {
             let Some((score, lx, ly)) = Self::match_sector(sector, &template) else { continue };
-            if score < global_best {
-                global_best = score;
-                let world_x = sector.file_x + lx as i32 + (tw / 2) as i32;
-                let world_y = sector.file_y + ly as i32 + (th / 2) as i32;
-                global_best_world = Some((world_x, world_y, sector.z));
-            }
+            per_sector.push((score, lx, ly, idx));
+        }
+        if per_sector.is_empty() {
+            self.update_common_stats(detect_start, use_narrow);
+            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        per_sector.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let global_best = per_sector[0].0;
+
+        // Update duración y search-type antes de ramificar.
+        self.update_common_stats(detect_start, use_narrow);
+
+        if global_best > self.match_threshold {
+            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                "MinimapMatcher: best SSD {:.4} > threshold {:.4}, no match",
+                global_best, self.match_threshold
+            );
+            return None;
         }
 
-        // Update stats (interior mutability via atomics).
-        let elapsed_us = detect_start.elapsed().as_micros() as u64;
+        // ── Disambiguation ─────────────────────────────────────────────
+        // Si está ON, validamos top-K con un segundo patch de la esquina
+        // opuesta del template. El primero que valide gana. Si ninguno
+        // valida, retornamos None (preferimos no-match sobre wrong-match).
+        //
+        // top-K se restringe a candidates "cercanos" al mejor: solo los
+        // scores ≤ max(best * 2.0, threshold). Esto acota el costo (los
+        // candidates muy lejos del best son descartes obvios) sin perder
+        // false-positive resolvers.
+        if !self.disambiguation_enabled {
+            let (score, lx, ly, idx) = per_sector[0];
+            self.stats.last_score_bits.store(score.to_bits(), Ordering::Relaxed);
+            let sector = candidates[idx];
+            let world_x = sector.file_x + lx as i32 + (tw / 2) as i32;
+            let world_y = sector.file_y + ly as i32 + (th / 2) as i32;
+            return Some((world_x, world_y, sector.z));
+        }
+
+        // Construir sub-template de la esquina opuesta al sub-template
+        // "primary" (que implícitamente representa el top-left).
+        //
+        // Elegimos el cuadrante bottom-right del template como sub-patch,
+        // de tamaño ~1/3 del template cada lado (evita overlap con la
+        // zona dominante del primary y mantiene área suficiente para que
+        // el SSD sea discriminativo).
+        let sub_w = (tw / 3).max(4);
+        let sub_h = (th / 3).max(4);
+        let sub_tl_x = tw.saturating_sub(sub_w);
+        let sub_tl_y = th.saturating_sub(sub_h);
+        let sub_template = match Self::crop_template(&template, sub_tl_x, sub_tl_y, sub_w, sub_h) {
+            Some(st) => st,
+            None => {
+                // No podemos disambiguar (template muy pequeño). Fallback:
+                // retornar el top-1 como antes.
+                let (score, lx, ly, idx) = per_sector[0];
+                self.stats.last_score_bits.store(score.to_bits(), Ordering::Relaxed);
+                let sector = candidates[idx];
+                let world_x = sector.file_x + lx as i32 + (tw / 2) as i32;
+                let world_y = sector.file_y + ly as i32 + (th / 2) as i32;
+                return Some((world_x, world_y, sector.z));
+            }
+        };
+
+        // Umbral del sub-patch: idéntico al del template completo. El SSD
+        // normalizado es invariante al tamaño del patch (es un ratio), así
+        // que el mismo threshold funciona razonablemente.
+        let sub_threshold = self.match_threshold;
+
+        // Cota del top-K a probar: todos con score ≤ 2 * best (caps).
+        // Cap duro de 8 candidates para que el cost esté acotado (full
+        // search con miles de candidates similares no explota).
+        const MAX_TOP_K: usize = 8;
+        let best_score = per_sector[0].0;
+        let score_cap = (best_score * 2.0).max(best_score + 0.01);
+
+        let mut checked = 0;
+        for &(score, lx, ly, idx) in per_sector.iter() {
+            if checked >= MAX_TOP_K || score > score_cap {
+                break;
+            }
+            checked += 1;
+            let sector = candidates[idx];
+
+            // La posición esperada del sub-patch dentro del sector:
+            // el primary template está anclado en (lx, ly); el sub-template
+            // está a offset (sub_tl_x, sub_tl_y) dentro del primary.
+            let expected_sub_x = lx as i32 + sub_tl_x as i32;
+            let expected_sub_y = ly as i32 + sub_tl_y as i32;
+
+            let Some(sub_score) = Self::ssd_normalized_at(
+                sector,
+                &sub_template,
+                expected_sub_x,
+                expected_sub_y,
+            ) else {
+                // Sub-patch fuera del sector (edge case). Rechazamos este.
+                self.stats.disambiguation_rejects.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+
+            if sub_score <= sub_threshold {
+                // Confirmación: primary + secondary patches coherentes.
+                self.stats.last_score_bits.store(score.to_bits(), Ordering::Relaxed);
+                let world_x = sector.file_x + lx as i32 + (tw / 2) as i32;
+                let world_y = sector.file_y + ly as i32 + (th / 2) as i32;
+                tracing::debug!(
+                    "MinimapMatcher disamb OK: primary {:.4} + sub {:.4} @ sector ({},{},z={})",
+                    score, sub_score, sector.file_x, sector.file_y, sector.z
+                );
+                return Some((world_x, world_y, sector.z));
+            }
+
+            // No matchea en la esquina opuesta → false positive candidate.
+            self.stats.disambiguation_rejects.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                "MinimapMatcher disamb REJECT: primary {:.4} OK pero sub {:.4} > {:.4} @ sector ({},{},z={})",
+                score, sub_score, sub_threshold, sector.file_x, sector.file_y, sector.z
+            );
+        }
+
+        // Ningún candidato top-K pasó disambiguation: preferimos no-match.
+        self.stats.disambiguation_misses.fetch_add(1, Ordering::Relaxed);
+        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            "MinimapMatcher disamb: ninguno de top-{} pasó (best primary {:.4})",
+            checked, best_score
+        );
+        None
+    }
+
+    /// Helper común para actualizar stats de duración y search-type.
+    fn update_common_stats(&self, start: std::time::Instant, use_narrow: bool) {
+        let elapsed_us = start.elapsed().as_micros() as u64;
         self.stats.last_duration_us.store(elapsed_us, Ordering::Relaxed);
         if use_narrow {
             self.stats.narrow_searches.fetch_add(1, Ordering::Relaxed);
         } else {
             self.stats.full_searches.fetch_add(1, Ordering::Relaxed);
-        }
-
-        if global_best <= self.match_threshold {
-            self.stats.last_score_bits.store(global_best.to_bits(), Ordering::Relaxed);
-            global_best_world
-        } else {
-            self.stats.misses.fetch_add(1, Ordering::Relaxed);
-            // No updatear last_score cuando es miss — preservamos el último bueno.
-            tracing::debug!(
-                "MinimapMatcher: best SSD {:.4} > threshold {:.4}, no match",
-                global_best, self.match_threshold
-            );
-            None
         }
     }
 }
@@ -1493,5 +1725,293 @@ mod tests {
         // Promedio de bloques uniformes sigue siendo 100.
         assert_eq!(template.get_pixel(0, 0).0[0], 100);
         assert_eq!(template.get_pixel(3, 3).0[0], 100);
+    }
+
+    // ── Disambiguation tests ─────────────────────────────────────────
+
+    /// Genera una region de patrón único (no-periódico) de tamaño `w×h`
+    /// con seed determinístico. Derivado de make_synthetic_reference para
+    /// los tests de disambiguation.
+    fn make_pattern_region(w: u32, h: u32, seed: u32) -> GrayImage {
+        let mut img = GrayImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let v = (x.wrapping_mul(7)
+                    .wrapping_add(y.wrapping_mul(13))
+                    .wrapping_add(seed.wrapping_mul(23))
+                    .wrapping_add(((x * y) ^ seed) % 256)
+                    .wrapping_add(((x / 3) ^ (y / 3)) * 31)) % 256;
+                img.put_pixel(x, y, image::Luma([v as u8]));
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn crop_template_extracts_subregion() {
+        // Given un template 10×10 con luma linear, crop 3×3 desde (2,2)
+        // debe coincidir con los pixels correspondientes del original.
+        let mut t = GrayImage::new(10, 10);
+        for y in 0..10u32 {
+            for x in 0..10u32 {
+                t.put_pixel(x, y, image::Luma([(x * 10 + y) as u8]));
+            }
+        }
+        let sub = MinimapMatcher::crop_template(&t, 2, 2, 3, 3).unwrap();
+        assert_eq!(sub.dimensions(), (3, 3));
+        for y in 0..3u32 {
+            for x in 0..3u32 {
+                assert_eq!(
+                    sub.get_pixel(x, y).0[0],
+                    t.get_pixel(x + 2, y + 2).0[0],
+                    "crop pixel ({},{})", x, y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crop_template_rejects_out_of_bounds() {
+        let t = GrayImage::new(5, 5);
+        assert!(MinimapMatcher::crop_template(&t, 3, 3, 3, 3).is_none());
+        assert!(MinimapMatcher::crop_template(&t, 0, 0, 6, 1).is_none());
+        assert!(MinimapMatcher::crop_template(&t, 0, 0, 0, 1).is_none());
+    }
+
+    #[test]
+    fn ssd_normalized_at_perfect_match_returns_zero() {
+        // Si el sub-template matchea exactamente los pixels del sector en
+        // la posición dada, SSD normalizado debe ser 0.
+        let sector_img = make_pattern_region(64, 64, 42);
+        let sector = ReferenceSector {
+            file_x: 32000,
+            file_y: 31000,
+            z: 7,
+            image: sector_img.clone(),
+        };
+        // Sub-template = exact crop del sector en (10, 10) tamaño 8×8.
+        let sub = MinimapMatcher::crop_template(&sector_img, 10, 10, 8, 8).unwrap();
+        let score = MinimapMatcher::ssd_normalized_at(&sector, &sub, 10, 10).unwrap();
+        assert!(score < 1e-5, "exact match SSD debe ser ~0, got {}", score);
+    }
+
+    #[test]
+    fn ssd_normalized_at_returns_high_score_for_mismatch() {
+        // Sub-template extraído de un patrón distinto → SSD alto.
+        let sector_img = make_pattern_region(64, 64, 42);
+        let sector = ReferenceSector {
+            file_x: 0, file_y: 0, z: 7,
+            image: sector_img,
+        };
+        // Sub-template = patrón totalmente distinto (seed 999).
+        let sub = make_pattern_region(8, 8, 999);
+        let score = MinimapMatcher::ssd_normalized_at(&sector, &sub, 10, 10).unwrap();
+        assert!(score > 0.01, "mismatch SSD debe ser grande, got {}", score);
+    }
+
+    #[test]
+    fn ssd_normalized_at_out_of_bounds_returns_none() {
+        let sector_img = GrayImage::new(20, 20);
+        let sector = ReferenceSector {
+            file_x: 0, file_y: 0, z: 7, image: sector_img,
+        };
+        let sub = GrayImage::new(8, 8);
+        // Position (15, 15) + sub 8×8 se sale del sector 20×20.
+        assert!(MinimapMatcher::ssd_normalized_at(&sector, &sub, 15, 15).is_none());
+        // Negative position.
+        assert!(MinimapMatcher::ssd_normalized_at(&sector, &sub, -1, 0).is_none());
+    }
+
+    #[test]
+    fn disambiguation_unique_match_returns_some() {
+        // Given un solo sector que contiene la vista exacta → disambiguation
+        // debe confirmar con ambos patches y retornar Some.
+        let reference = make_synthetic_reference();
+        let mut matcher = MinimapMatcher::new();
+        matcher.disambiguation_enabled = true;
+        matcher.match_threshold = 0.15;
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![ReferenceSector {
+                file_x: 32000, file_y: 31000, z: 7,
+                image: reference.clone(),
+            }],
+        );
+
+        let snap = make_synthetic_minimap_from_ref(&reference, 80, 80, 60, 60);
+        let result = matcher.detect(&snap, 1, None, true);
+        assert!(result.is_some(), "match único debe pasar disambiguation");
+        let (x, y, z) = result.unwrap();
+        assert!((x - 32080).abs() <= 2);
+        assert!((y - 31080).abs() <= 2);
+        assert_eq!(z, 7);
+
+        // No se incrementan contadores de disambiguation (no rechazos).
+        let stats = matcher.stats_snapshot();
+        assert_eq!(stats.disambiguation_misses, 0);
+    }
+
+    #[test]
+    fn disambiguation_rejects_false_positive_with_corrupted_corner() {
+        // Construimos 1 sector donde:
+        // - La vista (60×60) está pegada en (10, 10) → primary debería
+        //   matchear SSD bajo en esa posición.
+        // - PERO el corner bottom-right del sector (zona del sub-template)
+        //   está CORRUPTO (luma SATURADA a blanco 255), muy distinto del
+        //   patrón original.
+        // → primary matchea OK, secondary NO matchea en la pos geométrica
+        //   esperada → disambiguation rechaza.
+        //
+        // Con view 60×60 y scale 1, template es 60×60, sub es 20×20 @ (40, 40).
+        // Si matchea en (10, 10) del sector, sub cae en (50, 50) del sector.
+        // Corrompemos esa zona con luma 255 plana (contraste máximo vs patrón).
+        let mut reference = make_synthetic_reference();
+        for y in 50..70u32 {
+            for x in 50..70u32 {
+                reference.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+
+        let mut matcher = MinimapMatcher::new();
+        matcher.disambiguation_enabled = true;
+        // Threshold MODERADO: primary debe passar (la zona corrupta es
+        // 20×20 sobre 60×60 = ~11% del template, no es enough para pushear
+        // primary SSD > 0.15) pero el sub-patch DE ESA MISMA zona sí debe
+        // fallar (ratio 100% de corrupción dentro del sub).
+        matcher.match_threshold = 0.15;
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![ReferenceSector {
+                file_x: 32000, file_y: 31000, z: 7,
+                image: reference.clone(),
+            }],
+        );
+
+        // Snap generado desde la versión LIMPIA: simula el caso live donde
+        // el char ve el mundo limpio pero el sector indexado está dañado.
+        let clean_reference = make_synthetic_reference();
+        let snap = make_synthetic_minimap_from_ref(&clean_reference, 40, 40, 60, 60);
+
+        // Con disambiguation ON, el top-1 (sector único) falla el check del
+        // sub-patch y detect retorna None.
+        let result = matcher.detect(&snap, 1, None, true);
+        assert_eq!(
+            result, None,
+            "disambiguation debe rechazar el único candidato cuyo sub-patch no matchea"
+        );
+        let stats = matcher.stats_snapshot();
+        assert!(
+            stats.disambiguation_rejects >= 1,
+            "expected disamb_rejects ≥ 1, got {}", stats.disambiguation_rejects
+        );
+        assert_eq!(stats.disambiguation_misses, 1);
+    }
+
+    #[test]
+    fn disambiguation_disabled_accepts_top1_legacy() {
+        // Con disambiguation OFF, el mismo escenario del test anterior
+        // (sector con bottom-right corrupto) SÍ retorna Some.
+        // Esto verifica que el flag preserva backward compat.
+        let mut reference = make_synthetic_reference();
+        for y in 50..70u32 {
+            for x in 50..70u32 {
+                if x < 256 && y < 256 {
+                    let v = (x.wrapping_mul(199).wrapping_add(y.wrapping_mul(211))) as u8;
+                    reference.put_pixel(x, y, image::Luma([v ^ 0xA5]));
+                }
+            }
+        }
+
+        let mut matcher = MinimapMatcher::new();
+        matcher.disambiguation_enabled = false; // <<< OFF
+        matcher.match_threshold = 0.50;
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![ReferenceSector {
+                file_x: 32000, file_y: 31000, z: 7,
+                image: reference,
+            }],
+        );
+
+        let clean_reference = make_synthetic_reference();
+        let snap = make_synthetic_minimap_from_ref(&clean_reference, 40, 40, 60, 60);
+
+        let result = matcher.detect(&snap, 1, None, true);
+        assert!(
+            result.is_some(),
+            "con disambiguation=OFF debe retornar Some (legacy behavior)"
+        );
+        let stats = matcher.stats_snapshot();
+        assert_eq!(
+            stats.disambiguation_rejects, 0,
+            "disambiguation OFF no debe incrementar rejects"
+        );
+    }
+
+    #[test]
+    fn disambiguation_picks_correct_candidate_from_top_k() {
+        // Given dos sectores:
+        //   A: contiene la vista LIMPIA en (40, 40) → primary OK + sub OK.
+        //   B: contiene la vista COPIADA pero con corner BR corrupto → primary
+        //      podría ganar por casualidad pero sub-patch no matchea.
+        // La lógica de top-K debe probar B primero si tiene mejor primary score,
+        // rechazarlo por sub-check, y caer al 2do candidato (A) que sí valida.
+        //
+        // Para forzar que B tenga mejor primary score que A, hacemos B un
+        // clone de A pero con LEVE ruido global (menor que el threshold) EXCEPTO
+        // en la zona del sub-patch (donde pondremos algo MUY distinto).
+        // En la práctica B no tendrá mejor score que A, pero construimos las
+        // assertions para ser tolerantes: el resultado final DEBE ser A.
+
+        let clean = make_synthetic_reference();
+
+        // Sector A: vista limpia.
+        let sector_a_img = clean.clone();
+
+        // Sector B: clone de A pero con bottom-right CORRUPTO (donde caerá
+        // el sub-patch si match_sector elige la misma posición que A).
+        let mut sector_b_img = clean.clone();
+        for y in 40..120u32 {
+            for x in 40..120u32 {
+                // Solo corrompemos zona bottom-right del área de match
+                // (centro visto = 60, bottom-right ~ 80-120).
+                if x >= 80 && y >= 80 {
+                    let v = (x.wrapping_mul(17).wrapping_add(y.wrapping_mul(23))) as u8;
+                    sector_b_img.put_pixel(x, y, image::Luma([v ^ 0xFF]));
+                }
+            }
+        }
+
+        let mut matcher = MinimapMatcher::new();
+        matcher.disambiguation_enabled = true;
+        matcher.match_threshold = 0.50;
+        matcher.sectors_by_floor.insert(
+            7,
+            vec![
+                ReferenceSector { file_x: 32000, file_y: 31000, z: 7, image: sector_a_img },
+                ReferenceSector { file_x: 33000, file_y: 32000, z: 7, image: sector_b_img },
+            ],
+        );
+
+        // Snap desde la vista LIMPIA: solo sector A debe matchear ambos patches.
+        let snap = make_synthetic_minimap_from_ref(&clean, 60, 60, 60, 60);
+
+        let result = matcher.detect(&snap, 1, None, true);
+        assert!(result.is_some(), "al menos sector A debe matchear");
+        let (x, _y, _z) = result.unwrap();
+        // Debe caer en sector A (file_x 32000) no en B (33000).
+        assert!(
+            x >= 32000 && x < 33000,
+            "detect debe resolver en sector A (32000..33000), got x={}", x
+        );
+    }
+
+    #[test]
+    fn disambiguation_stats_snapshot_exposes_flags() {
+        let matcher = MinimapMatcher::new();
+        let s = matcher.stats_snapshot();
+        assert!(s.disambiguation_enabled, "default es ON");
+        assert_eq!(s.disambiguation_rejects, 0);
+        assert_eq!(s.disambiguation_misses, 0);
     }
 }

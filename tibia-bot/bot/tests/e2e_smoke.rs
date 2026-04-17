@@ -353,15 +353,18 @@ fn matcher_stats_snapshot_serializable() {
     use tibia_bot::sense::vision::game_coords::{MatcherStatsSnapshot};
 
     let snap = MatcherStatsSnapshot {
-        narrow_searches:  10,
-        full_searches:    2,
-        misses:           1,
-        total_detects:    12,
-        last_duration_ms: 85.3,
-        last_score:       0.0436,
-        sectors_loaded:   224,
-        floors_loaded:    vec![6, 7, 8],
-        match_threshold:  0.10,
+        narrow_searches:         10,
+        full_searches:           2,
+        misses:                  1,
+        disambiguation_rejects:  3,
+        disambiguation_misses:   1,
+        total_detects:           12,
+        last_duration_ms:        85.3,
+        last_score:              0.0436,
+        sectors_loaded:          224,
+        floors_loaded:           vec![6, 7, 8],
+        match_threshold:         0.10,
+        disambiguation_enabled:  true,
     };
 
     let json = serde_json::to_string(&snap).expect("serde serialize OK");
