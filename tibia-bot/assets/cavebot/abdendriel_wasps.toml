@@ -190,9 +190,14 @@ max_wait_ms = 5000
 # Alternativa futura: añadir sell_item step al cavebot runner.
 
 # Buy 100 mana potions
+# Este NPC (Ashari Aelzerand Neeymas) vende "magical equipment" — al decir
+# "trade" responde ofreciendo filtrar por "potions / wands / runes". Para
+# abrir la trade window con mana potions hay que decir "potions", no "trade".
+# "hi" abre el greeting + text dialog. Segunda frase "potions" filtra la
+# lista a potions y abre la trade window automáticamente.
 [[step]]
 kind = "npc_dialog"
-phrases = ["hi", "trade"]
+phrases = ["hi", "potions"]
 wait_prompt_ms = 1500
 
 # Calibrado live 2026-04-17 con hover mouse + GetCursorPos sobre la trade

@@ -47,10 +47,15 @@ idle_timeout_secs = 10
 # comandos HID (MOUSE_MOVE, MOUSE_CLICK, KEY_TAP) para evitar que keystrokes
 # y clicks vayan a la ventana equivocada. PING y RESET siempre pasan.
 #
-# Deshabilitado por defecto para compatibilidad.
-enabled = false
+# RECOMENDADO PARA PRODUCCIÓN: enabled = true. Protección contra alt-tab
+# accidental que mandaría inputs a la ventana equivocada (detección anti-bot
+# o simplemente bugs visibles).
+enabled = true
 # Substring a buscar en el título de la ventana activa.
 # Tibia usa "Tibia - NombrePersonaje" como título.
 window_title_contains = "Tibia"
 # Intervalo de polling en ms. 100ms es suficiente (el bot corre a 30Hz = 33ms).
 poll_interval_ms = 100
+# Polls consecutivos "sin foco" antes de declarar pérdida real.
+# 5 × 100ms = 500ms debounce — evita pausar por popups cortos (notifs, tooltips).
+debounce_count = 5

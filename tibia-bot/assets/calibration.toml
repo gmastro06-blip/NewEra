@@ -36,6 +36,20 @@ game_viewport = { x = 388, y = 94, w = 967, h = 708 }
 # npc_trade: panel "Commerce" de shopkeeper (left sidebar del juego).
 prompt_npc_trade   = { x = 50,  y = 25,  w = 420, h = 650 }
 
+# login: modal de login del cliente cuando se pierde sesión (server save,
+# disconnect, kick). Tibia 12 muestra un panel central grande con campos
+# account/password + logos del cliente. ROI cubre la zona central típica.
+# NOTA: coords son PLACEHOLDER — refinar capturando frame real con el login
+# modal abierto y medir con GIMP. Template en assets/templates/prompts/login.png.
+prompt_login       = { x = 560, y = 220, w = 800, h = 600 }
+
+# char_select: lista de personajes post-login y post-muerte (Tibia no tiene
+# "death screen" separada — va directo a char select). Panel central con
+# lista de chars + botones Login/Cancel.
+# NOTA: coords son PLACEHOLDER — refinar con frame real. Template en
+# assets/templates/prompts/char_select.png.
+prompt_char_select = { x = 600, y = 200, w = 720, h = 650 }
+
 # ── UI genérica (depot chest, menús contextuales) ────────────────────────────
 # ROIs de búsqueda para los templates de assets/templates/ui/.
 # Calibrar con GIMP sobre un frame real con la ventana abierta.
