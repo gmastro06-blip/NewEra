@@ -20,7 +20,7 @@
 //! hasta que vuelva a Walking. Esto congela los timers del step actual,
 //! que se restartearán al volver (ver `restart_current_step`).
 
-use crate::cavebot::step::{Step, StepKind, StandUntil, StepVerify, VerifyCheck, VerifyFailAction};
+use crate::cavebot::step::{Step, StepKind, StandUntil, VerifyCheck, VerifyFailAction};
 
 /// Ticks consecutivos sin movimiento antes de declarar stuck y avanzar el step.
 /// 60 ticks @ 30Hz = 2 segundos empujando contra una pared → abandonar dirección.
@@ -167,6 +167,11 @@ pub struct Cavebot {
     pub steps: Vec<Step>,
     /// `true` si al terminar la lista debe volver al inicio.
     pub loop_: bool,
+    /// Nombre del hunt profile declarado en `[cavebot].hunt_profile` del TOML
+    /// (si cargó correctamente). Expuesto en `/cavebot/status` para
+    /// observability — ayuda a confirmar que el profile correcto está activo
+    /// antes de una sesión live.
+    pub hunt_profile: Option<String>,
     /// Index del step activo. `None` = terminado (solo relevante si `!loop_`).
     pub current: Option<usize>,
     /// Tick en el que se entró al step actual.
@@ -317,10 +322,24 @@ impl Cavebot {
 
     /// Crea un cavebot con tuning custom (desde config).
     pub fn with_tuning(steps: Vec<Step>, loop_: bool, fps: u32, tuning: NodeTuning) -> Self {
+        Self::with_tuning_and_profile(steps, loop_, fps, tuning, None)
+    }
+
+    /// Versión completa de `with_tuning` que también acepta el nombre del
+    /// hunt profile (si el TOML lo declaró). Usada por el parser; los tests
+    /// pueden seguir usando `with_tuning` sin profile.
+    pub fn with_tuning_and_profile(
+        steps:        Vec<Step>,
+        loop_:        bool,
+        fps:          u32,
+        tuning:       NodeTuning,
+        hunt_profile: Option<String>,
+    ) -> Self {
         let current = if steps.is_empty() { None } else { Some(0) };
         Self {
             steps,
             loop_,
+            hunt_profile,
             current,
             started_tick: 0,
             last_emit_tick: None,
@@ -388,6 +407,8 @@ impl Cavebot {
             current_label: label,
             current_kind:  kind,
             loop_:         self.loop_,
+            hunt_profile:  self.hunt_profile.clone(),
+            verifying:     self.verifying.is_some(),
         }
     }
 

@@ -410,7 +410,13 @@ fn build_cavebot(
         }
     }
 
-    Ok(Cavebot::with_tuning(steps, file.cavebot.loop_, fps, tuning))
+    Ok(Cavebot::with_tuning_and_profile(
+        steps,
+        file.cavebot.loop_,
+        fps,
+        tuning,
+        hunt_profile.map(|p| p.name),
+    ))
 }
 
 // ── StepToml → Step ──────────────────────────────────────────────────────────

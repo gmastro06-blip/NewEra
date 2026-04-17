@@ -1397,6 +1397,13 @@ struct CavebotStatusResponse {
     current_label: Option<String>,
     current_kind:  String,
     fsm_state:     String,
+    /// Nombre del hunt profile cargado (si el TOML declara
+    /// `[cavebot].hunt_profile`). `null` si ninguno.
+    hunt_profile:  Option<String>,
+    /// `true` si el step actual está en fase de verify poll (post-acción,
+    /// esperando que se cumpla su postcondition). Distinto de `fsm_state`
+    /// — el cavebot puede estar verifying mientras el FSM sigue en Walking.
+    verifying:     bool,
 }
 
 async fn handle_cavebot_status(State(s): State<AppState>) -> Json<CavebotStatusResponse> {
@@ -1410,6 +1417,8 @@ async fn handle_cavebot_status(State(s): State<AppState>) -> Json<CavebotStatusR
         current_label: g.cavebot_status.current_label.clone(),
         current_kind:  g.cavebot_status.current_kind.clone(),
         fsm_state:     format!("{:?}", g.fsm_state),
+        hunt_profile:  g.cavebot_status.hunt_profile.clone(),
+        verifying:     g.cavebot_status.verifying,
     })
 }
 

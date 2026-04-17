@@ -420,3 +420,89 @@ fn starting_coord_absent_leaves_last_game_coords_unchanged() {
         "load_map_index sin seed no debe resetear last_game_coords"
     );
 }
+
+/// Integration test E2E del cavebot real: parsea
+/// `assets/cavebot/abdendriel_wasps.toml` + hunt_profile + valida la
+/// estructura esperada (total steps, hunt_profile cargado, verifies
+/// presentes en los steps críticos, check_supplies resueltos desde
+/// el profile).
+///
+/// Catch contra regresiones: si alguien modifica el profile o el cavebot
+/// y deja el pair incoherente (ej remueve un item del profile que
+/// check_supplies necesita), este test falla.
+#[test]
+fn abdendriel_wasps_cavebot_parses_with_profile_e2e() {
+    use tibia_bot::cavebot::parser;
+
+    // Path al cavebot real del repo (relativo al CARGO_MANIFEST_DIR = bot/).
+    let cavebot_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().unwrap()
+        .join("assets/cavebot/abdendriel_wasps.toml");
+
+    if !cavebot_path.exists() {
+        eprintln!("Skip: {} no existe en este ambiente", cavebot_path.display());
+        return;
+    }
+
+    let cb = parser::load(&cavebot_path, 30)
+        .unwrap_or_else(|e| panic!("abdendriel_wasps.toml no parsea: {:#}", e));
+
+    // Sanity: esperamos ~87 steps tras la última edición (pueden variar).
+    assert!(
+        cb.steps.len() >= 80,
+        "esperaba >=80 steps, got {}", cb.steps.len()
+    );
+
+    // Hunt profile debe estar resuelto.
+    assert_eq!(
+        cb.hunt_profile.as_deref(),
+        Some("abdendriel_wasps"),
+        "cavebot debe haber cargado el hunt profile"
+    );
+
+    // Verifies en al menos 3 steps (open_npc_trade + buy_item + bye).
+    let verify_count = cb.steps.iter().filter(|s| s.verify.is_some()).count();
+    assert!(
+        verify_count >= 3,
+        "esperaba >=3 [step.verify] en el cavebot, got {}", verify_count
+    );
+
+    // El step OpenNpcTrade (primer verify) debe tener verify TemplateVisible
+    // apuntando a "npc_trade".
+    use tibia_bot::cavebot::step::{StepKind, VerifyCheck};
+    let has_npc_trade_verify = cb.steps.iter().any(|s| {
+        matches!(&s.kind, StepKind::OpenNpcTrade { .. })
+            && matches!(
+                &s.verify,
+                Some(v) if matches!(
+                    &v.check,
+                    VerifyCheck::TemplateVisible { name, .. } if name == "npc_trade"
+                )
+            )
+    });
+    assert!(
+        has_npc_trade_verify,
+        "OpenNpcTrade step debe tener verify TemplateVisible('npc_trade')"
+    );
+
+    // check_supplies debe haber resuelto requirements desde el profile.
+    // abdendriel_wasps profile tiene 2 supplies checkables (mana_potion + health_potion).
+    let check_supplies_count = cb.steps.iter().filter(|s| {
+        matches!(&s.kind, StepKind::CheckSupplies { requirements, .. }
+            if requirements.len() == 2
+                && requirements.iter().any(|(n, _)| n == "mana_potion")
+                && requirements.iter().any(|(n, _)| n == "health_potion"))
+    }).count();
+    assert!(
+        check_supplies_count >= 1,
+        "al menos 1 check_supplies debe tener 2 reqs (mana+health) del profile, got {}",
+        check_supplies_count
+    );
+
+    // Snapshot endpoint data: debe reportar hunt_profile.
+    let snap = cb.snapshot(true);
+    assert_eq!(snap.hunt_profile.as_deref(), Some("abdendriel_wasps"));
+    assert!(!snap.verifying, "cold load no debe estar verifying");
+    assert!(snap.loaded);
+    assert!(snap.enabled);
+}

@@ -164,6 +164,13 @@ pub struct CavebotSnapshot {
     pub current_label: Option<String>,
     pub current_kind:  String,
     pub loop_:         bool,
+    /// Nombre del hunt profile cargado (si el TOML lo declara), para
+    /// observability en `/cavebot/status`. `None` = sin profile.
+    pub hunt_profile:  Option<String>,
+    /// True si el step actual está en fase de verify poll (post-acción,
+    /// esperando postcondition). Permite distinguir "ejecutando step" vs
+    /// "esperando evidencia de efecto" en el status endpoint.
+    pub verifying:     bool,
 }
 
 /// Estado global compartido entre el game loop, HTTP server y resto de módulos.
