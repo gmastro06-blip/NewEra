@@ -176,6 +176,12 @@ pub struct Cavebot {
     /// observability — ayuda a confirmar que el profile correcto está activo
     /// antes de una sesión live.
     pub hunt_profile: Option<String>,
+    /// Baselines copiados del profile `[metrics]` section. Expuestos en
+    /// /metrics (Prometheus) para comparar expected vs actual.
+    pub expected_xp_per_hour:      Option<u64>,
+    pub expected_kills_per_hour:   Option<u64>,
+    pub expected_loot_gp_per_hour: Option<u64>,
+    pub expected_cycle_min:        Option<u32>,
     /// Index del step activo. `None` = terminado (solo relevante si `!loop_`).
     pub current: Option<usize>,
     /// Tick en el que se entró al step actual.
@@ -338,6 +344,10 @@ impl Cavebot {
     /// Versión completa de `with_tuning` que también acepta el nombre del
     /// hunt profile (si el TOML lo declaró). Usada por el parser; los tests
     /// pueden seguir usando `with_tuning` sin profile.
+    ///
+    /// Firma backwards-compat: solo lleva el nombre. Para incluir baselines
+    /// del profile `[metrics]` section (para /metrics Prometheus), usar
+    /// `with_tuning_and_profile_metrics` abajo.
     pub fn with_tuning_and_profile(
         steps:        Vec<Step>,
         loop_:        bool,
@@ -350,6 +360,10 @@ impl Cavebot {
             steps,
             loop_,
             hunt_profile,
+            expected_xp_per_hour: None,
+            expected_kills_per_hour: None,
+            expected_loot_gp_per_hour: None,
+            expected_cycle_min: None,
             current,
             started_tick: 0,
             last_emit_tick: None,
@@ -399,6 +413,25 @@ impl Cavebot {
         }
     }
 
+    /// Versión full que además copia baselines del profile `[metrics]`
+    /// section — usado por `/metrics` Prometheus para exponer expected
+    /// vs actual como health signal del hunt en progreso.
+    pub fn with_tuning_and_profile_metrics(
+        steps:        Vec<Step>,
+        loop_:        bool,
+        fps:          u32,
+        tuning:       NodeTuning,
+        hunt_profile: Option<String>,
+        metrics:      &super::hunt_profile::MetricsBaseline,
+    ) -> Self {
+        let mut cb = Self::with_tuning_and_profile(steps, loop_, fps, tuning, hunt_profile);
+        cb.expected_xp_per_hour      = metrics.expected_xp_per_hour;
+        cb.expected_kills_per_hour   = metrics.expected_kills_per_hour;
+        cb.expected_loot_gp_per_hour = metrics.expected_loot_gp_per_hour;
+        cb.expected_cycle_min        = metrics.expected_cycle_min;
+        cb
+    }
+
     /// Snapshot ligero para exponer en HTTP `/cavebot/status`.
     pub fn snapshot(&self, enabled: bool) -> crate::core::state::CavebotSnapshot {
         let (label, kind) = match self.current {
@@ -420,6 +453,10 @@ impl Cavebot {
             loop_:         self.loop_,
             hunt_profile:  self.hunt_profile.clone(),
             verifying:     self.verifying.is_some(),
+            expected_xp_per_hour:      self.expected_xp_per_hour,
+            expected_kills_per_hour:   self.expected_kills_per_hour,
+            expected_loot_gp_per_hour: self.expected_loot_gp_per_hour,
+            expected_cycle_min:        self.expected_cycle_min,
         }
     }
 

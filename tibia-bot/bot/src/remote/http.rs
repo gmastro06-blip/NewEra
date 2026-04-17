@@ -1668,6 +1668,46 @@ async fn handle_prometheus_metrics(State(s): State<AppState>) -> Response {
         writeln!(out, "tibia_bot_safety_pause{{reason=\"{}\"}} 1", safe_reason).ok();
     }
 
+    // ── Hunt profile baselines (expected values del profile) ─────────────
+    // Expuestos como gauges — los paneles de Grafana pueden computar ratios
+    // actual/expected como health signal (ej: alert si xp_actual/hour <
+    // 50% del expected_xp_per_hour durante >15min).
+    let cs = &g.cavebot_status;
+    if let Some(ref profile_name) = cs.hunt_profile {
+        writeln!(out, "# HELP tibia_hunt_profile_loaded Hunt profile declared by cavebot TOML (info)").ok();
+        writeln!(out, "# TYPE tibia_hunt_profile_loaded gauge").ok();
+        let safe: String = profile_name.chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        writeln!(out, "tibia_hunt_profile_loaded{{profile=\"{}\"}} 1", safe).ok();
+
+        if let Some(xp) = cs.expected_xp_per_hour {
+            writeln!(out, "# HELP tibia_hunt_expected_xp_per_hour Baseline XP/hour del profile [metrics]").ok();
+            writeln!(out, "# TYPE tibia_hunt_expected_xp_per_hour gauge").ok();
+            writeln!(out, "tibia_hunt_expected_xp_per_hour {}", xp).ok();
+        }
+        if let Some(k) = cs.expected_kills_per_hour {
+            writeln!(out, "# HELP tibia_hunt_expected_kills_per_hour Baseline kills/hour").ok();
+            writeln!(out, "# TYPE tibia_hunt_expected_kills_per_hour gauge").ok();
+            writeln!(out, "tibia_hunt_expected_kills_per_hour {}", k).ok();
+        }
+        if let Some(gp) = cs.expected_loot_gp_per_hour {
+            writeln!(out, "# HELP tibia_hunt_expected_loot_gp_per_hour Baseline loot value GP/hour").ok();
+            writeln!(out, "# TYPE tibia_hunt_expected_loot_gp_per_hour gauge").ok();
+            writeln!(out, "tibia_hunt_expected_loot_gp_per_hour {}", gp).ok();
+        }
+        if let Some(c) = cs.expected_cycle_min {
+            writeln!(out, "# HELP tibia_hunt_expected_cycle_min Baseline ciclo depot→hunt→depot en minutos").ok();
+            writeln!(out, "# TYPE tibia_hunt_expected_cycle_min gauge").ok();
+            writeln!(out, "tibia_hunt_expected_cycle_min {}", c).ok();
+        }
+    }
+
+    // Cavebot verifying state (1 = el step actual está polling postcondition).
+    writeln!(out, "# HELP tibia_cavebot_verifying 1 si el step actual está en verify poll").ok();
+    writeln!(out, "# TYPE tibia_cavebot_verifying gauge").ok();
+    writeln!(out, "tibia_cavebot_verifying {}", if cs.verifying { 1 } else { 0 }).ok();
+
     // ── MinimapMatcher stats ─────────────────────────────────────────────
     if let Some(ref ms) = g.matcher_stats {
         writeln!(out, "# HELP tibia_matcher_detects_total Total MinimapMatcher detect calls").ok();

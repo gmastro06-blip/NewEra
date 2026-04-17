@@ -171,6 +171,13 @@ pub struct CavebotSnapshot {
     /// esperando postcondition). Permite distinguir "ejecutando step" vs
     /// "esperando evidencia de efecto" en el status endpoint.
     pub verifying:     bool,
+    /// Baselines del hunt profile `[metrics]` section, copiados al load.
+    /// Usados por /metrics (Prometheus) para exponer expected vs actual
+    /// como health signal del hunt. `None` si el profile no los declara.
+    pub expected_xp_per_hour:      Option<u64>,
+    pub expected_kills_per_hour:   Option<u64>,
+    pub expected_loot_gp_per_hour: Option<u64>,
+    pub expected_cycle_min:        Option<u32>,
 }
 
 /// Estado global compartido entre el game loop, HTTP server y resto de módulos.
