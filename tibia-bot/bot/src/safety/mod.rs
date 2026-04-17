@@ -30,6 +30,7 @@ pub mod rate_limit;
 pub mod variation;
 pub mod breaks;
 pub mod human_noise;
+pub mod session_limit;
 
 pub use reaction::ReactionGate;
 pub use rate_limit::RateLimiter;

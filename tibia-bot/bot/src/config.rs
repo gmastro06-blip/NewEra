@@ -396,6 +396,13 @@ pub struct SafetyConfig {
     // ── Breaks ───────────────────────────────────────────────────────────
     pub breaks_enabled: bool,
 
+    // ── Session cap (plan 10 días Task 2.2) ──────────────────────────────
+    /// Cap duro de duración de sesión en horas. Tras este tiempo el bot
+    /// pausa con `safety_pause_reason = "session:max_duration_reached"`.
+    /// Previene farmeo indefinido (detección estadística) + da ventana
+    /// de recovery natural. `0.0` = deshabilitado (no cap).
+    pub max_session_hours: f64,
+
     // ── Human noise ──────────────────────────────────────────────────────
     pub human_noise_enabled: bool,
     /// Lista de hotkeys "seguras" para emitir como ruido (nombres de tecla).
@@ -428,6 +435,7 @@ impl Default for SafetyConfig {
             heal_spell_weight:      70,
             heal_potion_weight:     30,
             breaks_enabled:         false, // off por default, opt-in
+            max_session_hours:      0.0,   // 0 = deshabilitado por default
             human_noise_enabled:    false,
             human_noise_keys:       vec![],
             human_noise_interval_mean_s: 180.0,

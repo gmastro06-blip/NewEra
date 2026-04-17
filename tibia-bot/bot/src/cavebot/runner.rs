@@ -233,6 +233,16 @@ pub struct Cavebot {
     stow_phase_start: u64,
     /// Iteraciones completadas (stow clicks emitidos).
     stow_iterations_done: u8,
+    /// Snapshot del `inventory_counts` al entrar al step (iter 1, phase 0).
+    /// Usado por la detección de "stash full" para comparar cambios entre
+    /// iteraciones. `None` = baseline todavía no capturado (reset al entrar
+    /// a un step nuevo, tras completar o tras abortar).
+    stow_baseline_counts: Option<std::collections::HashMap<String, u32>>,
+    /// Contador de iteraciones consecutivas sin cambio en `inventory_counts`
+    /// vs el baseline. Si alcanza 2 → emit SafetyPause con reason explícita
+    /// (stash lleno o no hay más stackables). Reset cuando hay drop en
+    /// cualquier item del baseline.
+    stow_stale_iters: u8,
 }
 
 impl Cavebot {
@@ -278,6 +288,8 @@ impl Cavebot {
             stow_phase: 0,
             stow_phase_start: 0,
             stow_iterations_done: 0,
+            stow_baseline_counts: None,
+            stow_stale_iters: 0,
             buy_phase: 0,
             buy_clicks_done: 0,
             buy_last_click_tick: 0,
@@ -566,6 +578,8 @@ impl Cavebot {
                         );
                         self.stow_phase = 0;
                         self.stow_iterations_done = 0;
+                        self.stow_baseline_counts = None;
+                        self.stow_stale_iters = 0;
                         self.advance(ctx.tick);
                         continue;
                     }
@@ -575,6 +589,13 @@ impl Cavebot {
                     match self.stow_phase {
                         0 => {
                             // Phase 0: right-click al slot 0 del bag.
+                            // Al entrar al step (iter 1, baseline aún no capturado),
+                            // snapshot de inventory_counts para la detección de
+                            // "stash lleno" (Task 2.3). Solo 1 clone por step.
+                            if self.stow_iterations_done == 0 && self.stow_baseline_counts.is_none() {
+                                self.stow_baseline_counts = Some(ctx.inventory_counts.clone());
+                                self.stow_stale_iters = 0;
+                            }
                             tracing::info!(
                                 "StowAllItems[{}] iter {}/{}: right-click bag slot at ({}, {})",
                                 idx, self.stow_iterations_done + 1, max_iterations, slot_vx, slot_vy
@@ -602,6 +623,43 @@ impl Cavebot {
                             // Phase 2: wait process → siguiente iteración.
                             if ctx.tick.saturating_sub(self.stow_phase_start) >= process_ticks {
                                 self.stow_iterations_done += 1;
+
+                                // Stash-full detection (Task 2.3): comparar el
+                                // inventory actual contra el baseline. Si NINGÚN
+                                // item del baseline bajó su count, esta iter no
+                                // tuvo efecto. Tras 2 iters stale consecutivos,
+                                // emitir SafetyPause.
+                                if let Some(baseline) = self.stow_baseline_counts.as_ref() {
+                                    let any_drop = baseline.iter().any(|(name, &base_count)| {
+                                        let cur = ctx.inventory_counts.get(name).copied().unwrap_or(0);
+                                        cur < base_count
+                                    });
+                                    if any_drop {
+                                        // Progreso real → reset stale + refrescar baseline
+                                        // al estado actual para la próxima iter.
+                                        self.stow_stale_iters = 0;
+                                        self.stow_baseline_counts = Some(ctx.inventory_counts.clone());
+                                    } else {
+                                        self.stow_stale_iters = self.stow_stale_iters.saturating_add(1);
+                                        if self.stow_stale_iters >= 2 {
+                                            let reason = format!(
+                                                "stow:stash_full_or_no_stackables: {} iters sin cambio en inventory. \
+                                                 baseline={} current={} — revisar si Supply Stash está lleno o \
+                                                 si el bag no tiene más items stackables.",
+                                                self.stow_stale_iters,
+                                                fmt_counts_summary(baseline),
+                                                fmt_counts_summary(&ctx.inventory_counts),
+                                            );
+                                            tracing::error!("Cavebot: {}", reason);
+                                            self.stow_phase = 0;
+                                            self.stow_iterations_done = 0;
+                                            self.stow_baseline_counts = None;
+                                            self.stow_stale_iters = 0;
+                                            return CavebotAction::SafetyPause { reason };
+                                        }
+                                    }
+                                }
+
                                 self.stow_phase = 0;
                                 // NO advance — volvemos a phase 0 para el siguiente iter.
                                 // La check de max_iterations arriba controla cuándo salir.
@@ -613,6 +671,8 @@ impl Cavebot {
                             tracing::warn!("StowAllItems[{}] invalid phase {}, resetting", idx, self.stow_phase);
                             self.stow_phase = 0;
                             self.stow_iterations_done = 0;
+                            self.stow_baseline_counts = None;
+                            self.stow_stale_iters = 0;
                             self.advance(ctx.tick);
                             continue;
                         }
@@ -752,6 +812,11 @@ impl Cavebot {
         self.buy_phase = 0;
         self.buy_clicks_done = 0;
         self.buy_last_click_tick = 0;
+        self.stow_phase = 0;
+        self.stow_phase_start = 0;
+        self.stow_iterations_done = 0;
+        self.stow_baseline_counts = None;
+        self.stow_stale_iters = 0;
         self.reset_node_state();
     }
 
@@ -805,6 +870,11 @@ impl Cavebot {
             self.buy_phase = 0;
             self.buy_clicks_done = 0;
             self.buy_last_click_tick = 0;
+            self.stow_phase = 0;
+            self.stow_phase_start = 0;
+            self.stow_iterations_done = 0;
+            self.stow_baseline_counts = None;
+            self.stow_stale_iters = 0;
             self.needs_kills_baseline = true;
             self.reset_node_state();
         } else {
@@ -1277,6 +1347,22 @@ fn ms_to_ticks(ms: u64, fps: u32) -> u64 {
         return 0;
     }
     (ms * fps as u64).div_ceil(1000)
+}
+
+/// Formatea un snapshot de `inventory_counts` a un string compacto y
+/// determinístico (ordenado por nombre). Usado en el `reason` de SafetyPause
+/// para el stash-full detection del step StowAllItems.
+///
+/// Filtra counts iguales a 0 para mantener el resumen corto y ordena por
+/// nombre para que la salida sea reproducible en tests/logs.
+fn fmt_counts_summary(counts: &std::collections::HashMap<String, u32>) -> String {
+    let mut entries: Vec<(&String, &u32)> = counts.iter().filter(|(_, &c)| c > 0).collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    if entries.is_empty() {
+        return "{}".into();
+    }
+    let parts: Vec<String> = entries.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    format!("{{{}}}", parts.join(","))
 }
 
 #[cfg(test)]
@@ -2386,6 +2472,185 @@ mod tests {
         assert!(c1.eval(&ctx));
         assert!(!c2.eval(&ctx));
         assert!(!c3.eval(&ctx));
+    }
+
+    // ── StowAllItems stash-full detection (Task 2.3) ──────────────────
+    //
+    // Helper para construir un ctx con inventory_counts pre-poblado.
+    fn ctx_inv(tick: u64, inv: &[(&str, u32)]) -> TickContext {
+        let mut c = TickContext { tick, ..Default::default() };
+        for (k, v) in inv {
+            c.inventory_counts.insert((*k).into(), *v);
+        }
+        c
+    }
+
+    /// Avanza un tick del cavebot con un inventory snapshot dado,
+    /// descartando la acción emitida (útil para llegar a un estado sin
+    /// aserciones intermedias).
+    fn tick_with_inv(cb: &mut Cavebot, tick: u64, inv: &[(&str, u32)]) -> CavebotAction {
+        cb.tick(&mut ctx_inv(tick, inv))
+    }
+
+    #[test]
+    fn stow_all_items_pauses_when_inventory_stable_two_iters() {
+        // Inventario estable durante 2 iteraciones consecutivas → SafetyPause.
+        // Config: menu_wait=100ms (3 ticks @ 30fps), process=100ms (3 ticks).
+        // Una iter = right-click + wait(3) + click + wait(3) = 6 ticks.
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::StowAllItems {
+                    slot_vx: 1600, slot_vy: 50,
+                    menu_offset_x: 90, menu_offset_y: 197,
+                    menu_wait_ms: 100, stow_process_ms: 100,
+                    max_iterations: 8,
+                }),
+                step(StepKind::Hotkey { hidcode: 0xEE }),
+            ],
+            false, 30,
+        );
+        let inv = &[("mana_potion", 5), ("gold_coin", 20)];
+
+        // ── Iter 1 ─────────────────────────────────────────────────────
+        // Tick 0: phase 0 → right-click. Captura baseline en este tick.
+        assert_eq!(tick_with_inv(&mut cb, 0, inv), CavebotAction::RightClick { vx: 1600, vy: 50 });
+        assert!(cb.stow_baseline_counts.is_some(), "baseline capturado en iter 1 phase 0");
+        assert_eq!(cb.stow_stale_iters, 0);
+        // Ticks 1,2: phase 1 idle.
+        for t in 1..=2 { assert_eq!(tick_with_inv(&mut cb, t, inv), CavebotAction::Idle); }
+        // Tick 3: click menu → phase 2.
+        assert_eq!(tick_with_inv(&mut cb, 3, inv), CavebotAction::Click { vx: 1690, vy: 247 });
+        // Ticks 4,5: phase 2 idle.
+        for t in 4..=5 { assert_eq!(tick_with_inv(&mut cb, t, inv), CavebotAction::Idle); }
+        // Tick 6: process expira → iter++, inventario no cambió → stale=1,
+        //         continua al phase 0 del iter 2 y emite right-click.
+        assert_eq!(tick_with_inv(&mut cb, 6, inv), CavebotAction::RightClick { vx: 1600, vy: 50 });
+        assert_eq!(cb.stow_stale_iters, 1, "1 iter sin drop");
+        assert_eq!(cb.stow_iterations_done, 1);
+
+        // ── Iter 2 ─────────────────────────────────────────────────────
+        // Ticks 7..11: phase 1 → click menu → phase 2 idle.
+        for t in 7..=8 { assert_eq!(tick_with_inv(&mut cb, t, inv), CavebotAction::Idle); }
+        assert_eq!(tick_with_inv(&mut cb, 9, inv), CavebotAction::Click { vx: 1690, vy: 247 });
+        for t in 10..=11 { assert_eq!(tick_with_inv(&mut cb, t, inv), CavebotAction::Idle); }
+        // Tick 12: process del iter 2 expira → stale=2 → SafetyPause.
+        let action = tick_with_inv(&mut cb, 12, inv);
+        match action {
+            CavebotAction::SafetyPause { reason } => {
+                assert!(
+                    reason.contains("stow:stash_full"),
+                    "reason debe mencionar 'stow:stash_full': {}", reason
+                );
+                assert!(
+                    reason.contains("mana_potion=5"),
+                    "reason debe incluir el summary del baseline: {}", reason
+                );
+            }
+            other => panic!("esperado SafetyPause tras 2 iters stale, got {:?}", other),
+        }
+        // Estado reseteado post-pause.
+        assert!(cb.stow_baseline_counts.is_none(), "baseline reseteado tras pause");
+        assert_eq!(cb.stow_stale_iters, 0);
+        assert_eq!(cb.stow_iterations_done, 0);
+    }
+
+    #[test]
+    fn stow_all_items_does_not_pause_when_drop_follows_stale_iter() {
+        // 1 iter stale + 1 iter con drop → stale vuelve a 0, NO pause.
+        // Confirma que un drop intermitente "resetea" el contador.
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::StowAllItems {
+                    slot_vx: 1600, slot_vy: 50,
+                    menu_offset_x: 90, menu_offset_y: 197,
+                    menu_wait_ms: 100, stow_process_ms: 100,
+                    max_iterations: 8,
+                }),
+                step(StepKind::Hotkey { hidcode: 0xEE }),
+            ],
+            false, 30,
+        );
+        let inv_full    = &[("mana_potion", 5), ("gold_coin", 20)];
+        let inv_dropped = &[("mana_potion", 5), ("gold_coin", 18)]; // gold_coin bajó
+
+        // ── Iter 1: inventario estable (mismo que el baseline capturado). ──
+        assert_eq!(tick_with_inv(&mut cb, 0, inv_full), CavebotAction::RightClick { vx: 1600, vy: 50 });
+        for t in 1..=2 { tick_with_inv(&mut cb, t, inv_full); }
+        tick_with_inv(&mut cb, 3, inv_full);
+        for t in 4..=5 { tick_with_inv(&mut cb, t, inv_full); }
+        // Tick 6: iter 1 cierra con stale=1. Re-emite right-click del iter 2.
+        tick_with_inv(&mut cb, 6, inv_full);
+        assert_eq!(cb.stow_stale_iters, 1);
+
+        // ── Iter 2: el inventory baja (gold_coin 20 → 18). Drop detectado ──
+        //             al final del iter → stale=0 + baseline refreshed.
+        for t in 7..=8 { tick_with_inv(&mut cb, t, inv_dropped); }
+        tick_with_inv(&mut cb, 9, inv_dropped);
+        for t in 10..=11 { tick_with_inv(&mut cb, t, inv_dropped); }
+        // Tick 12: process expira → detect drop → stale=0 + baseline refreshed.
+        //          NO pause, sigue iterando (emite right-click del iter 3).
+        let action = tick_with_inv(&mut cb, 12, inv_dropped);
+        assert_eq!(action, CavebotAction::RightClick { vx: 1600, vy: 50 });
+        assert_eq!(cb.stow_stale_iters, 0, "drop detectado → stale reset");
+        assert_eq!(cb.stow_iterations_done, 2);
+        assert!(cb.stow_baseline_counts.is_some(), "baseline sigue presente (refreshed)");
+        // El baseline refrescado debe reflejar el inv_dropped (no el original).
+        let baseline = cb.stow_baseline_counts.as_ref().unwrap();
+        assert_eq!(baseline.get("gold_coin").copied(), Some(18));
+    }
+
+    #[test]
+    fn stow_all_items_completes_when_inventory_drops_every_iter() {
+        // Inventory baja cada iter → stale siempre 0 → completa hasta
+        // max_iterations sin pause y avanza al próximo step.
+        let mut cb = Cavebot::new(
+            vec![
+                step(StepKind::StowAllItems {
+                    slot_vx: 1600, slot_vy: 50,
+                    menu_offset_x: 90, menu_offset_y: 197,
+                    menu_wait_ms: 100, stow_process_ms: 100,
+                    max_iterations: 3,
+                }),
+                step(StepKind::Hotkey { hidcode: 0xEE }),
+            ],
+            false, 30,
+        );
+        // Inventories que van bajando iter a iter.
+        let inv1 = &[("mana_potion", 5), ("gold_coin", 20)];
+        let inv2 = &[("mana_potion", 5), ("gold_coin", 15)];
+        let inv3 = &[("mana_potion", 5), ("gold_coin", 10)];
+
+        // Iter 1 (tick 0..6): baseline capturado con inv1.
+        tick_with_inv(&mut cb, 0, inv1);
+        for t in 1..=5 { tick_with_inv(&mut cb, t, inv1); }
+        // Tick 6: process expira → drop (20→15) → stale=0. Emite RC iter 2.
+        assert_eq!(tick_with_inv(&mut cb, 6, inv2), CavebotAction::RightClick { vx: 1600, vy: 50 });
+        assert_eq!(cb.stow_stale_iters, 0);
+        assert_eq!(cb.stow_iterations_done, 1);
+
+        // Iter 2 (tick 7..12): usa inv2 durante toda la iter (el último tick
+        // toma el snapshot final para comparar contra el baseline actual).
+        for t in 7..=11 { tick_with_inv(&mut cb, t, inv2); }
+        // Tick 12: process expira → comparación contra baseline=inv2 con
+        // current=inv3 (drop 15→10) → stale=0. Emite RC iter 3.
+        assert_eq!(tick_with_inv(&mut cb, 12, inv3), CavebotAction::RightClick { vx: 1600, vy: 50 });
+        assert_eq!(cb.stow_stale_iters, 0);
+        assert_eq!(cb.stow_iterations_done, 2);
+
+        // Iter 3 (tick 13..18): usa inv3 para el tick final.
+        for t in 13..=17 { tick_with_inv(&mut cb, t, inv3); }
+        // Tick 18: process expira → iter 3 termina. Inventario igual a
+        // baseline=inv3 (no bajó en este mismo tick) → stale=1, pero
+        // iterations_done=3 == max_iterations en el próximo tick de
+        // re-evaluación → completa y avanza al Hotkey 0xEE.
+        // (Al llegar a max_iterations el state reset incluye baseline/stale
+        // antes del advance.)
+        let action = tick_with_inv(&mut cb, 18, inv3);
+        // Avanza al siguiente step en el mismo tick vía `continue` y emite
+        // el KeyTap del Hotkey.
+        assert_eq!(action, CavebotAction::KeyTap(0xEE));
+        assert_eq!(cb.stow_iterations_done, 0, "reset tras completar el step");
+        assert!(cb.stow_baseline_counts.is_none(), "baseline limpio tras completar");
     }
 
     #[test]

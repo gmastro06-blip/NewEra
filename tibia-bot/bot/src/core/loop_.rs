@@ -24,6 +24,7 @@ use crate::safety::{
     BreakScheduler, HumanNoise, RateLimiter, ReactionGate, WeightedChoice,
 };
 use crate::safety::breaks::BreakStatus;
+use crate::safety::session_limit::SessionLimit;
 use crate::scripting::{ScriptEngine, ScriptResult, TickContext};
 use crate::sense::frame_buffer::FrameBuffer;
 use crate::sense::vision::Vision;
@@ -83,7 +84,17 @@ pub struct BotLoop {
     cavebot_enabled: bool,
     /// Grabador opcional de Perception snapshots (F1 replay tool).
     recorder: Option<crate::sense::recorder::PerceptionRecorder>,
+    /// Contador consecutivo de ticks sin frame NDI (watchdog de visión).
+    /// Se resetea a 0 cuando llega un frame. Cuando supera
+    /// `NO_FRAME_PAUSE_TICKS` se dispara una safety pause y se vuelve a 0
+    /// para no re-disparar en loop.
+    no_frame_ticks: u32,
 }
+
+/// Umbral de ticks consecutivos sin frame NDI antes de pausar por seguridad.
+/// A 30 Hz son ~4 segundos — suficiente para distinguir un hiccup puntual
+/// de OBS/DistroAV muerto de verdad.
+const NO_FRAME_PAUSE_TICKS: u32 = 120;
 
 impl BotLoop {
     #[allow(clippy::too_many_arguments)]
@@ -162,6 +173,7 @@ impl BotLoop {
             cavebot,
             cavebot_enabled,
             recorder,
+            no_frame_ticks: 0,
         }
     }
 
@@ -244,6 +256,22 @@ impl BotLoop {
         } else {
             None
         };
+
+        // Session duration cap (opt-in via max_session_hours > 0).
+        // Baseline = tick actual (normalmente 0 al arrancar, pero defensivo
+        // por si el loop corre con estado pre-existente).
+        let session_start_tick = self.state.read().tick;
+        let mut session_limit = SessionLimit::new(
+            safety.max_session_hours,
+            target_fps,
+            session_start_tick,
+        );
+        if session_limit.is_some() {
+            info!(
+                "Safety: session cap activo — {:.2}h (baseline tick={})",
+                safety.max_session_hours, session_start_tick,
+            );
+        }
 
         // Human noise emitter (opt-in).
         let mut human_noise = if safety.human_noise_enabled && !safety.human_noise_keys.is_empty() {
@@ -431,6 +459,33 @@ impl BotLoop {
             // ── SENSE ─────────────────────────────────────────────────────────
             let frame_arc = self.buffer.load_arc();
             let has_frame = frame_arc.is_some();
+
+            // ── WATCHDOG: no-frame ────────────────────────────────────────────
+            // Si NDI muere (OBS crasheó, cable desconectado, DistroAV caído) el
+            // buffer queda sin frames. La visión cae a `Perception::default()` y
+            // el bot seguiría "ciego" emitiendo acciones sobre estado vacío.
+            // Tras ~4s sin frame (NO_FRAME_PAUSE_TICKS @ 30 Hz) forzamos pausa
+            // con reason "vision:no_frame". Solo loggeamos una vez al disparar
+            // para no spamear si el frame oscila entre visible/ausente.
+            match step_no_frame_watchdog(&mut self.no_frame_ticks, has_frame, NO_FRAME_PAUSE_TICKS) {
+                NoFrameStep::TriggerPause => {
+                    warn!(
+                        "Watchdog: {} ticks consecutivos sin frame NDI — pausando bot \
+                         (vision:no_frame). Verificar OBS / DistroAV / conexión de red.",
+                        NO_FRAME_PAUSE_TICKS
+                    );
+                    {
+                        let mut g = self.state.write();
+                        g.is_paused = true;
+                        g.safety_pause_reason = Some("vision:no_frame".into());
+                    }
+                    // Propagar al tracking local para que el resto del tick
+                    // (is_safety_paused, hooks Lua on_fsm_state_change, etc.)
+                    // vea la pausa con la misma reason coherente.
+                    current_pause_reason = Some("vision:no_frame".into());
+                }
+                NoFrameStep::FrameOk | NoFrameStep::Accumulating => {}
+            }
 
             // ── VISION ────────────────────────────────────────────────────────
             let vision_start = Instant::now();
@@ -737,6 +792,23 @@ impl BotLoop {
             } else if current_pause_reason.as_deref() == Some("focus:tibia_not_foreground") {
                 info!("Safety: Tibia recuperó el foco — reanudando");
                 current_pause_reason = None;
+            }
+
+            // ── SAFETY: Session duration cap (Task 2.2) ──────────────────
+            // Dispara una sola vez cuando el runtime excede max_session_hours.
+            // Tras disparar, `session_limit = None` para no re-loggear cada
+            // tick. La pausa persiste (current_pause_reason) hasta intervención
+            // manual — el operador decide si reanudar o cerrar la sesión.
+            if let Some(ref sl) = session_limit {
+                if sl.is_expired(tick_num) {
+                    let elapsed = sl.elapsed_hours(tick_num, target_fps);
+                    warn!(
+                        "Safety: cap de sesión alcanzado ({:.2}h) — pausando bot",
+                        elapsed,
+                    );
+                    current_pause_reason = Some("session:max_duration_reached".into());
+                    session_limit = None;
+                }
             }
 
             // Si hay una pausa de safety, forzar que la FSM no emita nada
@@ -1354,6 +1426,42 @@ fn compute_tick_sleep(
     }
 }
 
+/// Resultado de un paso del watchdog de no-frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoFrameStep {
+    /// Llegó frame: contador reseteado, no hay pausa nueva.
+    FrameOk,
+    /// Sin frame pero bajo umbral: contador incrementado, no hay pausa nueva.
+    Accumulating,
+    /// Se superó el umbral: disparar safety pause "vision:no_frame" y
+    /// resetear el contador para no re-disparar cada tick.
+    TriggerPause,
+}
+
+/// Actualiza el contador de ticks sin frame y decide si corresponde disparar
+/// la safety pause "vision:no_frame".
+///
+/// Se extrae como función pura para testearla sin levantar game loop.
+/// El caller es responsable de mutar el estado compartido en `TriggerPause`.
+fn step_no_frame_watchdog(
+    counter: &mut u32,
+    has_frame: bool,
+    threshold: u32,
+) -> NoFrameStep {
+    if has_frame {
+        *counter = 0;
+        NoFrameStep::FrameOk
+    } else {
+        *counter = counter.saturating_add(1);
+        if *counter >= threshold {
+            *counter = 0;
+            NoFrameStep::TriggerPause
+        } else {
+            NoFrameStep::Accumulating
+        }
+    }
+}
+
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
@@ -1464,6 +1572,113 @@ mod scheduler_tests {
         assert_eq!(ticks_total, 5);
         // Ticks con proc > 33ms: 50 y 100 → 2 overruns.
         assert_eq!(ticks_overrun, 2);
+    }
+}
+
+#[cfg(test)]
+mod no_frame_watchdog_tests {
+    use super::*;
+
+    /// 120 ticks consecutivos sin frame → dispara pausa en el tick 120 exacto
+    /// y resetea el contador para no re-disparar en el tick siguiente.
+    #[test]
+    fn triggers_pause_at_threshold() {
+        let mut counter: u32 = 0;
+
+        // Ticks 1..=119 acumulan sin disparar.
+        for i in 1..NO_FRAME_PAUSE_TICKS {
+            let step = step_no_frame_watchdog(&mut counter, false, NO_FRAME_PAUSE_TICKS);
+            assert_eq!(
+                step, NoFrameStep::Accumulating,
+                "tick {i}: esperaba Accumulating"
+            );
+            assert_eq!(counter, i, "tick {i}: contador debería ser {i}");
+        }
+
+        // Tick 120 (== NO_FRAME_PAUSE_TICKS) → dispara pausa.
+        let step = step_no_frame_watchdog(&mut counter, false, NO_FRAME_PAUSE_TICKS);
+        assert_eq!(step, NoFrameStep::TriggerPause);
+        // Tras disparar, el contador se resetea.
+        assert_eq!(counter, 0, "counter debe resetearse tras disparar");
+
+        // Tick 121 sin frame: vuelve a acumular desde 1, no re-dispara aún.
+        let step = step_no_frame_watchdog(&mut counter, false, NO_FRAME_PAUSE_TICKS);
+        assert_eq!(step, NoFrameStep::Accumulating);
+        assert_eq!(counter, 1);
+    }
+
+    /// 100 ticks sin frame < umbral → NO dispara pausa, contador sigue vivo.
+    #[test]
+    fn does_not_trigger_below_threshold() {
+        let mut counter: u32 = 0;
+
+        for i in 1..=100u32 {
+            let step = step_no_frame_watchdog(&mut counter, false, NO_FRAME_PAUSE_TICKS);
+            assert_eq!(step, NoFrameStep::Accumulating, "tick {i}");
+            assert_eq!(counter, i);
+        }
+
+        // Nunca se llamó TriggerPause — confirmado por los asserts arriba.
+        assert!(counter < NO_FRAME_PAUSE_TICKS);
+    }
+
+    /// Llegada de un frame resetea el contador a 0 y retorna FrameOk.
+    #[test]
+    fn frame_resets_counter() {
+        let mut counter: u32 = 50;
+
+        let step = step_no_frame_watchdog(&mut counter, true, NO_FRAME_PAUSE_TICKS);
+        assert_eq!(step, NoFrameStep::FrameOk);
+        assert_eq!(counter, 0);
+    }
+
+    /// Un solo frame entremedio reinicia la cuenta: 119 sin frame + 1 frame +
+    /// 119 sin frame → NO dispara (el frame bajó el contador a 0).
+    #[test]
+    fn single_frame_prevents_trigger() {
+        let mut counter: u32 = 0;
+
+        for _ in 0..NO_FRAME_PAUSE_TICKS - 1 {
+            step_no_frame_watchdog(&mut counter, false, NO_FRAME_PAUSE_TICKS);
+        }
+        assert_eq!(counter, NO_FRAME_PAUSE_TICKS - 1);
+
+        // Un frame llega → reset.
+        let step = step_no_frame_watchdog(&mut counter, true, NO_FRAME_PAUSE_TICKS);
+        assert_eq!(step, NoFrameStep::FrameOk);
+        assert_eq!(counter, 0);
+
+        // Otros 119 sin frame — aún no dispara.
+        for _ in 0..NO_FRAME_PAUSE_TICKS - 1 {
+            let step = step_no_frame_watchdog(&mut counter, false, NO_FRAME_PAUSE_TICKS);
+            assert_eq!(step, NoFrameStep::Accumulating);
+        }
+        assert_eq!(counter, NO_FRAME_PAUSE_TICKS - 1);
+    }
+
+    /// Tras disparar, si los frames vuelven el watchdog retorna a FrameOk
+    /// inmediatamente y no hay estado residual.
+    #[test]
+    fn frame_after_trigger_recovers() {
+        let mut counter: u32 = 0;
+
+        // Llegar al umbral y disparar.
+        for _ in 0..NO_FRAME_PAUSE_TICKS {
+            step_no_frame_watchdog(&mut counter, false, NO_FRAME_PAUSE_TICKS);
+        }
+        assert_eq!(counter, 0, "contador reseteado tras disparar");
+
+        // El frame vuelve.
+        let step = step_no_frame_watchdog(&mut counter, true, NO_FRAME_PAUSE_TICKS);
+        assert_eq!(step, NoFrameStep::FrameOk);
+        assert_eq!(counter, 0);
+    }
+
+    /// Confirma la constante: 120 ticks @ 30 Hz ≈ 4s.
+    #[test]
+    fn threshold_constant_is_four_seconds_at_30hz() {
+        let seconds = NO_FRAME_PAUSE_TICKS as f64 / 30.0;
+        assert!((seconds - 4.0).abs() < 0.001);
     }
 }
 
