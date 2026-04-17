@@ -111,7 +111,13 @@ struct UiTemplate {
 /// Resultado de un match on-demand (API síncrona).
 ///
 /// Coords son frame-absolutas (incluyen offset de ROI si se usó una).
+///
+/// **Extension point**: los consumidores actuales son tests + eventualmente
+/// `StepVerify` si se wirea match_now() como alternativa al cached
+/// `ctx.ui_matches` (que tiene hasta 500ms de staleness). Ver ADR-003
+/// para el rationale de por qué la versión cached es aceptable para MVP.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub struct MatchResult {
     /// Best SSD-normalized score. Lower = better match. Typical threshold ≤ 0.15.
     pub score: f32,
@@ -298,6 +304,11 @@ impl UiDetector {
     ///
     /// Typical caller: cavebot runner verifying a step's postcondition.
     /// Expected cost: 5–30 ms on an 800×600 ROI vs a 50×50 template.
+    ///
+    /// **Status**: API disponible pero sin consumidor activo. StepVerify
+    /// usa el cached `ctx.ui_matches` (async 500ms) por default; si algún
+    /// caso live requiere latencia <200ms, wirear acá.
+    #[allow(dead_code)]
     pub fn match_now(&self, frame: &Frame, template_name: &str) -> Option<MatchResult> {
         let tpl = self.templates.iter().find(|t| t.name == template_name)?;
         let (search, offset_x, offset_y) = if let Some(roi) = tpl.roi {
@@ -312,6 +323,7 @@ impl UiDetector {
     /// Used when a step wants to verify a template appears in a tight box — e.g.
     /// "confirm that 'buy' button is visible at (100, 200) ± 10 px" you pass
     /// roi={x:90, y:190, w:template.w+20, h:template.h+20}.
+    #[allow(dead_code)]
     pub fn match_in_roi(
         &self,
         frame: &Frame,
@@ -326,6 +338,7 @@ impl UiDetector {
     /// Convenience wrapper: returns true if `match_now` found a match with
     /// score ≤ self.threshold AND the match center is within `tolerance` px of
     /// (expected_x, expected_y). Useful for "button at this exact spot" checks.
+    #[allow(dead_code)]
     pub fn match_at_point(
         &self,
         frame: &Frame,
@@ -370,6 +383,7 @@ fn crop_to_gray(frame: &Frame, roi: RoiDef) -> Option<GrayImage> {
 /// Busca el mejor match de `template` dentro de `search` y retorna
 /// `Some(MatchResult)` con coords frame-absolutas (search_offset_{x,y} + offset
 /// local) si el score es ≤ threshold. Usado por la API síncrona.
+#[allow(dead_code)]
 fn best_match(
     search:        &GrayImage,
     template:      &GrayImage,

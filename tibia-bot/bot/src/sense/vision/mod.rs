@@ -371,6 +371,7 @@ impl Vision {
     /// es simplemente un atlas de sectores), pero modificar durante operación
     /// normal puede causar inconsistencias de stats.
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn matcher_mut_for_test(&mut self) -> &mut game_coords::MinimapMatcher {
         &mut self.minimap_matcher
     }
@@ -378,6 +379,7 @@ impl Vision {
     /// Inyecta last_game_coords directamente, para tests de integración que
     /// necesitan bootstrap sin pasar por detect().
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn set_last_game_coords_for_test(&mut self, coords: Option<(i32, i32, i32)>) {
         self.last_game_coords = coords;
         self.tracked_sub_tile_px = (0, 0);
@@ -386,6 +388,7 @@ impl Vision {
     /// Read accessor a `last_game_coords` para tests de integración que
     /// validan el bootstrap-seed del matcher al aplicar config.
     #[doc(hidden)]
+    #[allow(dead_code)]
     pub fn last_game_coords_for_test(&self) -> Option<(i32, i32, i32)> {
         self.last_game_coords
     }

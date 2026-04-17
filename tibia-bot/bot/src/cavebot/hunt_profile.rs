@@ -129,6 +129,12 @@ impl HuntProfile {
     /// ¿El item `name` está en la whitelist de stackables de este hunt?
     /// Usado por StowAllItems para saber si vale la pena iterar. Comparación
     /// case-insensitive para tolerar variaciones entre templates y TOML.
+    ///
+    /// **Extension point**: aún no consumido por el runner (StowAllItems
+    /// usa directamente `stackables_whitelist: Option<Vec<String>>` populado
+    /// desde `profile.loot.stackables` al parse). Reservado para futuras
+    /// integraciones (ej: battle list validator, loot filter, reporting).
+    #[allow(dead_code)]
     pub fn is_stackable_loot(&self, item_name: &str) -> bool {
         self.loot
             .stackables
@@ -139,6 +145,12 @@ impl HuntProfile {
     /// ¿El monstruo `name` está en la lista de avoid (lure protection)?
     /// Case-insensitive porque la battle list puede capitalizar distinto
     /// ("Stalker" vs "stalker") que el TOML del profile.
+    ///
+    /// **Extension point**: aún no consumido — la battle list actual no
+    /// tiene OCR de nombres (`BattleEntry.name` es `Option<String>` pero
+    /// siempre `None`). Cuando se agregue OCR, este helper se wireará para
+    /// implementar lure protection (SafetyPause si entra un mob del avoid).
+    #[allow(dead_code)]
     pub fn is_monster_to_avoid(&self, monster_name: &str) -> bool {
         self.monsters
             .avoid
