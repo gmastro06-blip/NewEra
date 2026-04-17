@@ -349,9 +349,26 @@ max_wait_ms = 5000
 [[step]]
 kind = "ladder"
 
+# Verify cross-floor descent: tras el wait de animación, el char debe
+# estar en z=7 cerca del tile de ladder (32656, 31674). range=3 absorbe
+# pequeña dispersión del tile de arrival. Si en 3s seguimos en z=6 el
+# ladder no funcionó — SafetyPause con reason diagnosticable.
+#
+# Precondición: tile-hashing cargado (map_index_path + starting_coord
+# en bot/config.toml). Sin él, near_coord siempre retorna false y el
+# verify siempre falla. Comentar el [step.verify] si desactivás tile-hashing.
+#
+# Patrón reusable: cada ladder/rope que sigue tiene el mismo flujo, pero
+# por ahora solo instrumentamos esta primera como proof — si en live se
+# valida el pattern, replicar al resto de ladders/ropes del hunt loop.
 [[step]]
 kind = "wait"
 duration_ms = 1500
+
+[step.verify]
+condition  = "near_coord(32656, 31674, 7, 3)"
+timeout_ms = 3000
+on_fail    = "safety_pause"
 
 # ═══════════════════════════════════════════════════════════════
 # SUPERFICIE z=7 — camino a la cueva wasps
