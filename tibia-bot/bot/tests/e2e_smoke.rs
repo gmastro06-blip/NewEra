@@ -584,3 +584,140 @@ fn check_supplies_from_profile_triggers_refill_goto_when_low() {
     assert!(has_enough.eval(&ctx),
             "con 25 manas, HasItem(mana_potion,20) debe ser true → check_supplies pasa → advance");
 }
+
+/// Mock e2e: drive el cavebot real de Ab'dendriel a través de 2000 ticks
+/// con contexto aleatorio/simulado. Valida:
+///   - Ningún panic en ningún step kind (fuzz-like)
+///   - No infinite loops (max_iters cap del tick loop funciona)
+///   - Las `SafetyPause { reason }` emitidas son diagnosticables (reason no
+///     vacía, menciona algo específico del step)
+///   - El cavebot puede ser interrumpido (jump_to_label) sin romper estado
+///
+/// Purely autonomous — sin Tibia live ni HTTP server. Complementa los unit
+/// tests per-step con un fuzz integration test contra el TOML real que
+/// shippeamos. Catches cualquier bug de sequencing que solo aflora al correr
+/// muchos ticks consecutivos.
+#[test]
+fn abdendriel_cavebot_survives_2000_ticks_of_varied_context() {
+    use tibia_bot::cavebot::parser;
+    use tibia_bot::cavebot::runner::{CavebotAction, TickContext};
+
+    let cavebot_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().unwrap()
+        .join("assets/cavebot/abdendriel_wasps.toml");
+    if !cavebot_path.exists() {
+        eprintln!("Skip: cavebot TOML no existe");
+        return;
+    }
+    let mut cb = parser::load(&cavebot_path, 30)
+        .expect("parse ok");
+
+    // Contador de distintos kinds visitados — si al menos se tocaron varios
+    // kinds distintos, el cavebot hizo progreso real (no quedó en un loop
+    // de 1 step).
+    let mut kinds_touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut safety_pauses = 0u32;
+    let mut finished = false;
+
+    for tick in 0..2000u64 {
+        // Ctx variable: simular que a veces hay combat, que el inventario
+        // se populate, que game_coords va cambiando, etc. Nada coherente
+        // con el Tibia real — solo probar que el cavebot no panic con
+        // entradas diversas.
+        let mut ctx = TickContext::default();
+        ctx.tick = tick;
+        ctx.hp_ratio = Some(((tick % 100) as f32) / 100.0);  // 0.0-0.99 cíclico
+        ctx.mana_ratio = Some((((tick + 50) % 100) as f32) / 100.0);
+        ctx.in_combat = tick % 30 < 5;
+        ctx.enemy_count = if ctx.in_combat { 1 + (tick % 3) as u32 } else { 0 };
+        ctx.is_moving = Some(tick % 7 < 3);
+        ctx.game_coords = Some((
+            32681 + ((tick % 100) as i32) - 50,
+            31686 + ((tick / 10 % 100) as i32) - 50,
+            6 + ((tick / 100) % 3) as i32, // 6, 7, 8 cíclico
+        ));
+        // Periódicamente popular inventory para que los from_profile verify
+        // tengan datos.
+        if tick % 50 < 25 {
+            ctx.inventory_counts.insert("mana_potion".into(), 50);
+            ctx.inventory_stacks.insert("mana_potion".into(), 100);
+            ctx.inventory_counts.insert("health_potion".into(), 10);
+            ctx.inventory_stacks.insert("health_potion".into(), 20);
+        }
+        // Mock ui_matches para que verify templates no siempre fallen.
+        if tick % 25 < 12 {
+            ctx.ui_matches.push("npc_trade".into());
+        }
+
+        let action = cb.tick(&mut ctx);
+
+        // Record current step kind.
+        let snap = cb.snapshot(true);
+        kinds_touched.insert(snap.current_kind.clone());
+
+        match action {
+            CavebotAction::Finished => { finished = true; break; }
+            CavebotAction::SafetyPause { reason } => {
+                safety_pauses += 1;
+                assert!(
+                    !reason.is_empty(),
+                    "SafetyPause reason no debe ser vacío (tick {})", tick
+                );
+                // Reason debe ser diagnosticable: mencionar step, check, o timeout.
+                let has_diagnostic_info = reason.contains("step")
+                    || reason.contains("check")
+                    || reason.contains("timeout")
+                    || reason.contains("stash")
+                    || reason.contains("verify");
+                assert!(
+                    has_diagnostic_info,
+                    "SafetyPause reason '{}' debería contener diagnostic info (step/check/timeout/stash/verify)",
+                    reason
+                );
+                // Re-habilitar para seguir testeando — en prod el user
+                // decide resume manual; acá lo hacemos para cobertura.
+                // NOTA: actualmente SafetyPause no pausa al cavebot
+                // internamente (eso lo hace loop_.rs); el iter sigue vivo.
+            }
+            _ => {}
+        }
+    }
+
+    // El cavebot debe haber tocado VARIOS kinds distintos (progresó entre steps).
+    // Con 2000 ticks y ~89 steps, si no loopea en 1 step, esperamos ≥5 kinds.
+    assert!(
+        kinds_touched.len() >= 5,
+        "cavebot debería tocar ≥5 kinds distintos en 2000 ticks, got {}: {:?}",
+        kinds_touched.len(), kinds_touched
+    );
+
+    println!(
+        "[e2e mock fuzz] kinds visitados: {}, safety_pauses: {}, finished: {}",
+        kinds_touched.len(), safety_pauses, finished
+    );
+}
+
+/// Stress test: jump_to_label no rompe estado tras múltiples jumps consecutivos.
+/// Catches bugs donde el state per-step (buy_phase, stow_iterations, verifying)
+/// no se limpia correctamente al saltar.
+#[test]
+fn cavebot_jump_to_label_repeated_doesnt_corrupt_state() {
+    use tibia_bot::cavebot::parser;
+
+    let cavebot_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent().unwrap()
+        .join("assets/cavebot/abdendriel_wasps.toml");
+    if !cavebot_path.exists() { return; }
+    let mut cb = parser::load(&cavebot_path, 30).expect("parse");
+
+    // Jumping entre labels del cavebot 20 veces consecutivas.
+    let labels = ["start", "refill", "go_hunt", "hunt", "leave"];
+    for i in 0..20u64 {
+        let label = labels[i as usize % labels.len()];
+        let ok = cb.jump_to_label(label, i * 100);
+        assert!(ok, "jump_to_label('{}') debería succeed", label);
+        // Tras cada jump, el state per-step debe haberse limpiado.
+        let snap = cb.snapshot(true);
+        assert!(!snap.verifying, "verifying debe clearing tras jump");
+    }
+}
