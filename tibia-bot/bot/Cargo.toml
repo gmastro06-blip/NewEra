@@ -75,6 +75,10 @@ path = "src/bin/tune_inventory_strip.rs"
 name = "debug_game_coords"
 path = "src/bin/debug_game_coords.rs"
 
+[[bin]]
+name = "click_live"
+path = "src/bin/click_live.rs"
+
 [dependencies]
 # ── Runtime async ────────────────────────────────────────────────────────────
 tokio              = { workspace = true }
@@ -126,6 +130,14 @@ mlua               = { version = "0.10", features = ["lua54", "vendored"] }
 # `rand_distr` añade distribución Normal sobre el `rand` core.
 rand               = "0.8"
 rand_distr         = "0.4"
+
+# ── CLI tooling (solo binarios diagnósticos) ─────────────────────────────────
+clap               = { version = "4", features = ["derive"] }
+
+# ── HTTP client (blocking) — usado por bin `click_live` para hablar con el
+# bot vía /test/* endpoints sin tocar PicoLink directamente.
+# `rustls-tls` evita depender de OpenSSL del sistema (Windows cross-build).
+reqwest            = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 
 [dev-dependencies]
 tokio              = { workspace = true, features = ["test-util"] }

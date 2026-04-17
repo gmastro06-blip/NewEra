@@ -1,0 +1,113 @@
+# abdendriel_wasps.toml — Hunt profile para Ab'dendriel Wasps (druid low-mid level).
+#
+# Este archivo centraliza los datos del hunt (loot esperado, supplies requeridos,
+# mobs target, métricas baseline). El cavebot TOML referencia este profile via
+# `hunt_profile = "abdendriel_wasps"` en el top-level.
+#
+# Usado downstream por:
+#   - CheckSupplies step lee [supplies] (menos hardcoding en cavebot TOML)
+#   - StowAllItems usa [loot.stackables] como whitelist para stash_full detector
+#   - Battle list validator compara mobs actuales vs [monsters] (anti-lure)
+#   - /metrics expone kills/hour vs [metrics.expected_xp_per_hour] como health signal
+#
+# PENDIENTE VALIDACIÓN LIVE: los valores de [loot], [monsters] y [metrics] son
+# placeholders razonables basados en TibiaWiki. El usuario debería refinarlos
+# con 1 hora de hunt manual + contabilidad.
+
+name           = "abdendriel_wasps"
+description    = "Cueva de Wasps cerca de Ab'dendriel. Hunt de nivel bajo — wasps tienen poison damage muy bajo (máx 2 hp/turno) y XP modesta. Ideal para nivel 8-15. Casi no se gastan potions."
+level_range    = [8, 15]
+vocation       = "druid"  # druid | knight | paladin | sorcerer
+
+# ─────────────────────────────────────────────────────────────────────
+# Loot (corregido 2026-04-17 con datos del usuario)
+# ─────────────────────────────────────────────────────────────────────
+[loot]
+# Main drop: honeycomb (confirmado por user).
+# Gold coins siempre se stashean.
+# Mana potions quedan del refill si sobran.
+stackables = [
+    "gold_coin",
+    "honeycomb",           # drop principal de wasps
+    "mana_potion",         # compradas en refill, si sobra se stashea
+]
+
+# Non-stackables: quedan en el bag o depot chest. Raros.
+non_stackables = []
+
+# Items que el bot SIEMPRE descarta (trash sin espacio).
+drop = []
+
+# ─────────────────────────────────────────────────────────────────────
+# Supplies
+# ─────────────────────────────────────────────────────────────────────
+[supplies]
+# Cada entrada: { min = X, target = Y }
+#   min    — umbral mínimo para seguir al hunt; si menos, refill mandatorio
+#   target — cantidad a comprar cuando refill se activa
+#
+# Usado por CheckSupplies step. El cavebot puede ahora referenciar
+# check_supplies con `from_profile = true` en vez de repetir la lista.
+#
+# Ajustado 2026-04-17: user reporta "casi ninguna" potion consumida porque
+# poison damage de wasps es mínimo (2 hp/turno). Cantidades muy reducidas.
+mana_potion   = { min = 20, target = 50 }   # bajo — wasps consumen muy poca mana
+health_potion = { min = 5,  target = 10 }   # emergency only, no combat heal
+rope          = { min = 1,  target = 1  }   # para escaleras/holes del hunt
+
+# ─────────────────────────────────────────────────────────────────────
+# Monsters
+# ─────────────────────────────────────────────────────────────────────
+[monsters]
+# Mobs esperados en el hunt — battle list detect cuenta estos para kills_gte.
+expected = [
+    "Wasp",
+    "Bug",
+]
+
+# Mobs a evitar (lure protection). Si aparecen en la battle list, el cavebot
+# debería escapar (retreat step, no implementado aún) o hacer SafetyPause con
+# reason "unexpected_mob:<name>".
+avoid = [
+    "Stalker",             # invisible, peligroso
+    "Troll",               # demasiado HP para druid low-level
+    "Orc",                 # fuera de zona típica
+]
+
+# Boss/rare mobs que valen la pena farmear — el bot debería priorizarlos
+# (no implementado, placeholder).
+priority = []
+
+# ─────────────────────────────────────────────────────────────────────
+# Métricas baseline
+# ─────────────────────────────────────────────────────────────────────
+[metrics]
+# Valores de referencia para health signals. Si actual cae <50% de expected
+# durante >15 min, probable bug del cavebot (stuck loop, no farmeando real).
+#
+# Corregido 2026-04-17 con datos del usuario: XP real 5k-15k/hr (no los
+# 50k que asumí). Hunt modesto de entry-level, no high-yield.
+expected_xp_per_hour        = 10_000   # mid-range de 5-15k/hr reportado
+expected_xp_min_per_hour    = 3_000    # si cae debajo de esto, probable bug
+expected_loot_gp_per_hour   = 2_000    # honeycomb + gold, bajo valor
+expected_kills_per_hour     = 120      # wasps rápidas de matar pero XP baja
+expected_deaths_per_session = 0        # si >0 bug grave (wasps no matan)
+
+# Tiempo promedio esperado para ciclo completo depot→hunt→depot.
+# Hunt corto con pocas supplies — refill rápido.
+expected_cycle_min = 30
+
+# ─────────────────────────────────────────────────────────────────────
+# Calibration hints (opcional — por si sidebar layout difiere)
+# ─────────────────────────────────────────────────────────────────────
+[calibration_hints]
+# Número de backpacks abiertos en el layout del usuario durante hunt.
+# El inventory scanner necesita esto para backpack_count.
+backpack_count = 4
+
+# Si el usuario organiza los bags con stackable loot específicamente en
+# bag 3/4, listar acá para que stow_all_items los priorice.
+stow_bags = [
+    { bag_index = 3, name = "Green Backpack", expected_loot = ["wasp_sting", "honeycomb"] },
+    { bag_index = 4, name = "Bag",            expected_loot = ["gold_coin"] },
+]
