@@ -81,6 +81,50 @@ where
     count
 }
 
+/// Longest horizontal contiguous run of pixels matching `pred` within the ROI.
+///
+/// Scans each row independently. For each row, tracks the current run of
+/// consecutive matching pixels and updates the global maximum across rows.
+///
+/// **Uso clave 2026-04-18**: el battle list detector HP-bar usaba total pixel
+/// count. Las líneas de texto rojo del NPC chat ("Aelzerand Neeymas: hi"
+/// renderizadas en rojo Tibia) tienen MUCHOS pixeles colored pero
+/// DISCONTINUOS (gaps entre letras). Un HP bar real es un strip horizontal
+/// CONTINUO (≥30 pixeles consecutivos típicamente). Distinguir por run
+/// contiguo elimina el false positive.
+pub fn longest_horizontal_run<F>(frame: &Frame, roi: Roi, pred: F) -> u32
+where
+    F: Fn(&[u8]) -> bool,
+{
+    if !roi.fits_in(frame.width, frame.height) {
+        return 0;
+    }
+    let stride = frame.width as usize * 4;
+    let mut max_run = 0u32;
+    for row in 0..roi.h {
+        let y = (roi.y + row) as usize;
+        let base = y * stride;
+        let mut current_run = 0u32;
+        for col in 0..roi.w {
+            let x = (roi.x + col) as usize;
+            let off = base + x * 4;
+            if off + 3 >= frame.data.len() {
+                break;
+            }
+            let px = &frame.data[off..off + 4];
+            if pred(px) {
+                current_run += 1;
+                if current_run > max_run {
+                    max_run = current_run;
+                }
+            } else {
+                current_run = 0;
+            }
+        }
+    }
+    max_run
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -47,6 +47,11 @@ pub struct TickContext {
     /// Nombres de templates de UI visibles en el frame actual.
     /// Usado por `Condition::UiVisible` en GotoIf/Stand.
     pub ui_matches: Vec<String>,
+    /// Por cada template matched, su (center_x, center_y, width, height) en
+    /// frame coords. Usado por OpenNpcTrade con `bag_button_template = "..."`
+    /// para click genérico en icons identificables por template (bag, etc.)
+    /// sin hardcodear coords por NPC. Cache hasta ~500ms stale.
+    pub ui_match_infos: std::collections::HashMap<String, (u32, u32, u32, u32)>,
     /// `Some(true)` = char se movió. `Some(false)` = sin movimiento.
     /// `None` = minimap no calibrado — stuck detection deshabilitado.
     pub is_moving: Option<bool>,
@@ -208,6 +213,12 @@ pub struct Cavebot {
     open_trade_phrase_idx: usize,
     /// Tick en que se empezó la fase actual (wait o post-click).
     open_trade_phase_start: u64,
+    /// 2026-04-18 anti-spam hard guarantee: true cuando YA emitimos el
+    /// greeting en este step. `restart_current_step` PRESERVA este flag
+    /// (solo se resetea en `do_advance` cuando dejamos el step). Sin esto,
+    /// cada FSM interrupt (combat → walking) o Resume re-disparaba phase 0
+    /// → "hi" otra vez → riesgo de ban por chat spam.
+    open_trade_greeting_sent: bool,
     /// Ticks consecutivos donde `ctx.is_moving == false` durante un Walk.
     /// Se resetea en 0 al entrar a cada step. Si supera STUCK_THRESHOLD_TICKS
     /// durante un Walk activo, el bot avanza al siguiente step (da por perdida
@@ -375,6 +386,7 @@ impl Cavebot {
             open_trade_phase: 0,
             open_trade_phrase_idx: 0,
             open_trade_phase_start: 0,
+            open_trade_greeting_sent: false,
             stuck_walk_ticks: 0,
             needs_kills_baseline: true,
             prev_node: None,
@@ -463,6 +475,79 @@ impl Cavebot {
     /// ¿El cavebot tiene steps cargados y un step activo?
     pub fn is_running(&self) -> bool {
         self.current.is_some()
+    }
+
+    /// Devuelve los nombres de templates UI que el step actual (y su verify,
+    /// si está activo) necesitan que el `UiDetector` procese este tick.
+    ///
+    /// El game loop llama esto cada tick y hace `ui_detector.sync_on_demand(&result)`.
+    /// Templates declarados `Always` por el detector (ej `npc_trade_bag`) no
+    /// necesitan estar aquí — se procesan incondicionalmente.
+    ///
+    /// Motivación: sin este filtrado, el bg_worker del UiDetector procesa
+    /// templates caros (stow_menu=20.9s, depot_chest=1.97s, bench 2026-04-18)
+    /// en cada cycle aunque el bot esté caminando sin interactuar con ellos.
+    pub fn required_ui_templates(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+
+        // Si estamos verificando un StepVerify::TemplateVisible/Absent,
+        // activar ese template para que el próximo cycle lo procese.
+        // El spec vive en el step actual (verify field), no en VerifyingState.
+        if self.verifying.is_some() {
+            if let Some(idx) = self.current {
+                if let Some(step) = self.steps.get(idx) {
+                    if let Some(v) = &step.verify {
+                        match &v.check {
+                            VerifyCheck::TemplateVisible { name, .. }
+                            | VerifyCheck::TemplateAbsent { name, .. } => {
+                                out.push(name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // Step actual — declara las dependencias de UI esperadas.
+        if let Some(idx) = self.current {
+            if let Some(step) = self.steps.get(idx) {
+                match &step.kind {
+                    // NPC trade: la verify puede mirar "npc_trade" para confirmar
+                    // que la ventana está abierta, y bag_button_template
+                    // para el click genérico (si está set).
+                    StepKind::OpenNpcTrade { bag_button_template, .. } => {
+                        out.push("npc_trade".to_string());
+                        if let Some(t) = bag_button_template {
+                            out.push(t.clone());
+                        }
+                    }
+                    StepKind::BuyItem { .. }
+                    | StepKind::SellItem { .. }
+                    | StepKind::TypeInField { .. } => {
+                        // Estos ocurren DENTRO de la trade window abierta.
+                        // Activar npc_trade por si el verify del step anterior
+                        // todavía depende de él, o para que "npc_trade visible"
+                        // permanezca cacheado durante la secuencia.
+                        out.push("npc_trade".to_string());
+                    }
+                    // Depot: abre el depot chest + menú contextual stow.
+                    StepKind::Deposit { .. } => {
+                        out.push("depot_chest".to_string());
+                        out.push("stow_menu".to_string());
+                    }
+                    StepKind::StowAllItems { .. } => {
+                        out.push("stow_menu".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Deduplicar preservando orden de insert.
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|n| seen.insert(n.clone()));
+        out
     }
 
     /// Ejecuta un tick del cavebot con el contexto dado.
@@ -741,7 +826,7 @@ impl Cavebot {
                 // Usado por NPCs de Tibia 12 cuyo greeting expone un icono
                 // de bag (alternativa a decir "trade" / "potions" / etc).
                 StepKind::OpenNpcTrade {
-                    greeting_phrases, bag_button_vx, bag_button_vy, wait_button_ms,
+                    greeting_phrases, bag_button_vx, bag_button_vy, bag_button_template, wait_button_ms,
                 } => {
                     // Ticks de espera post-click — hardcoded 500ms para que
                     // la trade window termine de renderizarse antes del
@@ -749,22 +834,75 @@ impl Cavebot {
                     const POST_CLICK_WAIT_MS: u64 = 500;
                     match self.open_trade_phase {
                         0 => {
+                            // HARD ANTI-SPAM: si ya emitimos el greeting en este
+                            // step (flag preserva a través de restart_current_step),
+                            // saltar directo a phase 2 sin re-saying "hi".
+                            //
+                            // Escenarios que ESTE flag previene:
+                            //   - FSM combat → walking → restart_current_step → re-hi
+                            //   - ResumeCavebot tras pause manual → re-hi
+                            //   - Focus lost/regained → eventual restart → re-hi
+                            //
+                            // Solo `do_advance` (al dejar este step) limpia el
+                            // flag. Así el próximo refill loop sí dice "hi"
+                            // de nuevo (apropiado).
+                            //
+                            // Fallback secundario: si template del bag está set
+                            // y matchea, también skippear (útil si greeting ya
+                            // estaba abierto cuando entramos al step).
+                            let bag_already_visible = bag_button_template.as_deref()
+                                .and_then(|tpl| ctx.ui_match_infos.get(tpl))
+                                .is_some();
+                            // Anti-spam: si ya completamos el greeting (flag
+                            // seteado al agotar todas las phrases) o el bag
+                            // icon ya es visible (greeting window ya abierto),
+                            // saltar directo a phase 1 para continuar con el
+                            // render wait + click. Sin esto, un restart_current_step
+                            // tras combat interrumpiría el chat con un re-emit
+                            // de "hi". El flag PRESERVA through restart; solo
+                            // `do_advance` (al dejar el step) lo resetea.
+                            //
+                            // Phase 1 (no phase 2 como versión anterior del
+                            // flag hacía): phase 2 es el post-click wait, un
+                            // skip directo a ella deja el click sin emitir.
+                            if self.open_trade_greeting_sent || bag_already_visible {
+                                tracing::info!(
+                                    "OpenNpcTrade[{}] phase 0 SKIP (greeting_sent={}, bag_visible={}) \
+                                     → phase 1 (render wait + click)",
+                                    idx, self.open_trade_greeting_sent, bag_already_visible
+                                );
+                                self.open_trade_phase = 1;
+                                self.open_trade_phase_start = ctx.tick;
+                                return CavebotAction::Idle;
+                            }
                             // Fase 0: tipear greeting_phrases una por tick.
+                            // El flag NO se setea tras cada emit — solo al
+                            // completar la secuencia entera. Eso permite que
+                            // un restart mid-greeting re-inicie desde la
+                            // primera phrase (idx se resetea en restart) sin
+                            // que el flag (false aún) skipee la re-emisión.
                             if self.open_trade_phrase_idx < greeting_phrases.len() {
                                 let phrase = greeting_phrases[self.open_trade_phrase_idx].clone();
                                 self.open_trade_phrase_idx += 1;
+                                tracing::info!(
+                                    "OpenNpcTrade[{}] phase 0: emit greeting '{}' ({}/{})",
+                                    idx, phrase,
+                                    self.open_trade_phrase_idx,
+                                    greeting_phrases.len()
+                                );
                                 return CavebotAction::Say(phrase);
                             }
-                            // Todas las frases emitidas → pasar a fase 1.
+                            // Todas las frases emitidas → activar flag anti-spam
+                            // y pasar a fase 1. A partir de aquí, cualquier
+                            // restart preservará el flag y skipeará el re-emit.
+                            self.open_trade_greeting_sent = true;
                             self.open_trade_phase = 1;
                             self.open_trade_phase_start = ctx.tick;
                             tracing::info!(
-                                "OpenNpcTrade[{}] phase 1: esperando {}ms para render del greeting window",
+                                "OpenNpcTrade[{}] greeting complete, phase 1: esperando {}ms \
+                                 para render del greeting window",
                                 idx, wait_button_ms
                             );
-                            // Si wait_button_ms == 0, fall-through al próximo
-                            // tick evitaría esperar — devolvemos Idle para
-                            // chequear el timer en el siguiente tick.
                             return CavebotAction::Idle;
                         }
                         1 => {
@@ -774,14 +912,63 @@ impl Cavebot {
                             if ctx.tick.saturating_sub(self.open_trade_phase_start) >= wait_ticks {
                                 self.open_trade_phase = 2;
                                 self.open_trade_phase_start = ctx.tick;
-                                tracing::info!(
-                                    "OpenNpcTrade[{}] phase 2: click bag button at ({}, {}). \
-                                     If wrong position, edit script: bag_button_vx={}, bag_button_vy={}",
-                                    idx, bag_button_vx, bag_button_vy, bag_button_vx, bag_button_vy
-                                );
-                                return CavebotAction::Click {
-                                    vx: bag_button_vx, vy: bag_button_vy,
+
+                                // **Genérico**: si bag_button_template está set,
+                                // buscar el template en el frame actual via
+                                // ctx.ui_match_infos. Si matchea, clickeamos
+                                // su centro. Sino, fallback a coord hardcoded
+                                // si está set; sino, no emit y phase 2 va a
+                                // timeout → verify falla → SafetyPause.
+                                let click_coord: Option<(i32, i32)> = if let Some(tpl) = bag_button_template.as_deref() {
+                                    match ctx.ui_match_infos.get(tpl) {
+                                        Some(&(cx, cy, _, _)) => {
+                                            tracing::info!(
+                                                "OpenNpcTrade[{}] phase 2 (template): bag '{}' matched at ({}, {})",
+                                                idx, tpl, cx, cy
+                                            );
+                                            Some((cx as i32, cy as i32))
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                "OpenNpcTrade[{}] template '{}' NO matched en frame actual. \
+                                                 Greeting window no visible o template wrong. ui_match_infos keys: {:?}",
+                                                idx, tpl, ctx.ui_match_infos.keys().collect::<Vec<_>>()
+                                            );
+                                            // Fallback a coord hardcoded si está disponible.
+                                            match (bag_button_vx, bag_button_vy) {
+                                                (Some(vx), Some(vy)) => Some((vx, vy)),
+                                                _ => None,
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Sin template → coord hardcoded.
+                                    match (bag_button_vx, bag_button_vy) {
+                                        (Some(vx), Some(vy)) => Some((vx, vy)),
+                                        _ => None,
+                                    }
                                 };
+
+                                match click_coord {
+                                    Some((vx, vy)) => {
+                                        tracing::info!(
+                                            "OpenNpcTrade[{}] phase 2: click bag at ({}, {})",
+                                            idx, vx, vy
+                                        );
+                                        return CavebotAction::Click { vx, vy };
+                                    }
+                                    None => {
+                                        // Sin coord → no click, dejar que
+                                        // verify detecte el fail.
+                                        tracing::error!(
+                                            "OpenNpcTrade[{}] sin coord de click (template miss y sin fallback). \
+                                             Advance directo; verify va a fallar.",
+                                            idx
+                                        );
+                                        self.advance(ctx.tick);
+                                        continue;
+                                    }
+                                }
                             }
                             return CavebotAction::Idle;
                         }
@@ -1690,6 +1877,7 @@ impl Cavebot {
         self.open_trade_phase = 0;
         self.open_trade_phrase_idx = 0;
         self.open_trade_phase_start = 0;
+        self.open_trade_greeting_sent = false;  // reset solo al ADVANCE (no en restart)
         self.stuck_walk_ticks = 0;
         self.needs_kills_baseline = true;
         self.deposit_phase = 0;
@@ -1758,6 +1946,7 @@ impl Cavebot {
             self.open_trade_phase = 0;
             self.open_trade_phrase_idx = 0;
             self.open_trade_phase_start = 0;
+            self.open_trade_greeting_sent = false;  // jump fresh = nuevo step = puede decir "hi"
             self.stuck_walk_ticks = 0;
             self.deposit_phase = 0;
             self.deposit_phase_start = 0;
@@ -2755,8 +2944,9 @@ mod tests {
             vec![
                 step(StepKind::OpenNpcTrade {
                     greeting_phrases: vec!["hi".into()],
-                    bag_button_vx: 350,
-                    bag_button_vy: 400,
+                    bag_button_vx: Some(350),
+                    bag_button_vy: Some(400),
+                    bag_button_template: None,
                     wait_button_ms: 800,
                 }),
                 step(StepKind::Hotkey { hidcode: 0xBB }),
@@ -2802,8 +2992,9 @@ mod tests {
         let mut cb = Cavebot::new(
             vec![step(StepKind::OpenNpcTrade {
                 greeting_phrases: vec!["hi".into(), "yes".into()],
-                bag_button_vx: 100,
-                bag_button_vy: 200,
+                bag_button_vx: Some(100),
+                bag_button_vy: Some(200),
+                bag_button_template: None,
                 wait_button_ms: 0, // sin wait para test focused en fase 0
             })],
             false, 30,
@@ -2821,8 +3012,9 @@ mod tests {
             vec![
                 step(StepKind::OpenNpcTrade {
                     greeting_phrases: vec!["hi".into()],
-                    bag_button_vx: 42,
-                    bag_button_vy: 43,
+                    bag_button_vx: Some(42),
+                    bag_button_vy: Some(43),
+                    bag_button_template: None,
                     wait_button_ms: 0,
                 }),
                 step(StepKind::Hotkey { hidcode: 0xAA }),
@@ -2849,8 +3041,9 @@ mod tests {
         let mut cb = Cavebot::new(
             vec![step(StepKind::OpenNpcTrade {
                 greeting_phrases: vec!["hi".into(), "yes".into()],
-                bag_button_vx: 1,
-                bag_button_vy: 2,
+                bag_button_vx: Some(1),
+                bag_button_vy: Some(2),
+                bag_button_template: None,
                 wait_button_ms: 500,
             })],
             false, 30,
@@ -4822,6 +5015,97 @@ mod tests {
             let action = cb.tick(&mut ctx_ui(2, vec![]));
             assert!(matches!(action, CavebotAction::SafetyPause { .. }),
                     "retry_action=0 = legacy → SafetyPause directo");
+        }
+    }
+
+    // ── required_ui_templates: qué templates OnDemand necesita el step actual ─
+    //
+    // Vectores importantes: sin el filtrado correcto, el UiDetector procesa
+    // templates caros (stow_menu=20.9s) cuando el bot solo está caminando.
+    mod required_ui_templates {
+        use super::*;
+
+        /// Helper: construye un cavebot con un solo step y lo avanza al tick 0
+        /// para que `current = Some(0)` esté set.
+        fn cb_with_step(kind: StepKind) -> Cavebot {
+            let cb = Cavebot::new(vec![step(kind)], false, 30);
+            // Cavebot::new ya setea current=Some(0) si hay steps.
+            cb
+        }
+
+        #[test]
+        fn walk_step_requires_nothing() {
+            let cb = cb_with_step(StepKind::Walk {
+                hidcode: 0xAA, duration_ms: 100, interval_ms: 0,
+            });
+            assert!(cb.required_ui_templates().is_empty());
+        }
+
+        #[test]
+        fn open_npc_trade_requires_npc_trade() {
+            let cb = cb_with_step(StepKind::OpenNpcTrade {
+                greeting_phrases:    vec!["hi".into()],
+                bag_button_vx:       Some(100),
+                bag_button_vy:       Some(200),
+                bag_button_template: None,
+                wait_button_ms:      500,
+            });
+            assert_eq!(cb.required_ui_templates(), vec!["npc_trade".to_string()]);
+        }
+
+        #[test]
+        fn open_npc_trade_with_bag_template_includes_it() {
+            let cb = cb_with_step(StepKind::OpenNpcTrade {
+                greeting_phrases:    vec!["hi".into()],
+                bag_button_vx:       None,
+                bag_button_vy:       None,
+                bag_button_template: Some("npc_trade_bag".into()),
+                wait_button_ms:      500,
+            });
+            let req = cb.required_ui_templates();
+            assert!(req.contains(&"npc_trade".to_string()));
+            assert!(req.contains(&"npc_trade_bag".to_string()));
+        }
+
+        #[test]
+        fn stow_all_items_requires_stow_menu() {
+            let cb = cb_with_step(StepKind::StowAllItems {
+                slot_vx:              100,  slot_vy:              200,
+                menu_offset_x:        90,   menu_offset_y:        197,
+                menu_wait_ms:         300,
+                stow_process_ms:      800,
+                max_iterations:       8,
+                stackables_whitelist: None,
+            });
+            assert_eq!(cb.required_ui_templates(), vec!["stow_menu".to_string()]);
+        }
+
+        #[test]
+        fn deposit_requires_depot_chest_and_stow_menu() {
+            let cb = cb_with_step(StepKind::Deposit {
+                chest_vx: 100, chest_vy: 200,
+                stow_vx: 300, stow_vy: 400,
+                menu_wait_ms: 200, process_ms: 200,
+            });
+            let req = cb.required_ui_templates();
+            assert!(req.contains(&"depot_chest".to_string()));
+            assert!(req.contains(&"stow_menu".to_string()));
+            assert_eq!(req.len(), 2);
+        }
+
+        #[test]
+        fn no_duplicates_when_same_template_requested_twice() {
+            // bag_button_template que coincide con npc_trade no debería duplicar.
+            let cb = cb_with_step(StepKind::OpenNpcTrade {
+                greeting_phrases:    vec!["hi".into()],
+                bag_button_vx:       None,
+                bag_button_vy:       None,
+                bag_button_template: Some("npc_trade".into()), // same name
+                wait_button_ms:      500,
+            });
+            let req = cb.required_ui_templates();
+            assert_eq!(req.len(), 1, "no duplicates: got {:?}", req);
+            assert_eq!(req[0], "npc_trade");
         }
     }
 }

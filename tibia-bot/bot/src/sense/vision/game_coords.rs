@@ -495,9 +495,12 @@ pub const MAX_JUMP_PER_DETECT: i32 = 30;
 /// - Si `force_full=true` → bypassa el filtro (re-validación explícita,
 ///   acepta drift grande tras muerte/despawn).
 /// - Si `last` es `None` → no hay baseline, acepta (cold boot sin seed).
-/// - Si `detected.z != last.z` → cross-floor (ladder/rope/teleport),
-///   acepta sin filtro — las subidas/bajadas son saltos legítimos
-///   en distancia XY mínima pero cambian el piso.
+/// - Si `detected.z != last.z` → cross-floor. Ladder/rope drops al char
+///   cerca del mismo XY (dx,dy ≤ MAX_XY_ON_FLOOR_CHANGE tiles). Si el
+///   jump XY es grande + z diff → false positive del matcher (validado
+///   live 2026-04-18: saltó (32679,31684,6) → (32565,31779,7), dx=114,
+///   dy=95, imposible sin teleport). Solo aceptar cross-floor si XY
+///   está cerca del último known.
 /// - Si `|dx| > MAX_JUMP OR |dy| > MAX_JUMP` en el mismo piso → rechaza (`None`).
 /// - Sino → acepta (`Some(detected)`).
 pub fn validate_jump(
@@ -506,14 +509,35 @@ pub fn validate_jump(
     force_full: bool,
 ) -> Option<(i32, i32, i32)> {
     let d = detected?;
-    if force_full {
-        return Some(d);
-    }
+    // 2026-04-18 fix live: removido el `if force_full { return Some(d); }`
+    // — la auto-revalidación cada N detects generaba un hole en el filter:
+    // el matcher podía jumpear a un sector false-positive sin validation,
+    // actualizar last_game_coords, y los narrow siguientes se quedaban ahí.
+    //
+    // Ahora: si last es Some, SIEMPRE validamos. El `force_full` solo
+    // controla el scope del SEARCH en el matcher (narrow vs brute force),
+    // pero el FILTER se aplica igual. Cold boot (last=None) sigue bypass
+    // porque no hay baseline contra qué validar.
+    //
+    // Trade-off: si el char verdaderamente teleporta (hot_portal, rescue
+    // post-death), el filter bloquea hasta que el bot reinicie o el user
+    // actualice el seed. Para farming en area fija (Ab'dendriel), strict
+    // es la ventana correcta.
+    let _ = force_full; // kept para backwards compat de la API
     let Some(l) = last else {
         return Some(d);
     };
     if d.2 != l.2 {
-        return Some(d); // cross-floor — bypass
+        // Cross-floor: ladder/rope deja al char casi en el mismo XY. Un
+        // jump grande de XY al cambiar piso es señal de false positive
+        // del matcher, no navegación real.
+        const MAX_XY_ON_FLOOR_CHANGE: i32 = 3;
+        let dx = (d.0 - l.0).abs();
+        let dy = (d.1 - l.1).abs();
+        if dx <= MAX_XY_ON_FLOOR_CHANGE && dy <= MAX_XY_ON_FLOOR_CHANGE {
+            return Some(d); // legitimate ladder/rope
+        }
+        return None; // reject: z change + big xy jump = false positive
     }
     let dx = (d.0 - l.0).abs();
     let dy = (d.1 - l.1).abs();
@@ -1186,27 +1210,66 @@ mod tests {
     }
 
     #[test]
-    fn validate_jump_force_full_bypasses_filter() {
-        // force_full = re-validación, acepta drift grande.
+    fn validate_jump_force_full_still_validates_with_baseline() {
+        // 2026-04-18 fix: force_full ya NO bypassa el filter si hay last_known.
+        // Era un hole que permitía false positives del matcher post-revalidation.
+        // Ahora: si last es Some, validamos siempre, independiente de force_full.
         let last     = Some((1000, 1000, 6));
         let detected = Some((5000, 5000, 6));
-        assert_eq!(validate_jump(last, detected, true), detected);
+        // Drift enorme mismo piso → rechazado incluso con force_full=true.
+        assert_eq!(validate_jump(last, detected, true), None);
+
+        // Si last es None (verdadero cold boot), pasa cualquier cosa.
+        assert_eq!(
+            validate_jump(None, Some((5000, 5000, 6)), true),
+            Some((5000, 5000, 6))
+        );
     }
 
     #[test]
-    fn validate_jump_cross_floor_accepts_any_xy() {
-        // Ladder/rope/teleport: z cambia, xy puede cambiar arbitrariamente.
+    fn validate_jump_cross_floor_accepts_small_xy_jump() {
+        // Ladder/rope legítimo: z cambia pero xy queda cerca (dx/dy ≤ 3).
         let last = Some((1000, 1000, 6));
-        // Mismo XY, piso distinto → ladder
+        // Mismo XY, piso distinto → ladder típico
         assert_eq!(
             validate_jump(last, Some((1000, 1000, 7)), false),
             Some((1000, 1000, 7))
         );
-        // XY muy distinto + z distinto → teleport
+        // XY ±2 tiles, piso distinto → ladder con drift permitido
         assert_eq!(
-            validate_jump(last, Some((5000, 5000, 7)), false),
-            Some((5000, 5000, 7))
+            validate_jump(last, Some((1002, 998, 7)), false),
+            Some((1002, 998, 7))
         );
+        // XY ±3, piso distinto → borde (3 es max permitido)
+        assert_eq!(
+            validate_jump(last, Some((1003, 997, 7)), false),
+            Some((1003, 997, 7))
+        );
+    }
+
+    #[test]
+    fn validate_jump_cross_floor_rejects_big_xy_jump() {
+        // Hardening 2026-04-18 post live bug: z cambia + xy jump grande =
+        // false positive del matcher (imposible físicamente sin teleport).
+        // Caso real observado: (32679,31684,6) → (32565,31779,7)
+        // dx=114, dy=95, z=1 → rechazar.
+        let last = Some((32679, 31684, 6));
+        let bogus = Some((32565, 31779, 7));
+        assert_eq!(
+            validate_jump(last, bogus, false), None,
+            "cross-floor + xy jump >3 tiles debe rechazarse como false positive"
+        );
+
+        // dx=4 en z change → borde excedido, rechaza
+        let last2 = Some((1000, 1000, 6));
+        assert_eq!(
+            validate_jump(last2, Some((1004, 1000, 7)), false), None,
+            "dx=4 en cross-floor excede MAX_XY_ON_FLOOR_CHANGE=3"
+        );
+
+        // Teleports legítimos (mage spells, etc) NO pasan el filter sin
+        // force_full — aceptable trade-off: tras un teleport, el proximo
+        // force_full (cada N detects) re-sincroniza.
     }
 
     #[test]

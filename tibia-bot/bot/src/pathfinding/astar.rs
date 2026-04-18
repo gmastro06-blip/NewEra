@@ -1,6 +1,14 @@
 //! astar — A* pathfinding sobre una [`WalkabilityGrid`].
 //!
-//! Implementación estándar con `BinaryHeap` como priority queue.
+//! **Implementación**: delega el core a `pathfinding::directed::astar::astar`
+//! (crate batería-incluida). Preserva las 2 features del wrapper histórico:
+//!   - `max_iters` — aborta la búsqueda si se expanden > N nodos.
+//!   - `nodes_expanded` — counter devuelto en `Path` para profiling.
+//!
+//! Ambos se implementan envolviendo el callback `successors` con un
+//! `Cell<usize>` compartido que cuenta invocaciones y, cuando supera
+//! `max_iters`, retorna `[]` — eso hace que el algoritmo termine con `None`.
+//!
 //! **Seis-conectividad**: 4 vecinos en el mismo piso (N/S/E/W) + 2 vecinos
 //! verticales (Z±1) cuando ambos tiles están marcados como transición
 //! (stair/ramp/rope). Esto permite pathfinding multi-floor automático.
@@ -25,8 +33,7 @@
 //! - `max_iters` = 100_000 nodos expandidos (default).
 //! - Si se excede, retorna `None`.
 
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::cell::Cell;
 
 use super::walkability::{WalkabilityGrid, WALL_THRESHOLD};
 
@@ -50,26 +57,6 @@ pub struct Path {
     pub nodes_expanded: usize,
 }
 
-/// Nodo en la priority queue. `f_score` ordena (menor = mejor).
-#[derive(Debug, Eq, PartialEq)]
-struct Node {
-    f_score: u64,
-    tile: (i32, i32, i32),
-}
-
-impl Ord for Node {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap es max-heap. Invertimos para min-heap.
-        other.f_score.cmp(&self.f_score)
-    }
-}
-
-impl PartialOrd for Node {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 /// Heurística 3D admisible: distancia mínima posible entre 2 tiles.
 ///
 /// Para ser admisible, nunca debe sobreestimar el cost real. El cost mínimo
@@ -80,6 +67,42 @@ fn heuristic(a: (i32, i32, i32), b: (i32, i32, i32)) -> u64 {
     let dy = (a.1 - b.1).unsigned_abs() as u64;
     let dz = (a.2 - b.2).unsigned_abs() as u64;
     (dx + dy) * MIN_TILE_COST + dz * (MIN_TILE_COST + FLOOR_CHANGE_PENALTY)
+}
+
+/// Computa los vecinos transitables de un tile con sus costs.
+///
+/// 4-connectivity en el mismo piso + 2 verticales cuando ambos extremos
+/// están marcados como transición. Los walls (cost ≥ WALL_THRESHOLD) y los
+/// tiles desconocidos (cost = None) se filtran. El cost de un edge incluye
+/// `FLOOR_CHANGE_PENALTY` si cruza pisos.
+fn successors(
+    tile: (i32, i32, i32),
+    grid: &WalkabilityGrid,
+) -> Vec<((i32, i32, i32), u64)> {
+    let mut neighbors: Vec<(i32, i32, i32)> = vec![
+        (tile.0, tile.1 - 1, tile.2),
+        (tile.0, tile.1 + 1, tile.2),
+        (tile.0 - 1, tile.1, tile.2),
+        (tile.0 + 1, tile.1, tile.2),
+    ];
+    if grid.is_transition(tile.0, tile.1, tile.2) {
+        let up   = (tile.0, tile.1, tile.2 - 1);
+        let down = (tile.0, tile.1, tile.2 + 1);
+        if grid.is_transition(up.0, up.1, up.2)     { neighbors.push(up);   }
+        if grid.is_transition(down.0, down.1, down.2) { neighbors.push(down); }
+    }
+    neighbors.into_iter()
+        .filter_map(|next| {
+            let cost = grid.cost(next.0, next.1, next.2)?;
+            if cost >= WALL_THRESHOLD { return None; }
+            let move_cost = if next.2 != tile.2 {
+                cost as u64 + FLOOR_CHANGE_PENALTY
+            } else {
+                cost as u64
+            };
+            Some((next, move_cost))
+        })
+        .collect()
 }
 
 /// Busca un path entre `start` y `goal` en la grilla. Retorna `None` si
@@ -116,104 +139,40 @@ pub fn find_path_with_limit(
         return None;
     }
 
-    let mut open: BinaryHeap<Node> = BinaryHeap::new();
-    let mut came_from: HashMap<(i32, i32, i32), (i32, i32, i32)> = HashMap::new();
-    let mut g_score: HashMap<(i32, i32, i32), u64> = HashMap::new();
+    // Counter compartido entre el successors callback y el post-process.
+    // `Cell` permite mutación interior sin exclusive borrow — necesario porque
+    // el callback se pasa como `FnMut` pero queremos leer el counter tras
+    // la llamada a astar.
+    let nodes_expanded = Cell::new(0usize);
+    let aborted        = Cell::new(false);
 
-    g_score.insert(start, 0);
-    open.push(Node {
-        f_score: heuristic(start, goal),
-        tile: start,
-    });
-
-    let mut nodes_expanded = 0usize;
-
-    while let Some(Node { tile: current, .. }) = open.pop() {
-        nodes_expanded += 1;
-
-        if current == goal {
-            return Some(reconstruct_path(
-                came_from,
-                current,
-                g_score[&current],
-                nodes_expanded,
-            ));
-        }
-
-        if nodes_expanded >= max_iters {
-            return None;
-        }
-
-        // 4 vecinos en el mismo piso (N/S/E/W).
-        let mut neighbors: Vec<(i32, i32, i32)> = vec![
-            (current.0, current.1 - 1, current.2),
-            (current.0, current.1 + 1, current.2),
-            (current.0 - 1, current.1, current.2),
-            (current.0 + 1, current.1, current.2),
-        ];
-
-        // 2 vecinos verticales (Z±1) SOLO si current está marcado como
-        // transición (stair/ramp/rope) y el destino también.
-        if grid.is_transition(current.0, current.1, current.2) {
-            let up = (current.0, current.1, current.2 - 1);
-            let down = (current.0, current.1, current.2 + 1);
-            if grid.is_transition(up.0, up.1, up.2) {
-                neighbors.push(up);
+    let result = pathfinding::directed::astar::astar(
+        &start,
+        |&tile| {
+            // Si ya abortamos por max_iters, devolver vacío → astar termina None.
+            if aborted.get() {
+                return Vec::new();
             }
-            if grid.is_transition(down.0, down.1, down.2) {
-                neighbors.push(down);
+            nodes_expanded.set(nodes_expanded.get() + 1);
+            if nodes_expanded.get() >= max_iters {
+                aborted.set(true);
+                return Vec::new();
             }
-        }
+            successors(tile, grid)
+        },
+        |&tile| heuristic(tile, goal),
+        |&tile| tile == goal,
+    );
 
-        for next in neighbors {
-            let Some(cost) = grid.cost(next.0, next.1, next.2) else {
-                continue; // tile desconocido
-            };
-            if cost >= WALL_THRESHOLD {
-                continue; // wall
-            }
-
-            // Penalty adicional si hay cambio de piso.
-            let move_cost = if next.2 != current.2 {
-                cost as u64 + FLOOR_CHANGE_PENALTY
-            } else {
-                cost as u64
-            };
-
-            let tentative_g = g_score[&current] + move_cost;
-            let existing = g_score.get(&next).copied().unwrap_or(u64::MAX);
-            if tentative_g < existing {
-                came_from.insert(next, current);
-                g_score.insert(next, tentative_g);
-                let f = tentative_g + heuristic(next, goal);
-                open.push(Node {
-                    f_score: f,
-                    tile: next,
-                });
-            }
-        }
+    if aborted.get() {
+        return None;
     }
 
-    None
-}
-
-fn reconstruct_path(
-    came_from: HashMap<(i32, i32, i32), (i32, i32, i32)>,
-    mut current: (i32, i32, i32),
-    total_cost: u64,
-    nodes_expanded: usize,
-) -> Path {
-    let mut tiles = vec![current];
-    while let Some(&prev) = came_from.get(&current) {
-        tiles.push(prev);
-        current = prev;
-    }
-    tiles.reverse();
-    Path {
+    result.map(|(tiles, total_cost)| Path {
         tiles,
         total_cost,
-        nodes_expanded,
-    }
+        nodes_expanded: nodes_expanded.get(),
+    })
 }
 
 /// Reduce un path contiguo a sus corners (cambios de dirección en x, y o z).

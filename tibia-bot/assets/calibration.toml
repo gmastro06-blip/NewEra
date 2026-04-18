@@ -11,18 +11,22 @@ mana_bar = { x = 921, y = 5, w = 635, h = 25 }
 
 # ── Panel de batalla ─────────────────────────────────────────────────────────
 # Panel izquierdo completo. Medido con GIMP 2026-04-10 por el usuario.
-# y=36 empieza justo debajo del header "Battle List".
+# 2026-04-18: recalibrado con GetCursorPos — primera fila top-border en y=45
+# (antes y=36 → 9px arriba, causaba desfase en la grilla de 22px/slot).
 # w=171 cubre el slot entero (icono + nombre + HP bar).
-# h=1006 abarca todo el sidebar vertical — permite ver cualquier número
+# h=997 abarca todo el sidebar vertical — permite ver cualquier número
 # de mobs en la battle list. El lector hace n_rows = h/22 = 45 rows.
 # Rows vacías simplemente no superan MIN_HP_BAR_PX, coste perf negligible.
-battle_list = { x = 2, y = 36, w = 171, h = 1006 }
+battle_list = { x = 2, y = 45, w = 171, h = 997 }
 
 # ── Minimapa ──────────────────────────────────────────────────────────────────
 minimap = { x = 1753, y = 4, w = 107, h = 110 }
 
 # ── Viewport de juego ─────────────────────────────────────────────────────────
-game_viewport = { x = 388, y = 94, w = 967, h = 708 }
+# 2026-04-18: recalibrado con GetCursorPos — top-left real en (392, 83).
+# Antes (388, 94) estaba 11px desplazado hacia abajo. Preservamos y_bottom=802
+# (original 94+708) → nuevo h=719. x sin cambio (4px ruido de medición).
+game_viewport = { x = 388, y = 83, w = 967, h = 719 }
 
 # ── Target HP bar (encima del viewport) ──────────────────────────────────────
 # Área donde Tibia muestra la barra de vida + nombre del target actual.
@@ -58,9 +62,24 @@ prompt_char_select = { x = 490, y = 290, w = 900, h = 480 }
 # depot_chest: panel lateral derecho donde aparece la ventana del depot.
 # Ajustar tras abrir el depot chest en Tibia y medir con GIMP.
 depot_chest = { x = 1550, y = 0, w = 370, h = 500 }
-# stow_menu: menú de contexto aparece donde hagas click derecho.
-# Cubre toda la mitad derecha de la pantalla (inventario + containers).
-stow_menu   = { x = 900,  y = 0, w = 1020, h = 800 }
+
+# npc_trade_bag: icono de bag en el greeting window de cualquier NPC
+# shopkeeper. Vive en el sidebar IZQUIERDO, row de 4 icons bajo el chat.
+# ROI generoso porque el chat puede scrollearse → greeting window shift.
+npc_trade_bag = { x = 0, y = 250, w = 180, h = 100 }
+# stow_menu: menú de contexto tras right-click en un slot del bag.
+#
+# 2026-04-18: recalibrado tras bench baseline (cycle pre-split 20.9s por
+# stow_menu cuando ROI era 1020×800 y template 215×219 — 38G ops).
+# Nuevo template es solo la franja "Stow all items of this type" (210×24).
+# ROI cubre el área donde el menu context aparece tras right-click en
+# cualquier bag slot del sidebar derecho (slot_vx ∈ [1596, 1636], el menu
+# se extiende ~215 px a la derecha y ~220 abajo del click). Margen
+# generoso para tolerar futuros hunts con slots en otras ubicaciones del
+# sidebar.
+#
+# Speedup medido: ~36× (ROI 3.9× × template 9.3×).
+stow_menu   = { x = 1400, y = 50, w = 520, h = 550 }
 # npc_trade: panel "Commerce" de shopkeeper en el sidebar izquierdo.
 # Usado por StepVerify (open_npc_trade, bye click) vía ctx.ui_matches.
 # Mismas coords que [prompts].prompt_npc_trade — necesario porque UiDetector
@@ -128,7 +147,38 @@ slot_rows      = 1
 # ser una ventana un poco mayor al template para permitir drifts pequeños
 # de ventana (±10 px típicamente), pero NO más grande porque entonces la
 # template matching puede encontrar false positives.
-[[anchors]]
-name          = "sidebar_top"
-template_path = "sidebar_top.png"
-expected_roi  = { x = 1700, y = 0, w = 80, h = 70 }
+#
+# 2026-04-18: AnchorTracker ahora hace **geometric consistency check** cuando
+# hay ≥2 anchors (ver `cluster_offset` en anchors.rs). Cada anchor reporta
+# su offset independientemente; solo los que coinciden dentro de ±15px forman
+# cluster. El falso-positivo de `sidebar_top` en la battle list (x=132 vs
+# expected x=1700 → offset -1568px) se descarta automáticamente cuando el
+# segundo anchor reporta offset cercano a (0, 0).
+#
+# **Para activar el tracking**: regenerar 2 templates distintivos con
+# `make_anchors` sobre un frame live y descomentar los dos bloques de abajo.
+# El geometric check solo protege si existen LOS DOS — con uno solo, el
+# tracker vuelve a confiar ciegamente.
+#
+# Recomendación de anchors (elementos visualmente estables y poco ambiguos):
+#   1. sidebar_top  — header del sidebar derecho (icono Battle List, logos)
+#   2. minimap_corner — esquina NO del minimap (tiene N/S/E/W indicators)
+#
+# Workflow:
+#   1. curl /test/grab -o frame.png
+#   2. cargo run --release --bin make_anchors -- frame.png assets
+#   3. Verificar que los PNGs generados son distintivos (no blank, no logo
+#      repetido en otras UI zones).
+#   4. Descomentar los bloques de abajo. Los ROIs `expected_roi` son bounding
+#      boxes para búsqueda normal; la recovery full-frame solo se activa si
+#      el anchor se pierde por >10 ciclos.
+#
+# [[anchors]]
+# name          = "sidebar_top"
+# template_path = "sidebar_top.png"
+# expected_roi  = { x = 1700, y = 0, w = 80, h = 70 }
+#
+# [[anchors]]
+# name          = "minimap_corner"
+# template_path = "minimap_corner.png"
+# expected_roi  = { x = 1845, y = 15, w = 70, h = 60 }

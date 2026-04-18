@@ -135,6 +135,9 @@ struct StepToml {
     bag_button_vx: Option<i32>,
     #[serde(default)]
     bag_button_vy: Option<i32>,
+    /// GENÉRICO: template matching del bag icon (ver step.rs).
+    #[serde(default)]
+    bag_button_template: Option<String>,
     #[serde(default)]
     wait_button_ms: Option<u64>,
     // Node (coordenadas absolutas)
@@ -459,7 +462,7 @@ fn parse_step_toml(
         kind, name, key, duration_ms, interval_ms,
         until, max_wait_ms, label, when, vx, vy, retry_count,
         phrases, wait_prompt_ms,
-        greeting_phrases, bag_button_vx, bag_button_vy, wait_button_ms,
+        greeting_phrases, bag_button_vx, bag_button_vy, bag_button_template, wait_button_ms,
         x, y, z,
         chest_vx, chest_vy, stow_vx, stow_vy, menu_wait_ms, process_ms,
         item_vx, item_vy, amount_vx, amount_vy, confirm_vx, confirm_vy, sell_vx, sell_vy, quantity, spacing_ms,
@@ -551,12 +554,21 @@ fn parse_step_toml(
             if greeting_phrases.is_empty() {
                 bail!("open_npc_trade: 'greeting_phrases' no puede estar vacío");
             }
+            // Al menos uno: template (genérico) o coord hardcoded (legacy).
+            // Template toma prioridad si ambos están.
+            let has_template = bag_button_template.is_some();
+            let has_coords = bag_button_vx.is_some() && bag_button_vy.is_some();
+            if !has_template && !has_coords {
+                bail!(
+                    "open_npc_trade: necesita `bag_button_template = \"<name>\"` (genérico, \
+                     recomendado) o `bag_button_vx`/`bag_button_vy` (coords hardcoded legacy)"
+                );
+            }
             StepKind::OpenNpcTrade {
                 greeting_phrases,
-                bag_button_vx: bag_button_vx
-                    .context("open_npc_trade: falta 'bag_button_vx'")?,
-                bag_button_vy: bag_button_vy
-                    .context("open_npc_trade: falta 'bag_button_vy'")?,
+                bag_button_vx,
+                bag_button_vy,
+                bag_button_template,
                 wait_button_ms: wait_button_ms.unwrap_or(800),
             }
         }
@@ -1103,11 +1115,12 @@ mod tests {
         assert_eq!(cb.steps.len(), 1);
         match &cb.steps[0].kind {
             StepKind::OpenNpcTrade {
-                greeting_phrases, bag_button_vx, bag_button_vy, wait_button_ms,
+                greeting_phrases, bag_button_vx, bag_button_vy, bag_button_template, wait_button_ms,
             } => {
                 assert_eq!(greeting_phrases, &vec!["hi".to_string()]);
-                assert_eq!(*bag_button_vx, 350);
-                assert_eq!(*bag_button_vy, 400);
+                assert_eq!(*bag_button_vx, Some(350));
+                assert_eq!(*bag_button_vy, Some(400));
+                assert!(bag_button_template.is_none());
                 assert_eq!(*wait_button_ms, 800);
             }
             _ => panic!("not OpenNpcTrade"),

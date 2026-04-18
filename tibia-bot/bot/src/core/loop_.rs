@@ -55,6 +55,8 @@ pub enum LoopCommand {
     ResumeCavebot,
     /// Descarga el cavebot cargado.
     ClearCavebot,
+    /// Salta el cavebot a un label específico (útil para test focused).
+    JumpToCavebotLabel { label: String },
     // ── Recording (F1.4) ────────────────────────────────────────────────
     /// Inicia grabación de perception snapshots a JSONL.
     /// Si `path` es None, usa el default `session.jsonl`.
@@ -522,6 +524,25 @@ impl BotLoop {
             }
 
             // ── VISION ────────────────────────────────────────────────────────
+            //
+            // Antes del tick, declarar qué templates OnDemand necesita el step
+            // actual del cavebot. Sin esto, el UiDetector procesa TODOS los
+            // templates cada ciclo (cycle time ~23s, bench 2026-04-18). Con
+            // esto, en steady state el cycle cae a <50ms.
+            //
+            // La lista se calcula desde el step "actual" (el que correría en
+            // este tick). Hay hasta SUBMIT_INTERVAL (500ms) de retardo entre
+            // una transición de step y el UiDetector viendo un match — trivial
+            // comparado con los 23s previos.
+            if let Some(cb) = self.cavebot.as_ref() {
+                let required = cb.required_ui_templates();
+                let refs: Vec<&str> = required.iter().map(String::as_str).collect();
+                self.vision.set_ui_demand(&refs);
+            } else {
+                // Sin cavebot activo → ningún OnDemand (solo Always).
+                self.vision.set_ui_demand(&[]);
+            }
+
             let vision_start = Instant::now();
             let perception = if let Some(ref frame) = *frame_arc {
                 self.vision.tick(frame, tick_num)
@@ -608,6 +629,7 @@ impl BotLoop {
                             in_combat: perception.battle.has_enemies(),
                             last_activity_tick,
                             ui_matches: perception.ui_matches.clone(),
+                            ui_match_infos: perception.ui_match_infos.clone(),
                             is_moving: perception.is_moving,
                             enemy_count: perception.battle.enemy_count() as u32,
                             loot_sparkles: perception.loot_sparkles,
@@ -1399,6 +1421,17 @@ impl BotLoop {
                 info!("Cavebot descargado");
                 self.cavebot = None;
                 self.cavebot_enabled = false;
+            }
+            LoopCommand::JumpToCavebotLabel { label } => {
+                if let Some(cb) = &mut self.cavebot {
+                    if cb.jump_to_label(&label, tick) {
+                        info!("Cavebot saltó a label '{}' en tick {}", label, tick);
+                    } else {
+                        warn!("JumpToCavebotLabel: label '{}' no encontrado en script", label);
+                    }
+                } else {
+                    warn!("JumpToCavebotLabel ignorado: no hay cavebot cargado");
+                }
             }
             LoopCommand::ReloadScripts { .. } => {
                 // Se procesa inline en run() (líneas ~376-409) porque necesita

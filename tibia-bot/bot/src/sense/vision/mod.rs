@@ -403,6 +403,19 @@ impl Vision {
         })
     }
 
+    /// Activa/desactiva templates OnDemand del UiDetector según el step actual
+    /// del cavebot. Llamar ANTES de `tick()` cada iteración del game loop.
+    ///
+    /// `desired` típicamente viene de `Cavebot::required_ui_templates()`. Sin
+    /// esta llamada los templates OnDemand nunca se procesan → features como
+    /// StepVerify sobre `stow_menu` / `depot_chest` no funcionan. Con la
+    /// llamada, solo se procesan los templates relevantes al step en curso,
+    /// reduciendo el cycle time del bg_worker de ~23s a <50ms en steady state
+    /// (bench baseline 2026-04-18).
+    pub fn set_ui_demand(&mut self, desired: &[&str]) {
+        self.ui_detector.sync_on_demand(desired);
+    }
+
     /// Procesa un frame y retorna la Perception resultante.
     /// Nunca falla — retorna Perception::default() si la calibración no está lista.
     pub fn tick(&mut self, frame: &Frame, frame_tick: u64) -> Perception {
@@ -485,7 +498,22 @@ impl Vision {
         };
 
         // Leer battle list (stateful con histéresis).
-        let battle = if let Some(roi) = self.calibration.battle_list.map(|r| self.tracker.adjust_roi(r)) {
+        //
+        // 2026-04-18: GATE por NPC greeting window. Cuando el greeting
+        // está abierto, ocluye el mismo espacio que usaría el battle list.
+        // El chat NPC + portrait + texto colored crean false positives
+        // (392-1900 hits por row) que MAX_HP_BAR_PX (700) no filtra todos.
+        // Solución: detectar greeting window via match_now SYNC (barato,
+        // template 34x34, ROI 180x100, <5ms) y skippear battle list si
+        // greeting visible — real battle list no puede coexistir con
+        // NPC dialog en este espacio.
+        let greeting_window_open = self.ui_detector
+            .match_now(frame, "npc_trade_bag")
+            .is_some();
+        let battle = if greeting_window_open {
+            // Greeting abierto → sin battle list real posible.
+            Default::default()
+        } else if let Some(roi) = self.calibration.battle_list.map(|r| self.tracker.adjust_roi(r)) {
             self.battle_detector.read(frame, roi)
         } else {
             Default::default()
@@ -604,7 +632,42 @@ impl Vision {
         // resultados. last_matches() retorna el resultado del último job completado
         // (puede ser hasta ~500ms antiguo, aceptable para cambios de UI lentos).
         self.ui_detector.tick(frame);
-        let ui_matches = self.ui_detector.last_matches().to_vec();
+        let mut ui_matches = self.ui_detector.last_matches();
+        // Snapshot de match infos (nombre → (cx, cy, w, h)) para consumo del
+        // cavebot (OpenNpcTrade bag_button_template).
+        let mut ui_match_infos: std::collections::HashMap<String, (u32, u32, u32, u32)> =
+            self.ui_detector.last_matches_map().into_iter()
+                .map(|(name, info)| (
+                    name,
+                    (info.center_x, info.center_y, info.template_w, info.template_h)
+                ))
+                .collect();
+        // ── SYNC match override para templates CRÍTICOS ───────────────────────
+        //
+        // 2026-04-18: el async cache puede tener datos stale (hasta STICKY_TTL)
+        // cuando el main loop bloquea por MinimapMatcher full search (4s). Para
+        // templates chicos (ROI <200x200, template <50x50) donde match_now cuesta
+        // <5ms, corremos SYNC y overrideamos el cache. Asegura coord fresca
+        // cuando el cavebot llega a OpenNpcTrade y necesita clickear el bag.
+        //
+        // Solo templates explícitamente listados — no aplicar a templates caros
+        // (npc_trade, stow_menu) que sumarían 2-5s/tick.
+        const SYNC_PRIORITY_TEMPLATES: &[&str] = &["npc_trade_bag"];
+        for name in SYNC_PRIORITY_TEMPLATES {
+            if let Some(m) = self.ui_detector.match_now(frame, name) {
+                ui_match_infos.insert(
+                    name.to_string(),
+                    (m.x + m.w / 2, m.y + m.h / 2, m.w, m.h),
+                );
+                if !ui_matches.iter().any(|n| n == name) {
+                    ui_matches.push(name.to_string());
+                }
+            } else {
+                // Sin match en el frame actual → remover stale del cache.
+                ui_match_infos.remove(*name);
+                ui_matches.retain(|n| n != name);
+            }
+        }
 
         // Tile-hashing: detectar coordenadas absolutas cada N frames.
         //
@@ -796,6 +859,7 @@ impl Vision {
             target_hits,
             loot_sparkles,
             ui_matches,
+            ui_match_infos,
             captured_at: Some(frame.captured_at),
             frame_tick,
             minimap_diff,

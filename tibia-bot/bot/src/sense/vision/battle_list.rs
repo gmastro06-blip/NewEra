@@ -28,18 +28,35 @@ use crate::sense::frame_buffer::Frame;
 use crate::sense::perception::{BattleEntry, BattleList, EntryKind, SlotDebug};
 use crate::sense::vision::calibration::RoiDef;
 use crate::sense::vision::color::{is_bar_filled, is_monster_red, is_npc_yellow, is_player_blue};
-use crate::sense::vision::crop::{count_pixels, Roi};
+use crate::sense::vision::crop::{count_pixels, longest_horizontal_run, Roi};
 
 /// Altura en píxeles de cada entrada en la lista de batalla de Tibia (1920x1080).
 const ENTRY_HEIGHT_PX: u32 = 22;
 /// Ancho en píxeles del borde de color a analizar (columnas más a la izquierda).
 const BORDER_WIDTH_PX: u32 = 3;
 /// Mínimo de píxeles del color para confirmar la clasificación.
-const MIN_BORDER_HITS:  u32 = 2;
+/// Hits mínimos del color dominante en el borde (3×22=66 px máx) para
+/// clasificar. Anti-false-positive 2026-04-18: valor anterior era 2, lo
+/// que disparaba con texto rojo del NPC chat que deja 3-5 red pixels en
+/// los primeros 3 cols. Un border REAL de Tibia tiene 40-60 red pixels
+/// en esos 66. Bumpeado a 15 para rechazar texto + JPEG noise sin romper
+/// detection de borders reales.
+const MIN_BORDER_HITS:  u32 = 15;
 
 /// Threshold ALTO: píxeles "HP bar" requeridos para **empezar** a detectar
 /// un slot como Monster. Calibrado para HP bars reales (≥ ~40 px verdes).
 const MIN_HP_BAR_PX: u32 = 40;
+
+/// 2026-04-18: upper bound anti-false-positive. Un HP bar real de Tibia
+/// (171 px ancho × ~4 px alto) tiene máximo ~500 pixeles coloreados. Chat
+/// NPC / portraits / dialog overlays pueden contribuir 1500-1800 pixeles
+/// matching el color filter. Si hits supera este umbral, NO es HP bar.
+///
+/// Típico:
+///   - HP bar real (mob con HP full): 300-500 hits
+///   - HP bar real (mob low HP): 30-100 hits
+///   - Chat NPC + portrait en el ROI: 1000-2000 hits
+const MAX_HP_BAR_PX: u32 = 700;
 /// Threshold BAJO: conteo máximo de píxeles para considerar un slot
 /// realmente vacío (mob muerto + entry retirada del panel). Un slot con
 /// mob vivo mantiene el icono visible (~30-60 px cromáticos del portrait)
@@ -56,6 +73,22 @@ const MIN_HP_BAR_PX: u32 = 40;
 /// <20 hits incluso con noise fuerte. Un mob vivo (icono 30+ px) supera
 /// el threshold sin problema.
 const EMPTY_SLOT_PX: u32 = 20;
+
+/// Threshold de run horizontal CONTIGUO mínimo para clasificar un slot
+/// como Monster. Una HP bar real tiene 30+ pixels consecutivos del mismo
+/// color (verde/amarillo/rojo/azul según fase). Texto tiene gaps (<10
+/// pixels consecutivos máximo por carácter).
+///
+/// Anti-false-positive 2026-04-18: el detector anterior usaba solo
+/// `count_pixels` (total) que cuenta todos los pixeles colored en el
+/// ROI, incluso discontinuos. Texto rojo del NPC chat sumaba hits
+/// suficientes para pasar MIN_HP_BAR_PX=40 → false Monster detection
+/// cada vez que había diálogo activo.
+const MIN_HP_BAR_RUN: u32 = 30;
+/// Sticky threshold para mantener slot como Monster: run ≥ este valor.
+/// Más tolerante que MIN para absorber mobs con HP bar bajo (<30% HP
+/// puede tener bar rendered short).
+const STICKY_HP_BAR_RUN: u32 = 12;
 
 /// Detector stateful del battle list.
 ///
@@ -265,10 +298,19 @@ fn count_and_detect_hp_bar(
         return (0, None);
     }
     let hits = count_pixels(frame, scan_roi, is_bar_filled);
+    // 2026-04-18: requerir run horizontal contiguo además de total count.
+    // Texto del NPC chat tiene MUCHOS pixeles colored pero DISCONTINUOS
+    // (gaps entre letras). HP bar real es strip continuo ≥30 pixeles.
+    let longest_run = longest_horizontal_run(frame, scan_roi, is_bar_filled);
     let detected = if was_monster_prev {
-        hits > EMPTY_SLOT_PX
+        // Sticky: mantener slot si pasa EITHER threshold (tolera mobs de
+        // bajo HP con bar short, pero también exige evidencia de run).
+        // MAX bound: si hits > MAX_HP_BAR_PX, es NPC dialog/portrait, NO mob.
+        hits > EMPTY_SLOT_PX && hits <= MAX_HP_BAR_PX && longest_run >= STICKY_HP_BAR_RUN
     } else {
-        hits >= MIN_HP_BAR_PX
+        // Inicial: hits + run AMBOS deben pasar. Texto falla en run.
+        // MAX bound: slots con 1000+ hits son false positives (NPC chat / portrait).
+        hits >= MIN_HP_BAR_PX && hits <= MAX_HP_BAR_PX && longest_run >= MIN_HP_BAR_RUN
     };
     let kind = if detected { Some(EntryKind::Monster) } else { None };
     (hits, kind)
@@ -546,5 +588,79 @@ mod tests {
         ];
         let bl = BattleList { entries, slot_debug: vec![] };
         assert!(bl.has_attacked_entry());
+    }
+
+    /// Pinta un slot con simulación de TEXTO ROJO del NPC chat
+    /// (caracteres de rojo con gaps entre ellos, ~60 pixeles total
+    /// pero ningún run > 6 pixeles contiguos). Este era el false-positive
+    /// case del 2026-04-18 live run.
+    fn paint_red_text_in_slot(
+        frame: &mut Frame, panel_x: u32, panel_y: u32,
+    ) {
+        let stride = frame.width as usize * 4;
+        // Simular 7 "caracteres" de 5 px cada uno con 3 px gap entre letras.
+        // 7 × (5 + 3) = 56 pixels en una fila, total ~80 px de ancho.
+        // Cada char son ~5px contiguos → longest_run = 5 (bien bajo de 30 threshold).
+        for y_off in 8..=10u32 { // 3 filas de altura (como fuente Tibia)
+            let y = panel_y + y_off;
+            for char_idx in 0..7u32 {
+                let char_start = panel_x + 2 + char_idx * 8;
+                for pix in 0..5u32 {
+                    let x = char_start + pix;
+                    if x >= frame.width || y >= frame.height { continue; }
+                    let off = y as usize * stride + x as usize * 4;
+                    if off + 3 < frame.data.len() {
+                        frame.data[off]     = 200; // R — rojo oscuro (NPC red)
+                        frame.data[off + 1] = 40;  // G
+                        frame.data[off + 2] = 40;  // B
+                        frame.data[off + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hp_bar_detector_rejects_npc_red_text_as_false_positive() {
+        // Regression test del bug live 2026-04-18: NPC chat "Aelzerand
+        // Neeymas: hi" era detectado como 13 Monster entries porque
+        // cada línea de texto rojo tenía 60+ pixeles total colored.
+        // Con el fix (longest_horizontal_run ≥ 30), texto no pasa.
+        let mut frame = make_empty_frame(200, 100);
+        let roi = RoiDef { x: 0, y: 0, w: 180, h: 88 };
+        paint_red_text_in_slot(&mut frame, 0, 0);
+
+        let mut det = BattleListDetector::new();
+        let bl = det.read(&frame, roi);
+
+        // Con texto rojo scattered: cada línea tiene longest_run=5 < 30
+        // threshold → NO debe detectarse como Monster.
+        let monsters: Vec<_> = bl.entries.iter()
+            .filter(|e| matches!(e.kind, EntryKind::Monster))
+            .collect();
+        assert_eq!(
+            monsters.len(), 0,
+            "texto rojo del NPC chat NO debe ser detectado como Monster. \
+             debug: {:?}",
+            bl.slot_debug.iter()
+                .filter(|d| d.kind.is_some())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hp_bar_detector_accepts_contiguous_bar() {
+        // Sanity check: barra contigua de 50+ pixeles SÍ debe detectarse.
+        let mut frame = make_empty_frame(200, 100);
+        let roi = RoiDef { x: 0, y: 0, w: 180, h: 44 };
+        // paint_hp_bar_in_slot ya pinta una barra contigua (50 px).
+        paint_hp_bar_in_slot(&mut frame, 0, 0, 50);
+
+        let mut det = BattleListDetector::new();
+        let bl = det.read(&frame, roi);
+        let monsters: Vec<_> = bl.entries.iter()
+            .filter(|e| matches!(e.kind, EntryKind::Monster))
+            .collect();
+        assert_eq!(monsters.len(), 1, "HP bar contigua 50px debe detectarse como Monster");
     }
 }

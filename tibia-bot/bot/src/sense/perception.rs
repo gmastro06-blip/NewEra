@@ -67,6 +67,12 @@ pub struct Perception {
     /// hacen match. Vacío si no hay templates cargados o ninguno coincide.
     /// Accesible en Lua como `ctx.ui["depot_chest"]`.
     pub ui_matches: Vec<String>,
+    /// Coordenadas center-x/y + dims de cada template matched.
+    /// Usado por OpenNpcTrade con `bag_button_template = "..."` para click
+    /// genérico en el bag icon del greeting sin hardcodear coords por NPC.
+    /// Key = nombre del template, Value = (center_x, center_y, width, height).
+    /// Vacío si no hay matches. Hasta ~500ms stale (cache async del UiDetector).
+    pub ui_match_infos: std::collections::HashMap<String, (u32, u32, u32, u32)>,
     /// Timestamp de cuando se procesó este frame.
     pub captured_at: Option<Instant>,
     /// Número de frame en que se generó esta percepción.

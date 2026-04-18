@@ -1053,9 +1053,12 @@ mod tests {
     }
 
     #[test]
-    fn input_config_default_is_sendinput() {
+    fn input_config_default_is_serial() {
+        // 2026-04-18: alineado con `default_input_mode()` tras ADR-001
+        // (anti-BattleEye). El default se movió a "serial" (Arduino HID) en
+        // commit fb7a1b8; este test quedó stale hasta 2026-04-18.
         let cfg = InputConfig::default();
-        assert_eq!(cfg.mode, "sendinput");
+        assert_eq!(cfg.mode, "serial");
     }
 
     #[test]

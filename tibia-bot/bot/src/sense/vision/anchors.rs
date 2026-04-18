@@ -271,10 +271,27 @@ impl AnchorTracker {
         }
     }
 
-    /// Offset promedio de la ventana según todos los anclas con match válido.
-    /// Si un anchor está lost pero tiene `last_good`, usa ese offset como
-    /// fallback degradado (mejor que (0,0) si la ventana no se movió).
-    /// Retorna (0, 0) si ningún anchor tiene match ni last_good.
+    /// Offset promedio de la ventana con **geometric consistency check** cuando
+    /// hay ≥2 anchors. Un anchor con offset inconsistente vs los demás se
+    /// descarta como false-positive en lugar de contaminar el promedio.
+    ///
+    /// Motivación (2026-04-18 — caso real): `sidebar_top` tras full-frame
+    /// recovery matcheaba en la battle list panel (x=132) en vez del sidebar
+    /// real (x=1700) → offset=-1568px que shift-eaba todas las ROIs al fuera
+    /// del frame. Con un segundo anchor independiente (ej minimap_corner),
+    /// ambos DEBEN reportar offsets similares (dentro de GEOMETRIC_TOLERANCE_PX).
+    /// Si diverge uno, el cluster consistente lo excluye.
+    ///
+    /// Comportamiento:
+    /// - 0 anchors válidos → (0, 0)
+    /// - 1 anchor válido → su offset (sin comparación posible; confía en
+    ///   `max_score` para evitar matches absurdos)
+    /// - ≥2 anchors válidos → geometric filtering: los matches dentro de
+    ///   `GEOMETRIC_TOLERANCE_PX` del cluster dominante se promedian; el
+    ///   resto se descarta con warning. Si ninguno forma cluster consistente
+    ///   (todos divergen), retorna (0, 0) con warning.
+    ///
+    /// Los matches lost usan `last_good` como fallback degradado.
     pub fn window_offset(&self) -> (i32, i32) {
         let s = self.shared.read();
         let valid: Vec<AnchorMatch> = s.matches.iter()
@@ -289,14 +306,76 @@ impl AnchorTracker {
                 }
             })
             .collect();
+        drop(s);
 
+        Self::cluster_offset(&valid)
+    }
+
+    /// Aplica geometric consistency filtering al set de matches y devuelve
+    /// el offset promedio del cluster dominante. Expuesto como método
+    /// asociado para testabilidad.
+    fn cluster_offset(valid: &[AnchorMatch]) -> (i32, i32) {
         if valid.is_empty() {
             return (0, 0);
         }
+        if valid.len() == 1 {
+            return (valid[0].offset_x, valid[0].offset_y);
+        }
+        const GEOMETRIC_TOLERANCE_PX: i32 = 15;
 
-        let n = valid.len() as i32;
-        let ox = valid.iter().map(|m| m.offset_x).sum::<i32>() / n;
-        let oy = valid.iter().map(|m| m.offset_y).sum::<i32>() / n;
+        // Cluster dominante: el match con más vecinos dentro de tolerance
+        // es el "pivote" del cluster. Los vecinos se incluyen en el promedio.
+        // Coste O(n²) pero n ≤ 5 en la práctica — negligible.
+        let mut best_pivot = 0usize;
+        let mut best_count = 0usize;
+        for (i, m_i) in valid.iter().enumerate() {
+            let count = valid.iter()
+                .filter(|m_j| {
+                    (m_j.offset_x - m_i.offset_x).abs() <= GEOMETRIC_TOLERANCE_PX
+                        && (m_j.offset_y - m_i.offset_y).abs() <= GEOMETRIC_TOLERANCE_PX
+                })
+                .count();
+            if count > best_count {
+                best_count  = count;
+                best_pivot  = i;
+            }
+        }
+
+        // Sin cluster de ≥2 → todos los matches divergen entre sí. Ningún
+        // anchor confiable → (0, 0) + warning.
+        if best_count < 2 {
+            tracing::warn!(
+                "AnchorTracker: {} anchors inconsistentes (offsets: {:?}), \
+                 ninguno forma cluster dentro de ±{}px. Usando (0, 0).",
+                valid.len(),
+                valid.iter().map(|m| (m.offset_x, m.offset_y)).collect::<Vec<_>>(),
+                GEOMETRIC_TOLERANCE_PX
+            );
+            return (0, 0);
+        }
+
+        let pivot = &valid[best_pivot];
+        let cluster: Vec<&AnchorMatch> = valid.iter()
+            .filter(|m| {
+                (m.offset_x - pivot.offset_x).abs() <= GEOMETRIC_TOLERANCE_PX
+                    && (m.offset_y - pivot.offset_y).abs() <= GEOMETRIC_TOLERANCE_PX
+            })
+            .collect();
+
+        if cluster.len() < valid.len() {
+            let outliers: Vec<(i32, i32)> = valid.iter()
+                .filter(|m| !cluster.iter().any(|c| std::ptr::eq(*c, *m)))
+                .map(|m| (m.offset_x, m.offset_y))
+                .collect();
+            tracing::warn!(
+                "AnchorTracker: descartando {} outlier(s) {:?} (cluster pivote=({}, {}))",
+                outliers.len(), outliers, pivot.offset_x, pivot.offset_y
+            );
+        }
+
+        let n  = cluster.len() as i32;
+        let ox = cluster.iter().map(|m| m.offset_x).sum::<i32>() / n;
+        let oy = cluster.iter().map(|m| m.offset_y).sum::<i32>() / n;
         (ox, oy)
     }
 
@@ -483,6 +562,54 @@ mod tests {
             s.fail_counts[0] = t.config.max_fails + 1;
         }
         assert_eq!(t.window_offset(), (0, 0));
+    }
+
+    // ── Geometric consistency check (2+ anchors) ──────────────────────────
+
+    /// Con 2 anchors coherentes (offsets dentro de tolerance), el promedio
+    /// los combina como antes.
+    #[test]
+    fn geometric_check_averages_consistent_pair() {
+        let matches = vec![test_match(5, 2), test_match(6, 1)];
+        assert_eq!(AnchorTracker::cluster_offset(&matches), (5, 1));
+    }
+
+    /// Con 2 anchors de offsets divergentes, NINGUNO forma cluster → (0, 0).
+    /// Este es el caso real: un anchor tiene false-positive de -1568px,
+    /// otro tiene offset correcto de 0. Sin cluster consistent → descartar ambos.
+    #[test]
+    fn geometric_check_rejects_divergent_pair() {
+        let matches = vec![test_match(-1568, 0), test_match(0, 0)];
+        assert_eq!(AnchorTracker::cluster_offset(&matches), (0, 0));
+    }
+
+    /// Con 3 anchors donde 2 coinciden y 1 es outlier, el outlier se
+    /// descarta y los 2 consistentes se promedian. Protege contra un
+    /// false-positive individual sin sacrificar el offset sano.
+    #[test]
+    fn geometric_check_drops_outlier_keeps_cluster() {
+        let matches = vec![
+            test_match(4, 0),
+            test_match(6, 2),
+            test_match(-1568, 0), // outlier
+        ];
+        let (ox, oy) = AnchorTracker::cluster_offset(&matches);
+        assert_eq!(ox, 5); // avg(4, 6)
+        assert_eq!(oy, 1); // avg(0, 2)
+    }
+
+    /// Un solo anchor sigue funcionando como antes (sin punto de comparación).
+    /// Esto preserva compat si el usuario no ha configurado el segundo anchor.
+    #[test]
+    fn geometric_check_single_anchor_passes_through() {
+        let matches = vec![test_match(7, -3)];
+        assert_eq!(AnchorTracker::cluster_offset(&matches), (7, -3));
+    }
+
+    /// Lista vacía → (0, 0).
+    #[test]
+    fn geometric_check_empty_returns_zero() {
+        assert_eq!(AnchorTracker::cluster_offset(&[]), (0, 0));
     }
 
     /// Tras recovery (match nuevo tras ser lost), last_good se actualiza.

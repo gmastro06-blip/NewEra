@@ -87,6 +87,10 @@ path = "src/bin/debug_game_coords.rs"
 name = "click_live"
 path = "src/bin/click_live.rs"
 
+[[bin]]
+name = "crop_template"
+path = "src/bin/crop_template.rs"
+
 [dependencies]
 # ── Runtime async ────────────────────────────────────────────────────────────
 tokio              = { workspace = true }
@@ -123,6 +127,12 @@ base64             = "0.22"
 imageproc          = "0.25"
 bincode            = "1.3"               # serialización del map index para coords
 
+# ── Pathfinding ──────────────────────────────────────────────────────────────
+# Crate batería-incluida: A*, Dijkstra, BFS, Kruskal, etc. Reemplaza el
+# A* custom de bot/src/pathfinding/astar.rs — mantenemos `max_iters` y
+# `nodes_expanded` wrapping el `successors` callback con un contador.
+pathfinding        = "4"
+
 # ── Calibración GUI ───────────────────────────────────────────────────────────
 eframe             = "0.29"
 egui               = "0.29"
@@ -147,5 +157,18 @@ clap               = { version = "4", features = ["derive"] }
 # `rustls-tls` evita depender de OpenSSL del sistema (Windows cross-build).
 reqwest            = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 
+# ── Windows API — GetCursorPos en /vision/cursor y /vision/extract_template ──
+# Permite workflow de calibración cursor-based sin PowerShell externo.
+[target.'cfg(windows)'.dependencies]
+windows-sys        = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
 [dev-dependencies]
 tokio              = { workspace = true, features = ["test-util"] }
+# criterion: microbenchmarking del template-matching del UiDetector.
+# Ejecuta `cargo bench --bench template_matching` para generar reports en
+# target/criterion/. Sin historial comparar vs anterior pasa `--save-baseline`.
+criterion          = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "template_matching"
+harness = false

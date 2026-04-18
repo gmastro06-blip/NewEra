@@ -224,21 +224,44 @@ max_wait_ms = 5000
 #   buy_button:          (480, 327)   — botón Buy
 #   bye_button:          (117, 298)   — icono mano rojo (cierra chat)
 
-# 1. Say "hi" + click bag icon
-# Verify: tras el click al bag icon, la trade window debe renderizar.
-# Si el template npc_trade no aparece en 4s → SafetyPause con reason
-# diagnosticable "verify_failed" (vs 12 clicks fantasma del bug pre-ADR-003).
+# Label para focused testing: jump vía /cavebot/jump_to_label?label=buy_potions
+# saltando walk-to-NPC cuando el char ya está frente al NPC.
+[[step]]
+kind = "label"
+name = "buy_potions"
+
+# 1. Say "hi" + click bag icon via TEMPLATE matching (genérico para cualquier NPC)
+# - El bag icon del greeting window de Tibia 12 es siempre el mismo sprite
+# - `bag_button_template = "npc_trade_bag"` → UiDetector busca el template
+#   en el frame actual y clickea su centro. No hardcodeo de coord por NPC.
+# - Fallback: si NPC tiene greeting con bag icon DIFERENTE (raro), usar
+#   bag_button_vx/vy hardcoded.
+# Verify: trade window (distinto del greeting) debe renderizar en 4s.
 [[step]]
 kind = "open_npc_trade"
-greeting_phrases = ["hi"]
-bag_button_vx    = 163
-bag_button_vy    = 301
-wait_button_ms   = 1500
+greeting_phrases    = ["hi"]
+# 2026-04-18: usamos SOLO coord hardcoded. Intento template-based falló
+# porque el icono 4 del greeting cambia según estado del diálogo NPC:
+#   - Estado inicial: potion azul
+#   - Post "trade": bag marrón
+# Un solo template no cubre ambos y el matching loose pegaba con el
+# icono X equivocado (score ~0.18 < threshold). La POSICIÓN del icono 4
+# es consistente → coord hardcoded siempre funciona.
+bag_button_vx       = 150
+bag_button_vy       = 297
+wait_button_ms      = 1500
 
-[step.verify]
-template   = "npc_trade"
-timeout_ms = 4000
-on_fail    = "safety_pause"
+# 2026-04-18: verify deshabilitado temporalmente. El template npc_trade
+# (595×374) es más grande que su ROI (420×650) → bg_worker lo skipea
+# silencioso y el verify siempre timeoutea aunque la trade window esté
+# abierta. Workaround: si el bag click no abrió la trade window, el
+# próximo step (type_in_field) fallará naturalmente al typear en un
+# campo que no existe. TODO: extraer template chico (ej "Commerce" text)
+# y re-habilitar verify.
+# [step.verify]
+# template   = "npc_trade"
+# timeout_ms = 4000
+# on_fail    = "safety_pause"
 
 # 2. Click "Ty to search" + type "mana potion" para filtrar lista
 [[step]]

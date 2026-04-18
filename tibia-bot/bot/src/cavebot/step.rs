@@ -167,8 +167,24 @@ pub enum StepKind {
     /// GIMP y pegar en `bag_button_vx`/`bag_button_vy`.
     OpenNpcTrade {
         greeting_phrases: Vec<String>,
-        bag_button_vx:    i32,
-        bag_button_vy:    i32,
+        /// Coord absoluta HARD-CODED del bag icon (legacy). Solo usada si
+        /// `bag_button_template` es None. `None` si se usa template matching.
+        bag_button_vx:    Option<i32>,
+        bag_button_vy:    Option<i32>,
+        /// **GENÉRICO**: nombre del template PNG en `assets/templates/ui/`
+        /// que matchea el bag icon del greeting window. Si set, el runner
+        /// busca este template en el frame actual y clickea su centro — así
+        /// funciona con CUALQUIER NPC sin re-calibrar coords.
+        ///
+        /// Típico: `bag_button_template = "npc_trade_bag"`.
+        /// Requiere que el template esté cargado por UiDetector (auto-load
+        /// de `assets/templates/ui/*.png` al boot).
+        ///
+        /// Mutuamente exclusivo con bag_button_vx/vy: si ambos set, template
+        /// tiene prioridad. Si el template no matchea (NPC no visible,
+        /// greeting no abierto, template wrong), el OpenNpcTrade falla el
+        /// verify y pausa — útil pues indica que greeting no se abrió.
+        bag_button_template: Option<String>,
         wait_button_ms:   u64,
     },
 
@@ -583,6 +599,7 @@ mod tests {
             in_combat,
             last_activity_tick: 0,
             ui_matches: vec![],
+            ui_match_infos: std::collections::HashMap::new(),
             is_moving: Some(false),
             enemy_count: if in_combat { 1 } else { 0 },
             loot_sparkles: 0,

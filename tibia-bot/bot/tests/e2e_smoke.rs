@@ -460,30 +460,41 @@ fn abdendriel_wasps_cavebot_parses_with_profile_e2e() {
         "cavebot debe haber cargado el hunt profile"
     );
 
-    // Verifies en al menos 3 steps (open_npc_trade + buy_item + bye).
+    // Verifies en al menos 2 steps. El umbral bajó de 3→2 el 2026-04-18:
+    // el verify del OpenNpcTrade quedó comentado temporalmente mientras el
+    // template `npc_trade` (595×374) excede el ROI configurado (420×650) y
+    // es silenciosamente skipeado por el bg_worker. El usuario planea
+    // regenerar el template a un crop estable (ej "Currency:" header) tras
+    // validar en live; cuando lo haga, re-habilitar el verify y subir este
+    // umbral de vuelta a 3.
     let verify_count = cb.steps.iter().filter(|s| s.verify.is_some()).count();
     assert!(
-        verify_count >= 3,
-        "esperaba >=3 [step.verify] en el cavebot, got {}", verify_count
+        verify_count >= 2,
+        "esperaba >=2 [step.verify] en el cavebot, got {}", verify_count
     );
 
-    // El step OpenNpcTrade (primer verify) debe tener verify TemplateVisible
-    // apuntando a "npc_trade".
+    // Si OpenNpcTrade tiene verify, debe apuntar a "npc_trade". Si el verify
+    // está None (estado transitorio del 2026-04-18 post-crop pendiente), se
+    // permite — la ausencia no es regresión, es una decisión explícita del
+    // TOML actual.
     use tibia_bot::cavebot::step::{StepKind, VerifyCheck};
-    let has_npc_trade_verify = cb.steps.iter().any(|s| {
-        matches!(&s.kind, StepKind::OpenNpcTrade { .. })
-            && matches!(
-                &s.verify,
-                Some(v) if matches!(
+    let npc_trade_step = cb.steps.iter()
+        .find(|s| matches!(&s.kind, StepKind::OpenNpcTrade { .. }));
+    assert!(
+        npc_trade_step.is_some(),
+        "el cavebot debe contener al menos un OpenNpcTrade step"
+    );
+    if let Some(s) = npc_trade_step {
+        if let Some(v) = &s.verify {
+            assert!(
+                matches!(
                     &v.check,
                     VerifyCheck::TemplateVisible { name, .. } if name == "npc_trade"
-                )
-            )
-    });
-    assert!(
-        has_npc_trade_verify,
-        "OpenNpcTrade step debe tener verify TemplateVisible('npc_trade')"
-    );
+                ),
+                "si OpenNpcTrade tiene verify, debe ser TemplateVisible('npc_trade')"
+            );
+        }
+    }
 
     // check_supplies debe haber resuelto requirements desde el profile.
     // abdendriel_wasps profile tiene 2 supplies checkables (mana_potion + health_potion).

@@ -29,7 +29,7 @@ use axum::{
 };
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::act::Actuator;
 use crate::config::Config;
@@ -67,6 +67,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/test/inject_frame",     post(handle_test_inject_frame))
         .route("/test/grab",             get(handle_test_grab))
         .route("/vision/perception",     get(handle_vision_perception))
+        .route("/vision/cursor",         get(handle_vision_cursor))
+        .route("/vision/match_now",      get(handle_vision_match_now))
+        .route("/vision/extract_template", post(handle_vision_extract_template))
         .route("/vision/vitals",         get(handle_vision_vitals))
         .route("/vision/battle",         get(handle_vision_battle))
         .route("/vision/status",         get(handle_vision_status))
@@ -93,6 +96,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/cavebot/pause",         post(handle_cavebot_pause))
         .route("/cavebot/resume",        post(handle_cavebot_resume))
         .route("/cavebot/clear",         post(handle_cavebot_clear))
+        .route("/cavebot/jump_to_label", post(handle_cavebot_jump_to_label))
         .route("/scripts/reload",        post(handle_scripts_reload))
         .route("/scripts/status",        get(handle_scripts_status))
         .route("/metrics",               get(handle_prometheus_metrics))
@@ -599,6 +603,270 @@ async fn handle_test_grab(State(s): State<AppState>) -> Response {
         .into_response()
 }
 
+// ── /vision/cursor ────────────────────────────────────────────────────────────
+//
+// Devuelve la posición actual del cursor en coord desktop/viewport.
+// Con Tibia en primary monitor fullscreen, coord desktop == coord viewport.
+// Uso: workflow rápido de calibración sin PowerShell.
+
+#[derive(Serialize)]
+struct CursorPos { x: i32, y: i32 }
+
+#[cfg(windows)]
+async fn handle_vision_cursor(State(_s): State<AppState>) -> Response {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    use windows_sys::Win32::Foundation::POINT;
+    let mut p = POINT { x: 0, y: 0 };
+    let ok = unsafe { GetCursorPos(&mut p as *mut _) };
+    if ok == 0 {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "GetCursorPos failed").into_response();
+    }
+    Json(CursorPos { x: p.x, y: p.y }).into_response()
+}
+
+#[cfg(not(windows))]
+async fn handle_vision_cursor(State(_s): State<AppState>) -> Response {
+    (StatusCode::NOT_IMPLEMENTED, "cursor API solo en Windows").into_response()
+}
+
+// ── /vision/match_now?template=X ──────────────────────────────────────────────
+//
+// Corre template matching SYNC contra el frame actual. Debug: permite ver score
+// exacto y coord del best match sin esperar al background worker async.
+// Bypassa el ROI configurado — busca en el frame completo (más lento pero
+// útil para diagnóstico). Retorna JSON con score + top-left + centro + dims.
+
+#[derive(Deserialize)]
+struct MatchNowQuery {
+    template: String,
+    #[serde(default)]
+    /// Si true, busca solo dentro del ROI configurado en [ui_rois] del template.
+    /// Por default (false) busca en el frame completo (más lento pero
+    /// diagnóstico más completo).
+    use_roi: bool,
+}
+
+#[derive(Serialize)]
+struct MatchNowResponse {
+    template: String,
+    score: f32,
+    top_left_x: u32,
+    top_left_y: u32,
+    center_x: u32,
+    center_y: u32,
+    template_w: u32,
+    template_h: u32,
+    search_area_w: u32,
+    search_area_h: u32,
+    passed_threshold: bool,
+    threshold: f32,
+}
+
+async fn handle_vision_match_now(
+    State(s): State<AppState>,
+    Query(q): Query<MatchNowQuery>,
+) -> Response {
+    use imageproc::template_matching::{match_template, MatchTemplateMethod};
+
+    let frame = match s.buffer.latest_frame() {
+        Some(f) => f,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "No hay frame NDI").into_response(),
+    };
+
+    // Load template from disk (same path UiDetector uses).
+    // TODO: leer assets_dir dinámicamente; por ahora hardcoded "assets/templates/ui".
+    let tpl_path = PathBuf::from(format!("assets/templates/ui/{}.png", q.template));
+    let tpl_img = match image::open(&tpl_path) {
+        Ok(i) => i.to_luma8(),
+        Err(e) => return (
+            StatusCode::NOT_FOUND,
+            format!("No se pudo cargar template '{}': {}", tpl_path.display(), e),
+        ).into_response(),
+    };
+    let (tw, th) = tpl_img.dimensions();
+
+    // Convertir frame RGBA a GrayImage con BT.601 (igual que UiDetector::crop_to_gray).
+    let (fw, fh) = (frame.width, frame.height);
+    let (search_x, search_y, search_w, search_h) = if q.use_roi {
+        if let Some(roi) = s.calibration.ui_rois.get(&q.template).copied() {
+            (roi.x, roi.y, roi.w, roi.h)
+        } else {
+            (0, 0, fw, fh)
+        }
+    } else {
+        (0, 0, fw, fh)
+    };
+
+    if search_w < tw || search_h < th {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("search_area ({}x{}) < template ({}x{})", search_w, search_h, tw, th),
+        ).into_response();
+    }
+
+    // Crop frame to search area and convert to luma (BT.601).
+    let mut gray = image::GrayImage::new(search_w, search_h);
+    let stride = fw as usize * 4;
+    for row in 0..search_h {
+        for col in 0..search_w {
+            let off = (search_y + row) as usize * stride + (search_x + col) as usize * 4;
+            if off + 2 >= frame.data.len() {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "frame bounds").into_response();
+            }
+            let r = frame.data[off] as u32;
+            let g = frame.data[off + 1] as u32;
+            let b = frame.data[off + 2] as u32;
+            let luma = (299 * r + 587 * g + 114 * b) / 1000;
+            gray.put_pixel(col, row, image::Luma([luma as u8]));
+        }
+    }
+
+    let result = match_template(&gray, &tpl_img, MatchTemplateMethod::SumOfSquaredErrorsNormalized);
+    let rw = result.width();
+    let mut best_idx = 0usize;
+    let mut best_score = f32::MAX;
+    for (i, &p) in result.iter().enumerate() {
+        if p < best_score {
+            best_score = p;
+            best_idx = i;
+        }
+    }
+    let local_x = (best_idx as u32) % rw;
+    let local_y = (best_idx as u32) / rw;
+    let tlx = search_x + local_x;
+    let tly = search_y + local_y;
+    // Threshold default del UiDetector = 0.20
+    let threshold = 0.20f32;
+
+    Json(MatchNowResponse {
+        template: q.template,
+        score: best_score,
+        top_left_x: tlx,
+        top_left_y: tly,
+        center_x: tlx + tw / 2,
+        center_y: tly + th / 2,
+        template_w: tw,
+        template_h: th,
+        search_area_w: search_w,
+        search_area_h: search_h,
+        passed_threshold: best_score <= threshold,
+        threshold,
+    }).into_response()
+}
+
+// ── /vision/extract_template?name=X&w=34&h=34 ─────────────────────────────────
+//
+// Extrae una región del frame actual centrada en la posición del cursor,
+// la guarda como grayscale (BT.601) PNG en assets/templates/ui/<name>.png.
+// Conveniencia: reemplaza el ciclo manual "curl /test/grab + PIL crop + save".
+// Requiere rebuild/restart para que el UiDetector recargue templates.
+
+#[derive(Deserialize)]
+struct ExtractTemplateQuery {
+    name: String,
+    #[serde(default = "default_tpl_size")]
+    w: u32,
+    #[serde(default = "default_tpl_size")]
+    h: u32,
+    /// Opcional: si no se pasa, usa cursor pos. Centro del recorte.
+    #[serde(default)]
+    cx: Option<i32>,
+    #[serde(default)]
+    cy: Option<i32>,
+}
+fn default_tpl_size() -> u32 { 34 }
+
+#[derive(Serialize)]
+struct ExtractTemplateResponse {
+    saved_path: String,
+    center_x: i32,
+    center_y: i32,
+    top_left_x: i32,
+    top_left_y: i32,
+    w: u32,
+    h: u32,
+    mean_luma: f32,
+}
+
+#[cfg(windows)]
+async fn handle_vision_extract_template(
+    State(s): State<AppState>,
+    Query(q): Query<ExtractTemplateQuery>,
+) -> Response {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    use windows_sys::Win32::Foundation::POINT;
+
+    let frame = match s.buffer.latest_frame() {
+        Some(f) => f,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "No hay frame NDI").into_response(),
+    };
+
+    let (cx, cy) = match (q.cx, q.cy) {
+        (Some(x), Some(y)) => (x, y),
+        _ => {
+            let mut p = POINT { x: 0, y: 0 };
+            let ok = unsafe { GetCursorPos(&mut p as *mut _) };
+            if ok == 0 {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "GetCursorPos failed").into_response();
+            }
+            (p.x, p.y)
+        }
+    };
+
+    let w = q.w;
+    let h = q.h;
+    let tlx = cx - (w as i32) / 2;
+    let tly = cy - (h as i32) / 2;
+
+    if tlx < 0 || tly < 0 || tlx + w as i32 > frame.width as i32 || tly + h as i32 > frame.height as i32 {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Region ({},{},{},{}) fuera del frame {}x{}", tlx, tly, w, h, frame.width, frame.height),
+        ).into_response();
+    }
+
+    // Extract region and convert RGBA→Luma (BT.601) → save as grayscale PNG.
+    let mut gray = image::GrayImage::new(w, h);
+    let stride = frame.width as usize * 4;
+    let mut sum = 0u64;
+    for row in 0..h {
+        for col in 0..w {
+            let off = (tly as u32 + row) as usize * stride + (tlx as u32 + col) as usize * 4;
+            let r = frame.data[off] as u32;
+            let g = frame.data[off + 1] as u32;
+            let b = frame.data[off + 2] as u32;
+            let luma = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
+            gray.put_pixel(col, row, image::Luma([luma]));
+            sum += luma as u64;
+        }
+    }
+
+    let save_path = PathBuf::from(format!("assets/templates/ui/{}.png", q.name));
+    if let Err(e) = gray.save(&save_path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Save: {}", e)).into_response();
+    }
+    info!("Template extraído y guardado: {} ({}x{} at TL=({},{}))", save_path.display(), w, h, tlx, tly);
+
+    Json(ExtractTemplateResponse {
+        saved_path: save_path.display().to_string(),
+        center_x: cx,
+        center_y: cy,
+        top_left_x: tlx,
+        top_left_y: tly,
+        w,
+        h,
+        mean_luma: (sum as f32) / ((w * h) as f32),
+    }).into_response()
+}
+
+#[cfg(not(windows))]
+async fn handle_vision_extract_template(
+    State(_s): State<AppState>,
+    Query(_q): Query<ExtractTemplateQuery>,
+) -> Response {
+    (StatusCode::NOT_IMPLEMENTED, "extract_template solo en Windows").into_response()
+}
+
 // ── /vision/vitals ────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -708,6 +976,13 @@ struct PerceptionResponse {
     game_coords:      Option<(i32, i32, i32)>,
     target_active:    Option<bool>,
     inventory_counts: std::collections::HashMap<String, u32>,
+    /// UI templates matcheados en el último ciclo async del UiDetector.
+    /// Lista de nombres (ej: ["npc_trade_bag", "stow_menu"]).
+    /// 2026-04-18: agregado para debug del bag-click workflow.
+    ui_matches:       Vec<String>,
+    /// Centro + dims de cada match (para click directo en coord específica).
+    /// Tupla = (center_x, center_y, template_w, template_h).
+    ui_match_infos:   std::collections::HashMap<String, (u32, u32, u32, u32)>,
 }
 
 async fn handle_vision_perception(State(s): State<AppState>) -> Json<PerceptionResponse> {
@@ -729,6 +1004,8 @@ async fn handle_vision_perception(State(s): State<AppState>) -> Json<PerceptionR
             game_coords:      p.game_coords,
             target_active:    p.target_active,
             inventory_counts: p.inventory_counts.clone(),
+            ui_matches:       p.ui_matches.clone(),
+            ui_match_infos:   p.ui_match_infos.clone(),
         }),
     }
 }
@@ -1571,6 +1848,35 @@ async fn handle_cavebot_resume(State(s): State<AppState>) -> Json<CommandAck> {
 
 async fn handle_cavebot_clear(State(s): State<AppState>) -> Json<CommandAck> {
     send_cmd(&s, LoopCommand::ClearCavebot, "ClearCavebot")
+}
+
+#[derive(Deserialize)]
+struct CavebotJumpQuery {
+    label: String,
+}
+
+async fn handle_cavebot_jump_to_label(
+    State(s): State<AppState>,
+    Query(q): Query<CavebotJumpQuery>,
+) -> Json<CommandAck> {
+    let label = q.label.clone();
+    let cmd = LoopCommand::JumpToCavebotLabel { label: label.clone() };
+    match s.loop_tx.send(cmd) {
+        Ok(()) => {
+            info!("JumpToCavebotLabel solicitado: label='{}'", label);
+            Json(CommandAck {
+                ok: true,
+                message: format!("queued JumpToCavebotLabel label='{}'", label),
+            })
+        }
+        Err(e) => {
+            warn!("JumpToCavebotLabel error: {e}");
+            Json(CommandAck {
+                ok: false,
+                message: format!("send error: {e}"),
+            })
+        }
+    }
 }
 
 // ── /recording/start y /recording/stop (F1.4) ─────────────────────────────────
