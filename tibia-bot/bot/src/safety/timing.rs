@@ -153,4 +153,138 @@ mod tests {
         let mut rng = rand::thread_rng();
         assert_eq!(sampler.sample_clamped(&mut rng, 0.0), 10.0);
     }
+
+    // ── Statistical invariants de la distribución muestreada ─────────────────
+    //
+    // Estos tests verifican que el sampler NO está colapsado (std=0) ni
+    // sesgado. Detectan regresiones del tipo "alguien cambió el sampler a un
+    // mock que retorna siempre mean" — bug silencioso porque la media
+    // seguiría siendo correcta pero la humanización estaría rota.
+
+    /// El stddev empírico debe estar cerca del target. Si alguien hiciera el
+    /// sampler devolver siempre mean, `empirical_std` sería ~0 y el test
+    /// atraparía el regression.
+    #[test]
+    fn empirical_std_is_close_to_target() {
+        let target_mean = 100.0;
+        let target_std  = 20.0;
+        let sampler     = GaussSampler::new(target_mean, target_std);
+        let mut rng     = rand::thread_rng();
+        let n           = 10_000;
+
+        // Usamos sample_clamped con min=0 y clamp a [μ-3σ, μ+3σ]. El clamp
+        // reduce ligeramente el stddev empírico porque recorta las colas;
+        // para N(0,1) el stddev post-truncate a 3σ es aprox 0.9973 * σ →
+        // margen es despreciable para tolerance ±20%.
+        let samples: Vec<f64> = (0..n)
+            .map(|_| sampler.sample_clamped(&mut rng, 0.0))
+            .collect();
+
+        let mean_emp = samples.iter().sum::<f64>() / n as f64;
+        let var_emp  = samples.iter()
+            .map(|x| (x - mean_emp).powi(2))
+            .sum::<f64>() / n as f64;
+        let std_emp  = var_emp.sqrt();
+
+        // Tolerancia ±20% sobre target_std. Para N=10k, la incertidumbre
+        // del estimador `s` es aprox `σ / sqrt(2N) = 20/141 = 0.14` = 0.7%.
+        // Con ±20% cubrimos el efecto del clamp + ruido finito.
+        let delta = (std_emp - target_std).abs();
+        assert!(
+            delta / target_std < 0.20,
+            "empirical_std={:.2} difiere >20% del target={} (delta={:.2})",
+            std_emp, target_std, delta
+        );
+
+        // Mean bias: con N=10k, SE ≈ σ/√N = 0.2. Tolerance 1.0 es 5·SE.
+        let mean_bias = (mean_emp - target_mean).abs();
+        assert!(
+            mean_bias < 1.0,
+            "mean_bias={:.3} demasiado grande (empirical_mean={:.3})",
+            mean_bias, mean_emp
+        );
+    }
+
+    /// Chi-squared-like goodness-of-fit: verificar que las proporciones en
+    /// bins de 1σ / 2σ / 3σ matchean las esperadas de una Normal truncada.
+    ///
+    /// Para N(μ, σ) sin truncate:
+    ///   - P(|X-μ| ≤ 1σ) ≈ 0.6827
+    ///   - P(|X-μ| ≤ 2σ) ≈ 0.9545
+    ///   - P(|X-μ| ≤ 3σ) ≈ 0.9973
+    ///
+    /// Post-clamp a ±3σ, la cola fuera de 3σ desaparece → P(|X-μ| ≤ 3σ) = 1.0.
+    /// Las proporciones dentro de 1σ y 2σ se renormalizan levemente al alza.
+    #[test]
+    fn distribution_matches_normal_proportions() {
+        let target_mean = 50.0;
+        let target_std  = 10.0;
+        let sampler     = GaussSampler::new(target_mean, target_std);
+        let mut rng     = rand::thread_rng();
+        let n           = 20_000;
+
+        let samples: Vec<f64> = (0..n)
+            .map(|_| sampler.sample_clamped(&mut rng, 0.0))
+            .collect();
+
+        let mut in_1sigma = 0usize;
+        let mut in_2sigma = 0usize;
+        let mut in_3sigma = 0usize;
+        for x in &samples {
+            let z = (x - target_mean).abs() / target_std;
+            if z <= 1.0 { in_1sigma += 1; }
+            if z <= 2.0 { in_2sigma += 1; }
+            if z <= 3.0 { in_3sigma += 1; }
+        }
+
+        let p1 = in_1sigma as f64 / n as f64;
+        let p2 = in_2sigma as f64 / n as f64;
+        let p3 = in_3sigma as f64 / n as f64;
+
+        // Tolerancias: ±2 puntos porcentuales para 1σ y 2σ (margen holgado
+        // para ruido de muestreo con N=20k); 3σ debe ser ~100% por el clamp.
+        assert!(
+            (p1 - 0.6827).abs() < 0.02,
+            "proporción en 1σ = {:.4}, esperada ≈ 0.68 (±0.02)", p1
+        );
+        assert!(
+            (p2 - 0.9545).abs() < 0.02,
+            "proporción en 2σ = {:.4}, esperada ≈ 0.95 (±0.02)", p2
+        );
+        assert!(
+            p3 >= 0.999,
+            "proporción en 3σ = {:.4} — clamp debería forzar ≥ 0.999", p3
+        );
+
+        println!("proporciones: 1σ={:.4} 2σ={:.4} 3σ={:.4}", p1, p2, p3);
+    }
+
+    /// Uniformidad angular: el sampler debe producir valores tanto por
+    /// arriba como por debajo del mean en proporciones similares. Detecta
+    /// un regression donde alguien hiciera el sampler solo retornar valores
+    /// en un lado (bug típico de off-by-one en signos).
+    #[test]
+    fn samples_are_symmetric_around_mean() {
+        let target_mean = 42.0;
+        let sampler     = GaussSampler::new(target_mean, 10.0);
+        let mut rng     = rand::thread_rng();
+        let n           = 10_000;
+
+        let mut below = 0usize;
+        let mut above = 0usize;
+        for _ in 0..n {
+            let x = sampler.sample_clamped(&mut rng, 0.0);
+            if x < target_mean { below += 1; }
+            else if x > target_mean { above += 1; }
+        }
+
+        // Proporción below vs above debe ser ~50/50 ± 3% para N=10k.
+        let p_below = below as f64 / n as f64;
+        let p_above = above as f64 / n as f64;
+        assert!(
+            (p_below - 0.5).abs() < 0.03 && (p_above - 0.5).abs() < 0.03,
+            "asimetría sospechosa: below={:.4} above={:.4} (esperada ≈ 0.5 cada)",
+            p_below, p_above
+        );
+    }
 }
