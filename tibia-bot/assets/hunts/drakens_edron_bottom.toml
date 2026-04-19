@@ -1,0 +1,43 @@
+# drakens_edron_bottom.toml — Draken spawns en Edron sewers bottom / Zao.
+# Level 30-50, alto waste pero muy alto XP/hr.
+# WARNING: drakens son altamente peligrosos — paladin/druid/sorc only.
+
+name        = "drakens_edron_bottom"
+description = "Draken warmaster + spellweaver en niveles profundos de Edron sewers (access via Zao corridor). High XP / high waste. Knight NO recomendado (damage output insuficiente, consumo excesivo)."
+level_range = [30, 50]
+vocation    = "paladin_druid_sorcerer_monk"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "small_ruby",
+    "small_topaz",
+    "small_diamond",
+]
+non_stackables = [
+    "drachaku",              # no template — weapon raro
+    "lizard_leather",        # no template (aunque en wiki es stackable, UI lo trata como non)
+    "tail_slapper",          # no template — raro
+    "zaoan_robe",            # no template
+    "zaoan_shoes",           # no template
+]
+drop = []
+
+[supplies]
+# Drakens pegan MUY duro + combo elemental. HP + mana fluyen rápido.
+great_health_potion  = { min = 150, target = 300 }
+great_mana_potion    = { min = 200, target = 400 }
+# sorcerer/druid
+ultimate_healing_rune = { min = 40, target = 100 }
+sudden_death_rune     = { min = 50, target = 120 }
+
+[monsters]
+draken_warmaster    = { hp = 4_150, xp = 2_400 }
+draken_spellweaver  = { hp = 5_000, xp = 3_100 }
+
+[metrics]
+expected_xp_per_hour    = 180_000
+expected_kills_per_hour = 45
+expected_loot_gp_per_hour = 25_000
+expected_cycle_min      = 100

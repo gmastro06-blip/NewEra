@@ -1,0 +1,47 @@
+# asura_palace_low.toml — Asura Palace lower floors (Port Hope / Banuta access).
+# Level 45-70, one of the best profit spots mid-game.
+
+name        = "asura_palace_low"
+description = "Asura Palace pisos bajos — slick_water_elemental + diamond_servant + true_dawnfire_asura. Mix de mobs fire/water elementales. Alto XP + alto profit (gems + jewelled drops)."
+level_range = [45, 70]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "crystal_coin",
+    "small_topaz",
+    "small_emerald",
+    "small_diamond",
+    "small_sapphire",
+    "small_ruby",
+]
+non_stackables = [
+    "gemmed_figurine",       # raro, caro — no template
+    "jewelled_backpack",     # RARÍSIMO, trophy — no template
+    "golden_mug",            # no template
+    "ruby_necklace",         # no template
+    "emerald_bangle",        # no template
+]
+drop = []
+
+[supplies]
+# Asuras pegan fuerte + AOE. Requiere mucha potion.
+great_health_potion   = { min = 200, target = 400 }
+ultimate_health_potion = { min = 100, target = 250 }
+great_mana_potion     = { min = 200, target = 400 }
+ultimate_mana_potion  = { min = 100, target = 250 }
+ultimate_healing_rune = { min = 50, target = 120 }
+sudden_death_rune     = { min = 60, target = 150 }
+
+[monsters]
+slick_water_elemental = { hp = 550,  xp = 450 }
+diamond_servant       = { hp = 1_000, xp = 700 }
+true_dawnfire_asura   = { hp = 8_500, xp = 7_475 }
+
+[metrics]
+expected_xp_per_hour    = 280_000
+expected_kills_per_hour = 60
+expected_loot_gp_per_hour = 60_000
+expected_cycle_min      = 120

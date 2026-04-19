@@ -1,0 +1,39 @@
+# stone_golems_cormaya.toml — Stone golems + earth elementals en Cormaya south caves.
+# Level 20-35, decent EXP con loot de gems.
+
+name        = "stone_golems_cormaya"
+description = "Stone golems en el sur de Cormaya (isla al SE de Edron). Mix con earth_elementals en pisos bajos. Loot de gems stackable + armor drops."
+level_range = [20, 35]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "small_diamond",
+    "small_sapphire",
+    "small_emerald",
+]
+non_stackables = [
+    "stone_skin_amulet",   # raro, high value — no template
+    "power_ring",          # no template
+    "earth_cape",          # no template (earth_elemental)
+]
+drop = []
+
+[supplies]
+# Stone golem pega melee + earth elemental physical/earth mix.
+health_potion        = { min = 50, target = 120 }
+strong_health_potion = { min = 30, target = 80 }
+mana_potion          = { min = 40, target = 100 }
+strong_mana_potion   = { min = 30, target = 80 }
+
+[monsters]
+stone_golem     = { hp = 270,  xp = 160 }
+earth_elemental = { hp = 650,  xp = 550 }
+
+[metrics]
+expected_xp_per_hour    = 85_000
+expected_kills_per_hour = 130
+expected_loot_gp_per_hour = 18_000
+expected_cycle_min      = 120

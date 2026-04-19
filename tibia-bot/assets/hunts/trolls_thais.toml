@@ -1,0 +1,37 @@
+# trolls_thais.toml — Trolls al SW de Thais, zona newbie clásica.
+# Level 8-15, consumo bajísimo de supplies.
+
+name        = "trolls_thais"
+description = "Trolls spawn en el bosque/camino SW de Thais. Mix de troll + troll_champion. Low-level, low-waste, buena para onboarding."
+level_range = [8, 15]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "meat",
+    "brown_mushroom",
+]
+non_stackables = [
+    "leather_boots",       # no template
+    "studded_club",        # no template
+    "wooden_shield",       # no template
+    "spear",
+    "twin_hooks",          # raro, de troll_champion
+]
+drop = []
+
+[supplies]
+# Troll pega flojo. Mana potions solo para mages low-level.
+health_potion = { min = 10, target = 30 }
+mana_potion   = { min = 10, target = 30 }
+
+[monsters]
+troll           = { hp = 50, xp = 20 }
+troll_champion  = { hp = 75, xp = 40 }
+
+[metrics]
+expected_xp_per_hour    = 25_000
+expected_kills_per_hour = 250
+expected_loot_gp_per_hour = 3_000
+expected_cycle_min      = 90

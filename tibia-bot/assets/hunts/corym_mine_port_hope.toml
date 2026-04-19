@@ -1,0 +1,41 @@
+# corym_mine_port_hope.toml — Corym mines al norte de Port Hope / Banuta.
+# Level 35-55, mid-tier XP con loot balanceado.
+
+name        = "corym_mine_port_hope"
+description = "Corym charlatan + vanguard + skirmisher en las minas tribales al N de Port Hope. Mix humanoid-like con equipo militar. XP estable, loot medio."
+level_range = [35, 55]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "meat",
+]
+non_stackables = [
+    "mining_helmet",         # no template
+    "war_hammer",            # no template — vanguard
+    "battle_axe",            # no template
+    "bronze_shield",         # no template
+    "ripper_lance",          # no template — raro skirmisher
+    "filled_jug",            # no template — charlatan drop flavor
+]
+drop = []
+
+[supplies]
+# Corym mix melee + ranged. Waste medio-alto.
+great_health_potion  = { min = 150, target = 300 }
+strong_health_potion = { min = 60,  target = 150 }
+great_mana_potion    = { min = 100, target = 250 }
+strong_mana_potion   = { min = 60,  target = 150 }
+
+[monsters]
+corym_charlatan   = { hp = 250, xp = 150 }
+corym_vanguard    = { hp = 700, xp = 490 }
+corym_skirmisher  = { hp = 450, xp = 260 }
+
+[metrics]
+expected_xp_per_hour    = 170_000
+expected_kills_per_hour = 130
+expected_loot_gp_per_hour = 30_000
+expected_cycle_min      = 120

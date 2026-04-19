@@ -1,0 +1,39 @@
+# dwarves_kazordoon.toml — Dwarf caves debajo de Kazordoon.
+# Level 18-30, low-waste classic.
+
+name        = "dwarves_kazordoon"
+description = "Dwarf + dwarf_soldier + dwarf_guard en los túneles bajo Kazordoon. Mix humanoid con alto drop rate de armor/weapons no-stackable. Bajo waste."
+level_range = [18, 30]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "meat",
+]
+non_stackables = [
+    "pick",                # no template — tool que pueden dar
+    "battle_hammer",       # no template
+    "dwarven_shield",      # no template
+    "dwarven_axe",         # no template — raro
+    "ring_of_healing",
+    "iron_helmet",         # no template
+]
+drop = []
+
+[supplies]
+health_potion        = { min = 40, target = 100 }
+strong_health_potion = { min = 20, target = 60 }
+mana_potion          = { min = 30, target = 80 }
+
+[monsters]
+dwarf         = { hp = 90,  xp = 45 }
+dwarf_soldier = { hp = 135, xp = 70 }
+dwarf_guard   = { hp = 245, xp = 165 }
+
+[metrics]
+expected_xp_per_hour    = 80_000
+expected_kills_per_hour = 180
+expected_loot_gp_per_hour = 12_000
+expected_cycle_min      = 120

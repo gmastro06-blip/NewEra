@@ -1,0 +1,37 @@
+# mutated_rats_yalahar.toml — Mutated rats en Yalahar foreign quarter caves.
+# Level 18-30, spot sólido mid-tier.
+
+name        = "mutated_rats_yalahar"
+description = "Mutated rats en las cuevas del foreign quarter de Yalahar. Single-mob spawn, XP consistente, loot de mutated_flesh para creature products."
+level_range = [18, 30]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "mutated_flesh",
+    "meat",
+]
+non_stackables = [
+    "rotten_piece_of_cloth", # no template
+    "moldy_cheese",          # no template
+    "ring_of_healing",
+]
+drop = []
+
+[supplies]
+# Mutated rats pegan melee fuerte + paralyze raro. HP potions importantes.
+health_potion        = { min = 50, target = 120 }
+strong_health_potion = { min = 30, target = 80 }
+mana_potion          = { min = 30, target = 80 }
+strong_mana_potion   = { min = 20, target = 60 }
+
+[monsters]
+mutated_rat = { hp = 550, xp = 450 }
+
+[metrics]
+expected_xp_per_hour    = 80_000
+expected_kills_per_hour = 120
+expected_loot_gp_per_hour = 15_000
+expected_cycle_min      = 120
