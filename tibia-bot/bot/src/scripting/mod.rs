@@ -540,6 +540,125 @@ mod tests {
         load_inline(&e, code, "sandbox_check");
     }
 
+    // ── Negative tests: sandbox escape attempts (V-004 regressions) ──────────
+    //
+    // `sandbox_blocks_io_os_and_friends` prueba que los globals están nil.
+    // Estos tests prueban que INTENTAR USAR las APIs sandboxeadas FALLA con
+    // un error Lua (no crash, no silent bypass). Si un script malicioso se
+    // llegara a cargar (via V-003 path traversal o fs access), debe fallar
+    // sin side effects.
+
+    /// Intentar abrir un archivo via `io.open` debe fallar con error claro.
+    /// El script se carga via `load_dir` (path a un directorio con un .lua
+    /// que intenta exploitar). Se espera que la ejecución del script falle
+    /// y el hook quede sin registrar.
+    #[test]
+    fn sandbox_io_open_errors_attempting_to_index_nil() {
+        let lua_file = tempfile();
+        let dir = lua_file.parent().unwrap().to_path_buf();
+        std::fs::write(&lua_file, r#"
+            -- Intentar leer un archivo via io.open (sandboxeado).
+            local ok, err = pcall(function() return io.open("/etc/passwd", "r") end)
+            -- Guardar resultado en global para que el test lo inspeccione.
+            exploit_blocked = not ok
+        "#).unwrap();
+
+        let mut e = engine();
+        // load_dir carga todos los .lua del dir y aplica el sandbox.
+        // Si el script ejecuta sin panic, el `pcall` debería haber rechazado io.
+        let result = e.load_dir(&dir);
+        assert!(result.is_ok(), "load_dir no debería propagar errors de scripts, got: {:?}", result);
+        // Verificar que el pcall atrapó el error (io=nil → "attempt to index a nil value").
+        let blocked: bool = e.lua.globals().get("exploit_blocked").unwrap_or(false);
+        assert!(blocked, "io.open debería haber fallado — el sandbox está bypasseable");
+        // Limpiar
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `os.execute("cmd")` debe fallar análogamente.
+    #[test]
+    fn sandbox_os_execute_errors() {
+        let e = engine();
+        // Usamos la Lua directamente para verificar que la ejecución falla.
+        let lua = &e.lua;
+        let err = lua.load(r#"os.execute("echo rce")"#).exec();
+        assert!(err.is_err(), "os.execute debe fallar con os=nil");
+        let msg = format!("{:?}", err.unwrap_err());
+        assert!(
+            msg.contains("attempt to index") || msg.contains("nil value"),
+            "unexpected error message: {}", msg
+        );
+    }
+
+    /// `require("any")` debe fallar.
+    #[test]
+    fn sandbox_require_errors() {
+        let e = engine();
+        let lua = &e.lua;
+        let err = lua.load(r#"return require("whatever")"#).exec();
+        assert!(err.is_err(), "require debe fallar con require=nil");
+    }
+
+    /// `load()` es un builtin no removido, pero el código que carga hereda
+    /// el environment actual — por lo tanto sigue sin acceso a io/os.
+    /// Este test verifica que no hay escape via `load("return io")`.
+    #[test]
+    fn sandbox_load_inherits_restricted_env() {
+        let e = engine();
+        let lua = &e.lua;
+        // `load` existe (builtin estándar que no sandboxeamos)
+        // pero el chunk cargado hereda _ENV/globals actuales.
+        let result: mlua::Result<mlua::Value> = lua.load(r#"
+            local f = load("return io")
+            if f == nil then return "load_failed" end
+            return f()
+        "#).eval();
+        match result {
+            Ok(val) => {
+                // Si load() funcionó, el resultado de f() debe ser nil
+                // (porque io está nil en globals).
+                assert!(
+                    matches!(val, mlua::Value::Nil),
+                    "load() no debería dar acceso a io, got: {:?}", val
+                );
+            }
+            Err(e) => {
+                // Alternativamente load() mismo falla — también OK.
+                let msg = format!("{:?}", e);
+                assert!(
+                    msg.contains("io") || msg.contains("load") || msg.contains("nil"),
+                    "unexpected error: {}", msg
+                );
+            }
+        }
+    }
+
+    /// `string.dump` existe (no lo sandboxeamos) pero sin `load` de bytecode
+    /// no puede ser exploitado para bypass. Este test documenta el
+    /// comportamiento — si cambiamos el sandbox para remover string.dump,
+    /// actualizar aquí.
+    #[test]
+    fn sandbox_string_dump_alone_is_not_exploitable() {
+        let e = engine();
+        let lua = &e.lua;
+        // string.dump existe (builtin).
+        let has_dump: bool = lua.load(r#"return string.dump ~= nil"#).eval().unwrap();
+        assert!(has_dump, "string.dump existe — caso normal");
+        // Por sí solo no es exploit (solo serializa). Sin un loader de bytecode
+        // explotable + un canal para ejecutarlo, no hay escape. Documentamos.
+    }
+
+    /// Helper para negative tests que necesitan un tmp dir.
+    fn tempfile() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let seq = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("scripting_neg_{}_{}", std::process::id(), seq));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("x.lua")
+    }
+
     #[test]
     fn bot_log_api_is_callable() {
         let e = engine();

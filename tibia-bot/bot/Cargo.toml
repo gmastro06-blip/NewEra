@@ -168,7 +168,14 @@ tokio              = { workspace = true, features = ["test-util"] }
 # Ejecuta `cargo bench --bench template_matching` para generar reports en
 # target/criterion/. Sin historial comparar vs anterior pasa `--save-baseline`.
 criterion          = { version = "0.5", features = ["html_reports"] }
+# proptest: property-based testing del parser cavebot + hunt_profile. Generan
+# inputs random y verifican invariantes (roundtrip, no panics, jump_to_label).
+proptest           = "1"
 
 [[bench]]
 name    = "template_matching"
+harness = false
+
+[[bench]]
+name    = "pathfinding"
 harness = false
