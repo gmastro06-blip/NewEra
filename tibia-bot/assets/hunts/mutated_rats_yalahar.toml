@@ -7,16 +7,22 @@ level_range = [18, 30]
 vocation    = "any"
 
 [loot]
+# Drops wiki: mutated_rat
+# Ref: https://tibia.fandom.com/wiki/Mutated_Rat
+# NOTA: mutated_rat NO dropea platinum_coin ni mutated_flesh
+#       (mutated_flesh es de Mutated Tiger — confusión previa).
 stackables = [
     "gold_coin",
-    "platinum_coin",
-    "mutated_flesh",
-    "meat",
+    "health_potion",
+    # sin template: green_mushroom, mouldy_cheese, mutated_rat_tail, stone_herb
 ]
 non_stackables = [
-    "rotten_piece_of_cloth", # no template
-    "moldy_cheese",          # no template
-    "ring_of_healing",
+    "halberd",               # no template
+    "plate_shield",          # no template
+    "skull",                 # no template (item skull)
+    "spellbook_of_enlightenment",  # no template
+    "stealth_ring",          # no template
+    "tower_shield",          # no template
 ]
 drop = []
 

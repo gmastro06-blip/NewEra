@@ -7,17 +7,24 @@ level_range = [8, 15]
 vocation    = "any"
 
 [loot]
+# Drops consolidados wiki: troll + troll_champion
+# Ref: https://tibia.fandom.com/wiki/Troll, /Troll_Champion
 stackables = [
     "gold_coin",
     "meat",
-    "brown_mushroom",
+    "arrow",               # troll_champion
+    "rope",                # troll
+    # sin template: bunch_of_troll_hair, trollroot
 ]
 non_stackables = [
+    "hand_axe",            # no template
     "leather_boots",       # no template
+    "leather_helmet",      # no template
     "studded_club",        # no template
     "wooden_shield",       # no template
     "spear",
-    "twin_hooks",          # raro, de troll_champion
+    "silver_amulet",       # raro — no template
+    "heavy_old_tome",      # no template
 ]
 drop = []
 

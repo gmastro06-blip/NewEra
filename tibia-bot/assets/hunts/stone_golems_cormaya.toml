@@ -7,17 +7,28 @@ level_range = [20, 35]
 vocation    = "any"
 
 [loot]
+# Drops wiki consolidado: stone_golem + earth_elemental
+# Ref: https://tibia.fandom.com/wiki/Stone_Golem, /Earth_Elemental
+# NOTA: el único gem que matchea es small_topaz (earth_elemental).
+#       Los stone_golem NO dropean small_diamond/sapphire/emerald
+#       (error en versión previa).
 stackables = [
     "gold_coin",
-    "platinum_coin",
-    "small_diamond",
-    "small_sapphire",
-    "small_emerald",
+    "small_topaz",           # earth_elemental only
+    "strong_mana_potion",    # earth_elemental
+    # sin template: blank_rune, coal, iron_ore, clay_lump, lump_of_earth,
+    #               earth_arrow, small_stone, sulphurous_stone
 ]
 non_stackables = [
-    "stone_skin_amulet",   # raro, high value — no template
-    "power_ring",          # no template
-    "earth_cape",          # no template (earth_elemental)
+    "carlin_sword",          # no template
+    "crystal_ring",          # no template
+    "might_ring",            # no template (earth_elemental)
+    "power_ring",            # no template
+    "red_gem",               # gem non-stackable — no template
+    "heavily_rusted_armor",  # no template
+    "piece_of_marble_rock",  # no template
+    "shiny_stone",           # no template
+    "ancient_stone",         # no template
 ]
 drop = []
 

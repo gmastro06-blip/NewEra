@@ -8,19 +8,39 @@ level_range = [30, 50]
 vocation    = "paladin_druid_sorcerer_monk"
 
 [loot]
+# Drops wiki consolidado: draken_warmaster + draken_spellweaver
+# Ref: https://tibia.fandom.com/wiki/Draken_Warmaster, /Draken_Spellweaver
+# NOTA: drakens NO dropean small_topaz ni small_diamond (error previo).
+#       El único gem stackable es small_ruby.
 stackables = [
     "gold_coin",
     "platinum_coin",
     "small_ruby",
-    "small_topaz",
-    "small_diamond",
+    "meat",
+    "great_health_potion",
+    "great_mana_potion",
+    "ultimate_health_potion",
+    # sin template: bamboo_leaves, draken_sulphur
 ]
 non_stackables = [
-    "drachaku",              # no template — weapon raro
-    "lizard_leather",        # no template (aunque en wiki es stackable, UI lo trata como non)
-    "tail_slapper",          # no template — raro
-    "zaoan_robe",            # no template
-    "zaoan_shoes",           # no template
+    "drakinata",                 # warmaster — no template
+    "zaoan_halberd",             # warmaster — no template
+    "zaoan_armor",               # warmaster — no template
+    "zaoan_legs",                # both — no template
+    "zaoan_shoes",               # both — no template
+    "zaoan_robe",                # spellweaver — no template
+    "tower_shield",              # warmaster — no template
+    "bone_shoulderplate",        # warmaster — no template
+    "warmasters_wristguards",    # warmaster — no template (raro)
+    "ring_of_the_sky",           # both — no template (raro)
+    "focus_cape",                # spellweaver — no template
+    "wand_of_inferno",           # spellweaver — no template
+    "spellweavers_robe",         # spellweaver — no template
+    "weavers_wandtip",           # spellweaver — no template
+    "green_gem",                 # spellweaver — no template (non-stackable gem)
+    "draken_trophy",             # spellweaver — no template (trophy)
+    "harness",                   # spellweaver — no template
+    "luminous_orb",              # spellweaver — no template
 ]
 drop = []
 

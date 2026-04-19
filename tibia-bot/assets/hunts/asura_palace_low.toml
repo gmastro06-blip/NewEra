@@ -7,6 +7,9 @@ level_range = [45, 70]
 vocation    = "any"
 
 [loot]
+# Drops wiki consolidado: slick_water_elemental + diamond_servant + true_dawnfire_asura
+# Ref: https://tibia.fandom.com/wiki/Slick_Water_Elemental, /Diamond_Servant, /True_Dawnfire_Asura
+# NOTA: small_sapphire NO aparece en los drops (error previo).
 stackables = [
     "gold_coin",
     "platinum_coin",
@@ -14,15 +17,37 @@ stackables = [
     "small_topaz",
     "small_emerald",
     "small_diamond",
-    "small_sapphire",
     "small_ruby",
+    "strong_health_potion",
+    "strong_mana_potion",
+    "great_mana_potion",
+    # sin template: blue_gem, red_gem, yellow_gem, small_amethyst,
+    #               small_enchanted_ruby, demonic_essence,
+    #               flask_of_demonic_blood, iced_soil, red_piece_of_cloth,
+    #               shiver_arrow, soul_orb, royal_star, mastermind_potion
 ]
 non_stackables = [
-    "gemmed_figurine",       # raro, caro — no template
-    "jewelled_backpack",     # RARÍSIMO, trophy — no template
-    "golden_mug",            # no template
-    "ruby_necklace",         # no template
-    "emerald_bangle",        # no template
+    "magma_coat",                 # true_dawnfire — no template
+    "focus_cape",                 # true_dawnfire — no template
+    "mystic_turban",              # true_dawnfire — no template
+    "oriental_shoes",             # true_dawnfire — no template
+    "crystalline_armor",          # diamond_servant — no template
+    "golden_lotus_brooch",        # true_dawnfire — no template (raro)
+    "peacock_feather_fan",        # true_dawnfire — no template
+    "ruby_necklace",              # true_dawnfire — no template
+    "mysterious_fetish",          # true_dawnfire — no template
+    "death_ring",                 # true_dawnfire — no template
+    "might_ring",                 # diamond_servant — no template
+    "shockwave_amulet",           # diamond_servant — no template
+    "lightning_pendant",          # diamond_servant — no template
+    "spellbook_of_mind_control",  # true_dawnfire — no template (raro)
+    "wand_of_cosmic_energy",      # diamond_servant — no template
+    "wand_of_inferno",            # true_dawnfire — no template
+    "bonebreaker",                # diamond_servant — no template
+    "crystal_pedestal",           # diamond_servant — no template
+    "gear_crystal",               # diamond_servant — no template
+    "gear_wheel",                 # diamond_servant — no template
+    "life_crystal",               # diamond_servant — no template
 ]
 drop = []
 

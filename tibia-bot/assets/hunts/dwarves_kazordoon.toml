@@ -7,18 +7,36 @@ level_range = [18, 30]
 vocation    = "any"
 
 [loot]
+# Drops wiki consolidado: dwarf + dwarf_soldier + dwarf_guard
+# Ref: https://tibia.fandom.com/wiki/Dwarf, /Dwarf_Soldier, /Dwarf_Guard
+# NOTA: dwarves NO dropean platinum_coin ni meat (error previo).
 stackables = [
     "gold_coin",
-    "platinum_coin",
-    "meat",
+    "health_potion",         # dwarf_guard
+    # sin template: white_mushroom, coal, iron_ore, small_amethyst,
+    #               bolt, piercing_bolt
 ]
 non_stackables = [
-    "pick",                # no template — tool que pueden dar
-    "battle_hammer",       # no template
-    "dwarven_shield",      # no template
-    "dwarven_axe",         # no template — raro
-    "ring_of_healing",
-    "iron_helmet",         # no template
+    "axe",                   # dwarf
+    "hatchet",               # dwarf — no template
+    "pick",                  # dwarf — no template
+    "battle_axe",            # dwarf_soldier — no template
+    "battle_hammer",         # dwarf_guard — no template
+    "double_axe",            # dwarf_guard — no template
+    "copper_shield",         # dwarf — no template
+    "dwarven_shield",        # dwarf_soldier — no template
+    "battle_shield",         # dwarf_guard — no template
+    "chain_armor",           # dwarf_soldier — no template
+    "scale_armor",           # dwarf_guard — no template
+    "studded_armor",         # dwarf — no template
+    "leather_boots",         # dwarf_guard — no template
+    "leather_legs",          # dwarf — no template
+    "steel_helmet",          # dwarf_guard — no template
+    "soldier_helmet",        # dwarf_soldier — no template
+    "crossbow",              # dwarf_soldier — no template
+    "shovel",                # dwarf_soldier (template ✓)
+    "dwarven_ring",          # dwarf — no template (raro)
+    "axe_ring",              # dwarf_soldier — no template
 ]
 drop = []
 

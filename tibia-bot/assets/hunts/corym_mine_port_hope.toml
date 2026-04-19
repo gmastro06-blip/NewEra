@@ -7,18 +7,24 @@ level_range = [35, 55]
 vocation    = "any"
 
 [loot]
+# Drops wiki consolidado: corym_charlatan + corym_vanguard + corym_skirmisher
+# Ref: https://tibia.fandom.com/wiki/Corym_Charlatan, /Corym_Vanguard, /Corym_Skirmisher
+# NOTA: coryms NO dropean platinum_coin ni meat (error previo).
+#       Los 3 comparten la misma loot table (solo spiky_club es exclusivo de vanguard).
 stackables = [
     "gold_coin",
-    "platinum_coin",
-    "meat",
+    # sin template: bola, cheese, rat_cheese, soft_cheese
 ]
 non_stackables = [
-    "mining_helmet",         # no template
-    "war_hammer",            # no template — vanguard
-    "battle_axe",            # no template
-    "bronze_shield",         # no template
-    "ripper_lance",          # no template — raro skirmisher
-    "filled_jug",            # no template — charlatan drop flavor
+    "cheese_cutter",         # no template
+    "cheesy_figurine",       # no template
+    "earflap",               # no template (armor)
+    "leather_harness",       # no template (armor)
+    "life_preserver",        # no template
+    "rat_god_doll",          # no template (raro)
+    "ratana",                # no template (weapon)
+    "spike_shield",          # no template
+    "spiky_club",            # vanguard only — no template
 ]
 drop = []
 
