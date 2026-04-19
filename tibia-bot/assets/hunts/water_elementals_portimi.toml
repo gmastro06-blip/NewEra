@@ -13,7 +13,7 @@ stackables = [
     "small_sapphire",
     "small_topaz",
     "small_emerald",
-    "water_elemental_pieces",
+    "white_pearl",
 ]
 non_stackables = [
     "glacier_shoes",

@@ -10,10 +10,10 @@ vocation    = "any"
 stackables = [
     "gold_coin",
     "platinum_coin",
-    "two_handed_sword",    # lootable raro pero significativo
     "meat",
 ]
 non_stackables = [
+    "two_handed_sword",    # lootable raro pero significativo (weapon, non-stackable)
     "crown_armor",
     "crown_helmet",
     "knight_armor",

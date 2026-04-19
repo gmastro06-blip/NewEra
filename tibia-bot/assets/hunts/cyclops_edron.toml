@@ -1,15 +1,14 @@
 # cyclops_edron.toml — Cyclops camp al NE de Edron.
-# Level 15-28, loot de crude_iron + piggy_bank (raro).
+# Level 15-28, loot de cyclops_toe + piggy_bank (raro).
 
 name        = "cyclops_edron"
-description = "Cyclops camp NE de Edron — mix de cyclops + cyclops_drone + cyclops_smith. Loot ferrous (crude_iron)."
+description = "Cyclops camp NE de Edron — mix de cyclops + cyclops_drone + cyclops_smith."
 level_range = [15, 28]
 vocation    = "any"
 
 [loot]
 stackables = [
     "gold_coin",
-    "crude_iron",
     "meat",
     "dragon_ham",
 ]

@@ -12,7 +12,6 @@ stackables = [
     "gold_coin",
     "worm",
     "meat",
-    "crude_iron",
 ]
 non_stackables = []
 drop = []
