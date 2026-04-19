@@ -52,6 +52,9 @@ fn main() -> anyhow::Result<()> {
     let simplify = args.iter().any(|a| a == "--simplify");
     let output = arg(&args, "--output").map(PathBuf::from);
     let overrides_path = arg(&args, "--overrides").map(PathBuf::from);
+    let nearest_walkable_radius: i32 = arg(&args, "--nearest-walkable")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     println!("Loading walkability from {}...", walkability.display());
     let mut grid = WalkabilityGrid::load(&walkability)?;
@@ -74,20 +77,8 @@ fn main() -> anyhow::Result<()> {
     }
     println!();
 
-    if !grid.is_walkable(from.0, from.1, from.2) {
-        anyhow::bail!(
-            "start {:?} no es walkable (cost={:?})",
-            from,
-            grid.cost(from.0, from.1, from.2)
-        );
-    }
-    if !grid.is_walkable(to.0, to.1, to.2) {
-        anyhow::bail!(
-            "goal {:?} no es walkable (cost={:?})",
-            to,
-            grid.cost(to.0, to.1, to.2)
-        );
-    }
+    let from = remap_if_needed(&grid, from, "start", nearest_walkable_radius)?;
+    let to = remap_if_needed(&grid, to, "goal", nearest_walkable_radius)?;
 
     let start = std::time::Instant::now();
     let path = find_path(from, to, &grid)
@@ -137,6 +128,79 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Valida que `coord` sea walkable. Si no lo es y `radius > 0`, busca el tile
+/// walkable más cercano en un cubo de lado `2*radius+1` centrado en `coord`
+/// (distancia Chebyshev creciente) y loguea el remap. Si `radius == 0` o no
+/// encuentra walkable, bail out con el mismo mensaje que antes.
+fn remap_if_needed(
+    grid: &WalkabilityGrid,
+    coord: (i32, i32, i32),
+    label: &str,
+    radius: i32,
+) -> anyhow::Result<(i32, i32, i32)> {
+    if grid.is_walkable(coord.0, coord.1, coord.2) {
+        return Ok(coord);
+    }
+    if radius <= 0 {
+        anyhow::bail!(
+            "{} {:?} no es walkable (cost={:?})",
+            label,
+            coord,
+            grid.cost(coord.0, coord.1, coord.2)
+        );
+    }
+    match nearest_walkable(grid, coord, radius) {
+        Some(remapped) => {
+            let d = chebyshev(coord, remapped);
+            println!(
+                "  {} remapped: {:?} → {:?} (distance={} tiles)",
+                label, coord, remapped, d
+            );
+            Ok(remapped)
+        }
+        None => anyhow::bail!(
+            "{} {:?} no es walkable y no hay tile walkable dentro de radio {} (cost={:?})",
+            label,
+            coord,
+            radius,
+            grid.cost(coord.0, coord.1, coord.2)
+        ),
+    }
+}
+
+/// BFS esférico por Chebyshev distance: itera shell por shell (d=1,2,…,radius),
+/// devuelve el primer tile walkable. No prioriza dirección — devuelve el
+/// primero que encuentre en la shell actual.
+fn nearest_walkable(
+    grid: &WalkabilityGrid,
+    center: (i32, i32, i32),
+    radius: i32,
+) -> Option<(i32, i32, i32)> {
+    for r in 1..=radius {
+        for dz in -r..=r {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    // Solo shell (al menos una dimensión toca el borde)
+                    if dx.abs() != r && dy.abs() != r && dz.abs() != r {
+                        continue;
+                    }
+                    let x = center.0 + dx;
+                    let y = center.1 + dy;
+                    let z = center.2 + dz;
+                    if grid.is_walkable(x, y, z) {
+                        return Some((x, y, z));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn chebyshev(a: (i32, i32, i32), b: (i32, i32, i32)) -> i32 {
+    (a.0 - b.0).abs().max((a.1 - b.1).abs()).max((a.2 - b.2).abs())
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -249,5 +313,13 @@ mod tests {
         let path = vec![(10, 10, 7), (10, 10, 6), (10, 11, 6)];
         let s = render_toml_snippet(&path);
         assert!(s.contains("floor change from z=7 to z=6"));
+    }
+
+    #[test]
+    fn chebyshev_returns_max_axis_delta() {
+        assert_eq!(chebyshev((0, 0, 0), (3, 1, 2)), 3);
+        assert_eq!(chebyshev((0, 0, 0), (0, 5, 2)), 5);
+        assert_eq!(chebyshev((10, 10, 7), (10, 10, 7)), 0);
+        assert_eq!(chebyshev((5, 5, 5), (-5, 5, 5)), 10);
     }
 }

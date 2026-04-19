@@ -3,73 +3,69 @@
 Fecha: 2026-04-19
 Método: `path_finder` con `assets/walkability.bin` (11M tiles, 790k transitions, 373 floor files de TibiaMaps.io).
 
-## Resultado batch (post fix Darashia z=1→7)
+## Resultado final (post fix Darashia + extensión `--nearest-walkable 20`)
 
-| Hunt                         | Estado | Detalle                         |
-|------------------------------|--------|---------------------------------|
-| trolls_thais                 | OK     | 39 tiles, 2 floor changes       |
-| abdendriel_wasps             | OK     | 92 tiles, 0 floor changes       |
-| rotworms_darashia            | OK     | 63 tiles, 2 floor changes       |
-| orcs_thais                   | FAIL   | no hay path posible (~600 tiles, A* se rinde) |
-| minos_plains_of_havoc        | FAIL   | goal no walkable (cost=255)     |
-| cyclops_edron                | FAIL   | goal no walkable (cost=255)     |
-| mutated_rats_yalahar         | FAIL   | goal no walkable (cost=255, z=10) |
-| stone_golems_cormaya         | FAIL   | goal no walkable (cost=255, z=8) |
-| ancient_scarabs_darashia     | FAIL   | goal no walkable (cost=255, z=8) |
-| water_elementals_portimi     | FAIL   | goal no en grid (cost=None, z=8) |
-| dwarves_kazordoon            | FAIL   | start no walkable (depot z=11 inválido) |
-| drakens_edron_bottom         | FAIL   | goal no en grid (cost=None, z=10) |
-| mutated_tigers_yalahar       | FAIL   | goal no walkable (cost=255, z=9) |
-| hero_cave_edron              | FAIL   | goal no en grid (cost=None, z=8) |
-| asura_palace_low             | FAIL   | goal no en grid (cost=None, z=8) |
-| corym_mine_port_hope         | FAIL   | goal no en grid (cost=None, z=8) |
+| Hunt                         | Estado | Path | Remap |
+|------------------------------|--------|------|-------|
+| trolls_thais                 | OK     | 39 tiles, 2 floor changes   | — |
+| abdendriel_wasps             | OK     | 92 tiles, 0 floor changes   | — |
+| rotworms_darashia            | OK     | 63 tiles, 2 floor changes   | — |
+| ancient_scarabs_darashia     | OK     | 273 tiles, 7 floor changes  | goal +1 tile |
+| cyclops_edron                | OK     | 258 tiles, 5 floor changes  | goal +3 tiles (z=7→8) |
+| stone_golems_cormaya         | OK     | 183 tiles, 2 floor changes  | goal +1 tile (z=8→9) |
+| drakens_edron_bottom         | OK     | 226 tiles, 6 floor changes  | goal +3 tiles (z=10→7) |
+| hero_cave_edron              | OK     | 449 tiles, 12 floor changes | goal +5 tiles (z=8→9) |
+| mutated_rats_yalahar         | OK     | 84 tiles, 4 floor changes   | goal +1 tile (z=10→8) |
+| mutated_tigers_yalahar       | OK     | 87 tiles, 5 floor changes   | goal +1 tile |
+| dwarves_kazordoon            | OK     | 175 tiles, 3 floor changes  | start +1 tile (z=11→10) |
+| corym_mine_port_hope         | OK     | 86 tiles, 2 floor changes   | goal +1 tile (z=8→7) |
+| orcs_thais                   | FAIL   | no hay path (~600 tiles)    | A* max_nodes exceeded |
+| minos_plains_of_havoc        | FAIL   | no hay path (~500 tiles)    | A* max_nodes exceeded |
+| water_elementals_portimi     | FAIL   | no hay path (~1200 tiles)   | cruza agua entre islas |
+| asura_palace_low             | FAIL   | no hay path (~500 tiles)    | Port Hope → Asura distance |
 
-**Stats**: 3/16 reachable (19%), 13/16 requieren fix.
+**Stats finales**: 12/16 reachable (75%) — **up from 3/16 (19%) pre-extensión**.
 
-## Clasificación de fails
+## Evolución de la auditoría
 
-### `start no walkable` (1 hunt)
-- **dwarves_kazordoon**: depot kazordoon declarado en z=11, pero (32647,31925,11) no es walkable.
-  - Probé (32647,31917,7) → walkable.
-  - Probé (32661,31918,6) y (32661,31918,8) → walkables.
-  - **Sin coord exacta del Kazordoon Main Depot, no puedo fijar offline.**
+1. **Batch inicial**: 2/16 OK (trolls, abdendriel). 14 FAIL por coord inválida.
+2. **Post-fix Darashia z=1→z=7**: 3/16 OK (+rotworms).
+3. **Post-extensión `--nearest-walkable 20`**: 12/16 OK (+9 hunts via goal/start remap).
 
-### `goal no walkable (cost=255)` (5 hunts)
-Tile destino existe en grid pero es pared/agua/bloqueado. Probablemente el start_coord apunta dentro del spawn interior de la cueva, no a la entrada caminable.
-- minos_plains_of_havoc (z=7 surface)
-- cyclops_edron (z=7 surface)
-- mutated_rats_yalahar (z=10)
-- stone_golems_cormaya (z=8)
-- ancient_scarabs_darashia (z=8)
-- mutated_tigers_yalahar (z=9)
+## Fixes aplicados
 
-### `goal no en grid (cost=None)` (6 hunts)
-Tile destino NO está mapeado en walkability.bin — TibiaMaps.io no cubre esa área (spawns profundos privados o post-corte del mapa).
-- water_elementals_portimi (z=8)
-- drakens_edron_bottom (z=10)
-- hero_cave_edron (z=8)
-- asura_palace_low (z=8)
-- corym_mine_port_hope (z=8)
+### 1. `cities.toml` (commit `d6e37f6`)
+- Darashia depot/temple/NPCs: z=1 → z=7 (error tipográfico).
 
-### `no hay path posible` (1 hunt)
-A* no encuentra ruta aunque ambos tiles existan.
-- orcs_thais: Thais depot (z=7) → Orc Fortress (z=7), ~600 tiles de distancia cruzando montañas. Probablemente hay overrides de pathfinding que cortan rutas de montaña.
+### 2. `bot/src/bin/path_finder.rs` (nueva flag `--nearest-walkable N`)
+- Si start o goal no son walkable y N > 0, busca tile walkable más cercano por Chebyshev distance.
+- BFS esférico shell-by-shell (radio 1,2,...,N).
+- Log explícito cada remap: `"goal remapped: (X,Y,Z) → (X',Y',Z') (distance=D tiles)"`.
+- Tests: `chebyshev_returns_max_axis_delta`.
 
-## Lo que requeriría arreglo completo
+## Hunts restantes — fallan por `no hay path`
 
-1. **Coords validadas externamente**: acceso a tibiamaps.io lookup interactivo o sesión live con `/vision/perception`.
-2. **Walkability grid extendida**: algunas áreas (cuevas profundas, mines) no están en TibiaMaps.io y requieren data adicional.
-3. **Overrides de pathfinding**: `pathfinding_overrides.toml` para rutas de montaña (orcs_thais).
-4. **Extensión de path_finder**: "find nearest walkable tile" para tolerar start/goal off por 1-2 tiles.
+Los 4 hunts restantes NO fallan por coord inválida (coords son válidas después del remap). Fallan porque A* no encuentra ruta. Causas probables:
 
-## Probado offline sin éxito
+| Hunt | Depot → Spawn | Distancia XY | Causa |
+|------|---------------|--------------|-------|
+| orcs_thais | Thais → Orc Fortress | ~600 tiles | A* max_nodes exceeded o bridges de montaña |
+| minos_plains_of_havoc | Carlin → Plains of Havoc | ~470 tiles | A* max_nodes exceeded |
+| water_elementals_portimi | Liberty Bay → Portimi | ~1170 tiles | cruza agua entre islas (requiere boat route) |
+| asura_palace_low | Port Hope → Asura Palace | ~490 tiles | A* max_nodes exceeded |
 
-- Probé ±3z en coords del catálogo para starts fallidos: ninguno encontró walkable.
-- Probé sector notation de wiki (Mapper Coords) para Kazordoon: resultó en coords cercanas pero no el depot exacto.
+**Posibles soluciones** (fuera de scope offline):
+- Subir `MAX_NODES` del A* en `pathfinding::find_path` (ver `bot/src/pathfinding/`).
+- Agregar waypoints intermedios como check-points (depot → waypoint1 → waypoint2 → spawn).
+- Pathfinding jerárquico (HPA*) para distancias largas.
+- Usar `pathfinding_overrides.toml` para habilitar rutas de mar/boat.
 
-## Recomendación
+## Semantic note sobre remap
 
-Este audit queda como **data de diagnóstico**. Para progresar:
-- Opción A: sesión live, calibrar los 13 start_coords con `/vision/cursor` parado en cada entrada de cueva.
-- Opción B: descargar mapas adicionales o usar API de tibiamaps.io para lookup batch de coords.
-- Opción C: extender `path_finder` con modo "nearest walkable" (buscar tile walkable más cercano al goal dentro de radio N, y usar ese).
+El `--nearest-walkable 20` hace que path_finder tolere hasta **20 tiles de error** en el coord original. Esto es útil para el catálogo (coords aproximadas) pero **no se debe usar en producción del cavebot real**, porque el runtime del cavebot ejecuta nodes tile-exact. El flag es solo para generar los primeros waypoints viables; una vez generado el snippet, el usuario debe validar el path completo y ajustar las coords finales en sesión live.
+
+## Recomendación operativa
+
+- Usar el snippet generado con `--nearest-walkable` como **punto de partida** para cavebot scripts.
+- Validar cada waypoint en sesión live (`/vision/cursor`) antes de subir `enabled=true`.
+- Los 4 hunts que fallan por `no hay path` requieren o bien una sesión live donde se calibren waypoints intermedios, o bien la mejora de `find_path` para long-distance.
