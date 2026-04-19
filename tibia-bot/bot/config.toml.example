@@ -40,6 +40,16 @@ listen_addr         = "127.0.0.1:8080"
 # Generar en PowerShell:
 #   [Convert]::ToBase64String([byte[]] (1..32 | % {Get-Random -Max 256}))
 # auth_token        = "paste-base64-token-here"
+# V-007: stealth_mode oculta endpoints de debug/introspección con 404.
+# Quedan disponibles /health, /status, /pause, /resume, /metrics +
+# endpoints operativos (cavebot/load, scripts/reload). Los endpoints
+# /vision/*, /fsm/debug, /combat/events, /*/status se ocultan, eliminando
+# la superficie de fingerprinting que permite a un malware local
+# identificar la máquina como bot server.
+#
+# Default false para preservar debuggability durante calibración.
+# Setear true en sesiones live con cuenta real.
+stealth_mode       = false
 
 [loop_config]
 # Frecuencia del game loop en Hz. 30 Hz = ~33ms por tick.

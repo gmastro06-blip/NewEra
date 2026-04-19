@@ -83,6 +83,26 @@ pub struct HttpConfig {
     ///   [Convert]::ToBase64String([byte[]] (1..32 | % {Get-Random -Max 256}))
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// **V-007 mitigation**: cuando `true`, los endpoints de debug/introspección
+    /// devuelven 404. Solo quedan disponibles `/health`, `/status`, `/pause`,
+    /// `/resume` y `/metrics` (con auth). Elimina la superficie de
+    /// fingerprinting que puede usar un malware local para identificar la
+    /// máquina como bot server (ej `/cavebot/status` leak de `hunt_profile`,
+    /// `/vision/grab/debug` con boxes amarillos sobre la UI).
+    ///
+    /// Default `false` para preservar debuggability durante calibración. Setear
+    /// `true` en sesiones live con cuenta real.
+    ///
+    /// Endpoints gated por stealth_mode:
+    ///   - /vision/grab/{anchors,battle,debug,inventory,loot}
+    ///   - /vision/{perception,vitals,battle,status,inventory,cursor,
+    ///     match_now,extract_template,matcher/stats,battle/debug,
+    ///     target/debug,loot/debug}
+    ///   - /fsm/debug, /combat/events, /dispatch/stats
+    ///   - /cavebot/status, /waypoints/status, /scripts/status
+    ///   - /test/grab, /test/inject_frame
+    #[serde(default)]
+    pub stealth_mode: bool,
 }
 
 /// Default HTTP bind: `127.0.0.1:8080` (loopback only).

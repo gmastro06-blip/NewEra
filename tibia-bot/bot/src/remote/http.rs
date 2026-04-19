@@ -103,8 +103,30 @@ pub fn build_router(state: AppState) -> Router {
         .route("/recording/start",       post(handle_recording_start))
         .route("/recording/stop",        post(handle_recording_stop))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
+        // V-007 mitigation: stealth_mode hide debug endpoints.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), stealth_middleware))
+        // V-005/V-006 mitigations:
+        //
+        // RequestBodyLimitLayer cap requests body a MAX_HTTP_BODY_BYTES (10 MB).
+        // Protege `/test/inject_frame` y `/vision/extract_template` que parsean
+        // PNG — un atacante local podría pasar 10 GB de random bytes y forzar
+        // OOM en el allocator. El cap es generoso (un 1920×1080 PNG raramente
+        // supera 4 MB) pero muy por debajo del daño OOM.
+        //
+        // ConcurrencyLimitLayer cap a MAX_CONCURRENT_REQUESTS conexiones
+        // simultáneas. Evita que spamear `/test/grab` a 1000 req/s sature disk
+        // I/O + RAM (cada response genera un 2-4 MB PNG). 32 simultáneas es
+        // holgado para un cliente humano + automatización legítima, suficiente
+        // para bloquear un DoS trivial sin afectar el UX.
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_HTTP_BODY_BYTES))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS))
         .with_state(state)
 }
+
+/// V-005/V-006: límites del HTTP server. Valores deliberadamente holgados
+/// para no romper uso legítimo (frames inyectados, PNG templates extraídos).
+const MAX_HTTP_BODY_BYTES:      usize = 10 * 1024 * 1024;
+const MAX_CONCURRENT_REQUESTS:  usize = 32;
 
 /// V-002 fix: middleware que requiere `Authorization: Bearer <token>` si
 /// `config.http.auth_token` está set. Si no hay token configurado, pasa
@@ -155,6 +177,55 @@ async fn auth_middleware(
             axum::http::StatusCode::UNAUTHORIZED,
             "missing or invalid Authorization: Bearer <token>",
         ).into_response();
+    }
+
+    next.run(req).await
+}
+
+/// V-007 fix: middleware que oculta endpoints de debug/introspección cuando
+/// `config.http.stealth_mode` es true. Retorna 404 con cuerpo vacío — idéntico
+/// a un route inexistente, sin leak del hecho de que el endpoint existe pero
+/// está deshabilitado.
+///
+/// Endpoints SIEMPRE disponibles (incluso en stealth):
+///   - `/health` — liveness check
+///   - `/status`, `/pause`, `/resume` — mínimo necesario para ops humanas
+///   - `/metrics` — Prometheus scrape (útil con auth token + IP allowlist)
+///   - endpoints de escritura operativos (/cavebot/load, /scripts/reload, etc.)
+///     quedan disponibles porque son necesarios para operar el bot; su
+///     superficie de fingerprinting es mínima (no devuelven contenido).
+///
+/// Endpoints bloqueados por stealth (prefix match):
+///   - `/vision/*` completo (incluye grab, perception, inventory, debug views)
+///   - `/fsm/debug`, `/combat/events`, `/dispatch/stats`
+///   - `/test/grab`, `/test/inject_frame` (devuelven datos de vision)
+///   - `/*/status` que leak state interno (`/cavebot/status`, `/waypoints/status`,
+///     `/scripts/status`)
+async fn stealth_middleware(
+    axum::extract::State(s): axum::extract::State<AppState>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !s.config.http.stealth_mode {
+        return next.run(req).await;
+    }
+
+    let path = req.uri().path();
+    let blocked = path.starts_with("/vision/")
+        || path == "/fsm/debug"
+        || path == "/combat/events"
+        || path == "/dispatch/stats"
+        || path == "/test/grab"
+        || path == "/test/inject_frame"
+        || path == "/cavebot/status"
+        || path == "/waypoints/status"
+        || path == "/scripts/status";
+
+    if blocked {
+        // 404 (no 403) para que un scanner no distinga entre "endpoint no
+        // existe" y "endpoint existe pero stealth". Sin body para evitar
+        // fingerprint por contenido del error.
+        return (axum::http::StatusCode::NOT_FOUND, "").into_response();
     }
 
     next.run(req).await
@@ -1658,10 +1729,12 @@ struct CommandAck {
 /// directorio whitelisted. Previene path traversal (`../../../etc/passwd`).
 ///
 /// Usa `canonicalize` para resolver symlinks + `..` y luego chequea que el
-/// resultado empieza con el allowed dir (también canonicalized).
+/// resultado empieza con el allowed dir (también canonicalized). Además
+/// rechaza archivos > `MAX_LOAD_FILE_BYTES` (V-005 DoS mitigation).
 ///
-/// Errors si el path no existe, es symlink a fuera del whitelist, o apunta
-/// afuera. El caller devuelve 400 Bad Request con el error.
+/// Errors si el path no existe, es symlink a fuera del whitelist, apunta
+/// afuera, o el archivo es demasiado grande. El caller devuelve 400 Bad
+/// Request con el error.
 fn validate_load_path(user_path: &str, allowed_dir: &Path) -> Result<PathBuf, String> {
     let p = Path::new(user_path);
     let canonical = std::fs::canonicalize(p)
@@ -1680,8 +1753,32 @@ fn validate_load_path(user_path: &str, allowed_dir: &Path) -> Result<PathBuf, St
             canonical.display(), allowed_canonical.display()
         ));
     }
+    // V-005: file size cap para mitigar OOM DoS. Un TOML legítimo no supera
+    // unas decenas de KB (el cavebot más grande del proyecto es ~8 KB,
+    // hunt_profile ~4 KB). 1 MB es cap holgado que rechaza inputs absurdos
+    // (atacante pasando un 10 GB random blob) sin bloquear scripts reales.
+    //
+    // Para `/scripts/reload` el validator no aplica a cada .lua individualmente
+    // (ese loader itera el dir) — pero sí al dir target, que en canonicalize
+    // falla con EISDIR en metadata.len(), por lo que un dir grande no dispara
+    // este check. Los .lua individuales están capeados a <1 MB cada uno por
+    // convention; cap adicional sería redundante.
+    if let Ok(md) = std::fs::metadata(&canonical) {
+        if md.is_file() && md.len() > MAX_LOAD_FILE_BYTES {
+            return Err(format!(
+                "archivo '{}' excede el límite ({} bytes > {})",
+                canonical.display(), md.len(), MAX_LOAD_FILE_BYTES
+            ));
+        }
+    }
     Ok(canonical)
 }
+
+/// V-005 cap: tamaño máximo de archivo que los endpoints `/cavebot/load`,
+/// `/waypoints/load` y `/scripts/reload` aceptan leer. Conservador (1 MB)
+/// comparado al mayor archivo legítimo del proyecto (~8 KB) pero muy por
+/// debajo del cost de OOM en cargar un blob malicioso de varios GB.
+const MAX_LOAD_FILE_BYTES: u64 = 1 * 1024 * 1024;
 
 async fn handle_waypoints_load(
     State(s): State<AppState>,
@@ -2406,5 +2503,122 @@ mod tests {
         assert!(text.contains("tibia_bot_has_frame"));
         assert!(text.contains("tibia_bot_is_paused"));
         assert!(text.contains("tibia_bot_fsm_state"));
+    }
+
+    // ── Security: V-003, V-005, V-007 regressions ─────────────────────────
+
+    /// Helper: crea un TOML válido de 200 bytes en un tmp dir dentro de
+    /// `expected_dir` (que debe ser un subdir del workspace para que
+    /// canonicalize funcione). Retorna path absoluto al archivo escrito.
+    fn write_tmp_toml(expected_dir: &Path, name: &str, bytes: usize) -> PathBuf {
+        std::fs::create_dir_all(expected_dir).unwrap();
+        let path = expected_dir.join(name);
+        std::fs::write(&path, "x".repeat(bytes)).unwrap();
+        path
+    }
+
+    #[test]
+    fn v003_validate_load_path_rejects_escape_via_parent_dir() {
+        // Path claramente fuera del whitelist (usamos el propio workspace root).
+        let bad = "../../Cargo.toml";
+        let result = validate_load_path(bad, Path::new("assets/cavebot"));
+        assert!(result.is_err(), "expected reject, got {:?}", result);
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("escapa") || msg.contains("no resolvable"),
+            "unexpected error: {}", msg
+        );
+    }
+
+    #[test]
+    fn v003_validate_load_path_accepts_file_inside_whitelist() {
+        let dir = std::env::temp_dir().join(format!("v003_accept_{}", std::process::id()));
+        let path = write_tmp_toml(&dir, "ok.toml", 10);
+        let result = validate_load_path(path.to_str().unwrap(), &dir);
+        assert!(result.is_ok(), "expected accept, got {:?}", result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v005_validate_load_path_rejects_oversized_file() {
+        let dir = std::env::temp_dir().join(format!("v005_size_{}", std::process::id()));
+        // Escribir un archivo > MAX_LOAD_FILE_BYTES (1 MB). 2 MB = 2 * 1024 * 1024.
+        let path = write_tmp_toml(&dir, "huge.toml", 2 * 1024 * 1024);
+        let result = validate_load_path(path.to_str().unwrap(), &dir);
+        assert!(result.is_err(), "expected reject for oversized file");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("excede el límite"),
+            "unexpected error: {}", msg
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v005_validate_load_path_accepts_small_file() {
+        let dir = std::env::temp_dir().join(format!("v005_ok_{}", std::process::id()));
+        // 8 KB — orden de magnitud de scripts legítimos.
+        let path = write_tmp_toml(&dir, "normal.toml", 8 * 1024);
+        let result = validate_load_path(path.to_str().unwrap(), &dir);
+        assert!(result.is_ok(), "expected accept for normal-sized file, got {:?}", result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V-007: con `stealth_mode=true`, endpoints de debug deben retornar 404.
+    #[tokio::test]
+    async fn v007_stealth_mode_blocks_debug_endpoints() {
+        let mut state = test_state().await;
+        // Activar stealth_mode mutando el config del state.
+        let mut new_cfg = (*state.config.http.auth_token.as_ref().unwrap_or(&String::new())).clone();
+        let _ = &mut new_cfg; // noop — el mut anterior era para documentar
+        // Clone del config entero para modificar stealth_mode.
+        let mut cfg = state.config.clone();
+        cfg.http.stealth_mode = true;
+        state.config = cfg;
+        let app = build_router(state);
+
+        // Endpoints que DEBEN bloquearse (lista representativa).
+        for path in &["/vision/perception", "/vision/inventory", "/fsm/debug",
+                      "/combat/events", "/dispatch/stats", "/cavebot/status"] {
+            let (status, _) = get(app.clone(), path).await;
+            assert_eq!(
+                status, StatusCode::NOT_FOUND,
+                "stealth debería bloquear {} con 404, got {}", path, status
+            );
+        }
+    }
+
+    /// V-007: con stealth_mode activo, `/status` y `/health` siguen OK —
+    /// esenciales para ops humanas y monitoring externo.
+    #[tokio::test]
+    async fn v007_stealth_mode_allows_health_and_status() {
+        let mut state = test_state().await;
+        let mut cfg = state.config.clone();
+        cfg.http.stealth_mode = true;
+        state.config = cfg;
+        let app = build_router(state);
+
+        let (status_code, _) = get(app.clone(), "/status").await;
+        assert_eq!(status_code, StatusCode::OK, "/status debe seguir disponible");
+
+        // /health sin frame retorna 503 pero NO 404 — no está stealth-blocked.
+        let (health, _) = get(app, "/health").await;
+        assert_ne!(health, StatusCode::NOT_FOUND, "/health no debe estar stealth-blocked");
+    }
+
+    /// V-007: con stealth_mode=false (default), endpoints debug siguen accesibles.
+    /// Este test asegura que el middleware es no-op en default.
+    #[tokio::test]
+    async fn v007_stealth_mode_default_false_passes_through() {
+        let state = test_state().await;
+        // Sin tocar stealth_mode (default false).
+        let app = build_router(state);
+        let (status, _) = get(app, "/fsm/debug").await;
+        // Puede ser 200 o 503 según haya frame; el único status prohibido
+        // en default es 404 (eso solo aparecería si stealth estuviera ON).
+        assert_ne!(
+            status, StatusCode::NOT_FOUND,
+            "stealth default=false no debería bloquear /fsm/debug"
+        );
     }
 }

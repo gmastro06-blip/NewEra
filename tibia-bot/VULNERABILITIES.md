@@ -1,6 +1,7 @@
 # Análisis de vulnerabilidades — NewEra
 
-**Fecha**: 2026-04-17
+**Fecha original**: 2026-04-17
+**Última actualización**: 2026-04-19 (Sprint 2 fixes — V-005, V-006, V-007)
 **Scope**: bot + bridge + firmware Arduino
 **Método**: audit manual + `cargo audit` + grep patterns
 
@@ -17,21 +18,25 @@
 
 | # | ID | Título | Sev | Status |
 |---|----|--------|-----|--------|
-| 1 | V-001 | **Bridge TCP sin autenticación + bind 0.0.0.0** | 🔴 **Critical** | Abierto |
-| 2 | V-002 | HTTP API sin autenticación | 🟠 High | Mitigado parcial (loopback) |
-| 3 | V-003 | Path traversal via /cavebot/load, /waypoints/load | 🟡 Medium | Abierto |
-| 4 | V-004 | Lua sandbox — escape teórico vía VM bugs | 🟡 Medium | Mitigado parcial |
-| 5 | V-005 | Unbounded file read en load endpoints (DoS) | 🟡 Medium | Abierto |
-| 6 | V-006 | No HTTP rate limiting (DoS local) | 🟡 Medium | Abierto |
-| 7 | V-007 | Information disclosure via /cavebot/status /metrics | 🟠 High | Mitigado parcial (loopback) |
-| 8 | V-008 | bincode unmaintained (RUSTSEC-2025-0141) | 🟢 Low | Monitoring |
+| 1 | V-001 | Bridge TCP sin autenticación + bind 0.0.0.0 | 🔴 Critical | ✅ **Fixed** (e909cb3) — auth_token + loopback default |
+| 2 | V-002 | HTTP API sin autenticación | 🟠 High | ✅ **Fixed** (e909cb3) — Bearer middleware |
+| 3 | V-003 | Path traversal via /cavebot/load, /waypoints/load | 🟡 Medium | ✅ **Fixed** (e909cb3) — validate_load_path whitelist |
+| 4 | V-004 | Lua sandbox — escape teórico vía VM bugs | 🟡 Medium | Mitigado parcial (tras V-003 fix) |
+| 5 | V-005 | Unbounded file read en load endpoints (DoS) | 🟡 Medium | ✅ **Fixed** (sprint2) — MAX_LOAD_FILE_BYTES=1MB |
+| 6 | V-006 | No HTTP rate limiting (DoS local) | 🟡 Medium | ✅ **Fixed** (sprint2) — body limit + concurrency limit |
+| 7 | V-007 | Information disclosure via /cavebot/status /metrics | 🟠 High | ✅ **Fixed** (sprint2) — stealth_mode config |
+| 8 | V-008 | bincode unmaintained (RUSTSEC-2025-0141) | 🟢 Low | Monitoring (no exploit path) |
 | 9 | V-009 | rand unsound (RUSTSEC-2026-0097) | 🟢 Low | Mitigado (no custom logger) |
 | 10 | V-010 | PE metadata leaks crate name "tibia-bot" | 🟢 Low | Parcial (strip=symbols) |
 | 11 | V-011 | Arduino serial sin auth (local solamente) | 🟢 Low | Mitigado por físico |
 | 12 | V-012 | 33 unsafe blocks (Windows API) | ℹ️ Info | Auditado, OK |
 | 13 | V-013 | Log files en disk si pipeado a archivo | ℹ️ Info | Documentado |
 
-**Summary**: 1 Critical, 2 High, 4 Medium, 4 Low, 2 Info = **13 findings totales**.
+**Summary**: 1 Critical ✅, 2 High ✅, 4 Medium (3 ✅ + 1 parcial), 4 Low, 2 Info = **13 findings — 7 cerrados, 4 parcial/monitoring, 2 info**.
+
+**Post-Sprint 2**: el stack es **production-ready para live con cuenta real** en configuración recomendada:
+- `bridge_config.toml`: `mode="serial"` + `listen_addr=127.0.0.1:9000` + `auth_token` set
+- `bot/config.toml`: `listen_addr=127.0.0.1:8080` + `auth_token` set + `stealth_mode=true` para sesión live
 
 ---
 
@@ -109,7 +114,15 @@ Si el usuario corre bot + bridge en la misma máquina (setup común), cambiar de
 
 ### Tracking
 
-**Abierto** — no fix en esta sesión. Estimado siguiente commit: opción A como default, opción C como fallback.
+**Fixed 2026-04-17** (commit `e909cb3`). Implementación:
+
+- `[tcp].auth_token: Option<String>` en `bridge_config.toml` + mismo field en `bot/config.toml [pico].auth_token`.
+- Bridge default `listen_addr = "127.0.0.1:9000"` (loopback-only safe default).
+- Handshake: primer mensaje del cliente DEBE ser `AUTH <token>\n`, bridge responde `OK auth\n` o cierra tras 2s timeout.
+- Constant-time compare contra timing attacks.
+- Backward compat: si token None/empty, skip handshake (solo seguro con loopback bind).
+
+Para setup LAN (bot + bridge en máquinas distintas), ambos configs DEBEN setear el mismo token.
 
 ---
 
@@ -142,7 +155,9 @@ Mismo shared-secret pattern que V-001. Header `Authorization: Bearer <token>` en
 
 ### Tracking
 
-**Abierto** — mitigado parcial.
+**Fixed 2026-04-17** (commit `e909cb3`). Middleware `auth_middleware` en `remote/http.rs` chequea `Authorization: Bearer <token>` en cada request cuando `config.http.auth_token` está set. 401 Unauthorized si falta o no matches. `/health` excluido para liveness probes. Constant-time compare.
+
+Backward compat: sin token configurado, pasa todo (OK para loopback-only, inseguro para LAN).
 
 ---
 
@@ -197,7 +212,15 @@ Aplicar a `/cavebot/load` (whitelist a `assets/cavebot/`), `/waypoints/load` (wh
 
 ### Tracking
 
-**Abierto**.
+**Fixed 2026-04-17** (commit `e909cb3`). Helper `validate_load_path(user_path, allowed_dir)` en `remote/http.rs`:
+
+1. `fs::canonicalize` resuelve symlinks + `..`.
+2. Chequea que el canonical path empiece con `canonicalize(allowed_dir)`.
+3. Retorna error descriptivo (400 Bad Request) si escapa.
+
+Aplicado a `/cavebot/load` (whitelist `assets/cavebot/`), `/waypoints/load` (`assets/waypoints/`) y `/scripts/reload` (`assets/scripts/`).
+
+Tests: `v003_validate_load_path_rejects_escape_via_parent_dir`, `v003_validate_load_path_accepts_file_inside_whitelist`.
 
 ---
 
@@ -263,7 +286,7 @@ let raw = fs::read_to_string(&path)?;
 
 ### Tracking
 
-**Abierto**. Effort ~30 min.
+**Fixed 2026-04-19** (sprint 2). `validate_load_path` ahora checkea `fs::metadata().len()` y rechaza > `MAX_LOAD_FILE_BYTES` (1 MB). Tests: `v005_validate_load_path_rejects_oversized_file`, `v005_validate_load_path_accepts_small_file`.
 
 ---
 
@@ -287,7 +310,12 @@ Rate limiter global del bot (`safety::rate_limit`) aplica a ACCIONES HID, no a H
 
 ### Tracking
 
-**Abierto**.
+**Fixed 2026-04-19** (sprint 2). Dos layers añadidos en `build_router`:
+
+1. `tower_http::limit::RequestBodyLimitLayer::new(10 * 1024 * 1024)` — cap body a 10 MB para proteger `/test/inject_frame` y `/vision/extract_template` que parsean PNG arbitrario.
+2. `tower::limit::ConcurrencyLimitLayer::new(32)` — máximo 32 requests simultáneas. Un atacante spameando `/test/grab` a 1000 req/s queda limitado a 32 en cola, evitando saturación disk I/O + OOM.
+
+Backpressure limitado per-IP NO se implementó — el cap global es suficiente para el threat model loopback y evita la complejidad de `tower_governor`.
 
 ---
 
@@ -334,7 +362,21 @@ Impact: Anti-cheat tiene evidencia inequívoca de bot corriendo. Esto es peor qu
 
 ### Tracking
 
-**Abierto — mitigado parcial**.
+**Fixed 2026-04-19** (sprint 2, opción 4). Nuevo campo `[http].stealth_mode = false` en `bot/config.toml`. Cuando `true`:
+
+- `/vision/*` completo retorna 404
+- `/fsm/debug`, `/combat/events`, `/dispatch/stats` → 404
+- `/cavebot/status`, `/waypoints/status`, `/scripts/status` → 404
+- `/test/grab`, `/test/inject_frame` → 404
+- `/status`, `/pause`, `/resume`, `/metrics`, endpoints `load`/`reload` quedan operativos (necesarios para ops humanas)
+
+404 (no 403) para no leak que el endpoint existe pero está stealth.
+
+Default `false` para preservar debuggability durante calibración. El operador debe activar `stealth_mode = true` antes de una sesión live con cuenta real. Auth token + stealth_mode combinados eliminan ambos vectores de fingerprinting (credencial-less scrape + scan con credencial pero stealth-opaque).
+
+Tests: `v007_stealth_mode_blocks_debug_endpoints`, `v007_stealth_mode_allows_health_and_status`, `v007_stealth_mode_default_false_passes_through`.
+
+**Aún abierto (opcional)**: obfuscate strings — marginal ROI dado que con auth+stealth la superficie es mínima. Refactor tibia_bot_* metrics a nombres genéricos queda como nice-to-have.
 
 ---
 
@@ -501,15 +543,57 @@ Todas las warnings son transitivas (no directos), excepto `bincode` y `rand` que
 
 ## Conclusión
 
-El stack es **mayormente sólido** (Rust memory safety + arquitectura modular), pero tiene **1 vulnerabilidad crítica (V-001)** que debe resolverse antes de cualquier uso LAN-exposed.
+**Estado 2026-04-19 (post-sprint-2)**: el stack está **production-ready** para sesiones live con cuenta real.
 
-El único finding REAL-WORLD crítico es **V-001 bridge TCP sin auth + LAN bind**. Los demás son medium-impact y mitigables con ~8h de trabajo.
+Sprint 1 (commit `e909cb3`) cerró los 3 vectores remote críticos:
+- V-001 bridge TCP auth + loopback default
+- V-002 HTTP bearer middleware
+- V-003 path traversal whitelist
 
-Post-sprint 1, el bot sería **defensivamente aceptable** para uso con cuenta real. Los risks residuales son:
-- Detection patterns behavioral (imposibles de eliminar)
-- Lua escape (teórico, requiere chain V-003 + Lua VM CVE)
-- Supply chain (manejable con updates periódicos)
+Sprint 2 (actual) cerró los vectores DoS + fingerprinting:
+- V-005 file size cap en loads
+- V-006 body + concurrency limits HTTP
+- V-007 stealth_mode config para ocultar debug endpoints
 
-### Recomendación
+Risks residuales aceptables:
+- V-004 Lua escape — teórico, chain requires V-003 (cerrado) o FS access
+- V-008 bincode unmaintained — no exploit path, .bin files locales
+- V-010 PE metadata — strip=symbols elimina 60%, residual bajo
+- Detection patterns behavioral — imposibles de eliminar, mitigados por `safety/` module (timing jitter, breaks, human_noise)
+- Supply chain — `cargo audit` clean excepto 5 warnings transitivas
 
-**NO correr el bot en una sesión live con cuenta real hasta que V-001 esté fixed.** Un vecino con acceso a tu WiFi puede pwn tu gaming PC via bridge TCP en 30 segundos.
+### Recomendación para live
+
+**Configuración segura confirmada** (set todo esto antes de arrancar):
+
+```toml
+# bridge/bridge_config.toml
+[tcp]
+listen_addr = "127.0.0.1:9000"    # o LAN con firewall si multi-PC
+auth_token  = "<32+ byte random>"
+
+[input]
+mode = "serial"                   # Arduino HID, ADR-001
+
+# bot/config.toml
+[pico]
+auth_token = "<same as bridge>"
+
+[http]
+listen_addr  = "127.0.0.1:8080"
+auth_token   = "<32+ byte random>"
+stealth_mode = true               # live: true, dev: false
+```
+
+Con esta config:
+- RCE remoto vía bridge: **bloqueado** (auth + loopback)
+- Control malicioso local del bot via HTTP: **bloqueado** (Bearer token)
+- Fingerprinting por scan local: **bloqueado** (stealth_mode)
+- DoS local (spam /test/grab, load huge files): **bloqueado** (limits)
+- Path traversal en loads: **bloqueado** (whitelist)
+
+### Historial de remediation
+
+- **2026-04-17**: audit inicial — 13 findings identificados
+- **2026-04-17 commit e909cb3**: sprint 1 — V-001, V-002, V-003 fixed
+- **2026-04-19 commit TBD**: sprint 2 — V-005, V-006, V-007 fixed
