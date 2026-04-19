@@ -127,20 +127,22 @@ sells     = ["hmm_rune", "uh_rune", "sd_rune"]
 # DARASHIA — desert city, east, rotworm capital
 # ═════════════════════════════════════════════════════════════════════════════
 [darashia]
-depot_coord   = [33213, 32454, 1]
-temple_coord  = [33213, 32454, 1]
+# FIX 2026-04-19: z=1 era error tipográfico (surface en Tibia es z=7).
+#   Validado via path_finder: (33213, 32454, 7) es walkable.
+depot_coord   = [33213, 32454, 7]
+temple_coord  = [33213, 32454, 7]
 recommended_for_levels = "15-40"
 note          = "acceso fácil a Rotworms/Scarabs en el desierto"
 
 [[darashia.npcs]]
 name      = "Alesar"
 role      = "runes_magic"
-coord     = [33210, 32450, 1]
+coord     = [33210, 32450, 7]
 
 [[darashia.npcs]]
 name      = "Memech"
 role      = "potions"
-coord     = [33218, 32458, 1]
+coord     = [33218, 32458, 7]
 sells     = ["mana_potion", "health_potion"]
 
 # ═════════════════════════════════════════════════════════════════════════════
