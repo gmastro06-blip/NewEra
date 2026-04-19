@@ -1,0 +1,37 @@
+# mutated_tigers_yalahar.toml — Mutated Tigers hunt en Yalahar caves.
+# Level 35-50, alto XP, hunt típico para level-up rápido mid-game.
+
+name        = "mutated_tigers_yalahar"
+description = "Mutated tigers + mutated rats en cuevas bajo Yalahar. Alto XP, lootable para profit moderado."
+level_range = [35, 50]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "mutated_flesh",
+    "tiger_eye",
+    "meat",
+]
+non_stackables = [
+    "twin_hooks",        # loot raro high value
+    "strange_helmet",
+    "brutetamer_staff",
+]
+drop = []
+
+[supplies]
+great_health_potion  = { min = 100, target = 200 }
+great_mana_potion    = { min = 100, target = 250 }
+# food (documentación): dragon_ham - no check automático (no template)
+
+[monsters]
+mutated_rat   = { hp = 650,  xp = 450 }
+mutated_tiger = { hp = 1_200, xp = 700 }
+
+[metrics]
+expected_xp_per_hour    = 200_000
+expected_kills_per_hour = 120
+expected_loot_gp_per_hour = 35_000
+expected_cycle_min      = 120

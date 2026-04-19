@@ -1,0 +1,42 @@
+# hero_cave_edron.toml — Hero Cave en Edron N.
+# Level 40-55. XP sólido, loot mid-tier.
+
+name        = "hero_cave_edron"
+description = "Hero cave + valkyrie spawns en Edron north cave. Humanoid mobs — MIX de heroes + dwarves. Waste alto pero consistent XP."
+level_range = [40, 55]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "two_handed_sword",    # lootable raro pero significativo
+    "meat",
+]
+non_stackables = [
+    "crown_armor",
+    "crown_helmet",
+    "knight_armor",
+    "knight_legs",
+    "warrior_helmet",
+]
+drop = []
+
+[supplies]
+great_health_potion  = { min = 150, target = 300 }
+great_mana_potion    = { min = 150, target = 300 }
+# food (documentación): dragon_ham - no check automático (no template)
+# paladin/ranged
+# assassin_star = { ... } - no template, track manual
+
+[monsters]
+hero             = { hp = 850, xp = 720 }
+valkyrie         = { hp = 480, xp = 340 }
+dwarf_geomancer  = { hp = 455, xp = 265 }
+dwarf_guard      = { hp = 455, xp = 165 }
+
+[metrics]
+expected_xp_per_hour    = 220_000
+expected_kills_per_hour = 80
+expected_loot_gp_per_hour = 50_000
+expected_cycle_min      = 120

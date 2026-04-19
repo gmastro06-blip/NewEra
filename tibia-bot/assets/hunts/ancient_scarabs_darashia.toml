@@ -1,0 +1,41 @@
+# ancient_scarabs_darashia.toml — Ancient scarab cave (Darashia desert).
+# Level 25-40, alto XP, holy-weak mobs (paladin ideal).
+
+name        = "ancient_scarabs_darashia"
+description = "Ancient scarabs cave en el desierto al este de Darashia. Mobs holy-weak — paladin con exori_san muy efectivo. Buen XP mid-level."
+level_range = [25, 40]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "scarab_coin",
+    "small_diamond",
+    "small_sapphire",
+    "meat",
+]
+non_stackables = [
+    "scarab_shield",
+    "scarab_amulet",
+    "magic_light_wand",
+]
+drop = []
+
+[supplies]
+strong_health_potion = { min = 50,  target = 100 }
+strong_mana_potion   = { min = 100, target = 200 }
+great_mana_potion    = { min = 50,  target = 150 }
+# food (documentación): dragon_ham - no check automático (no template)
+# paladin specific
+# royal_spear = { ... } - no template, track manual
+
+[monsters]
+scarab          = { hp = 320, xp = 180 }
+ancient_scarab  = { hp = 1_350, xp = 950 }
+
+[metrics]
+expected_xp_per_hour    = 120_000
+expected_kills_per_hour = 80
+expected_loot_gp_per_hour = 25_000
+expected_cycle_min      = 120

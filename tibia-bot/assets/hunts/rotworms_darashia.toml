@@ -1,0 +1,35 @@
+# rotworms_darashia.toml — Rotworm hunt en Darashia desert caves.
+# Level range 10-20, spot newbie. Consumo de supplies bajo.
+# Ref: https://tibia.fandom.com/wiki/Rotworm
+
+name        = "rotworms_darashia"
+description = "Rotworms (y carrion worms en pisos bajos) cerca de Darashia desert. Bajo consumo, XP decente para level 10-20."
+level_range = [10, 20]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "worm",
+    "meat",
+    "crude_iron",
+]
+non_stackables = []
+drop = []
+
+[supplies]
+# Rotworms pegan flojo, poca heal needed.
+health_potion = { min = 20, target = 50 }
+mana_potion   = { min = 20, target = 50 }  # para druid/sorcerer/monk con spells
+# food (documentación): dragon_ham - no check automático (no template)
+
+[monsters]
+# Main targets con HP/XP aprox (TibiaWiki)
+rotworm         = { hp = 130, xp = 40,  summons = [] }
+carrion_worm    = { hp = 235, xp = 70,  summons = [] }
+
+[metrics]
+expected_xp_per_hour    = 40_000
+expected_kills_per_hour = 200
+expected_loot_gp_per_hour = 5_000
+expected_cycle_min      = 90   # duración típica de 1 hunt cycle antes de refill

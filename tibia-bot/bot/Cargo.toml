@@ -91,6 +91,14 @@ path = "src/bin/click_live.rs"
 name = "crop_template"
 path = "src/bin/crop_template.rs"
 
+[[bin]]
+name = "extract_inventory_slots"
+path = "src/bin/extract_inventory_slots.rs"
+
+[[bin]]
+name = "generate_cavebot"
+path = "src/bin/generate_cavebot.rs"
+
 [dependencies]
 # ── Runtime async ────────────────────────────────────────────────────────────
 tokio              = { workspace = true }

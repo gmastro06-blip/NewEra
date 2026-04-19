@@ -1,0 +1,271 @@
+# hunts_10_50.toml — Catálogo de hunts EXP-focused por level 10-50 por vocación.
+#
+# Cada hunt tiene:
+#   - level_min / level_max: rango recomendado
+#   - city: ciudad base (ver cities.toml)
+#   - exp_per_hour_estimate: EXP/h esperado solo (para comparar spots)
+#   - waste_gp_per_hour: gasto supplies/h aprox
+#   - team_size: solo=1, duo=2, team=3+
+#   - vocations: lista de voc que aprovechan bien este spot
+#   - monsters: lista main de mobs + HP/exp (si conocido)
+#   - start_coord: near spawn entrance (user validate)
+#   - notes: quirks operativos
+#
+# Ref: TibiaBuddy EXP guides + comunidad Tibia para valores 2026.
+# Los valores exp/h son orientativos; el user debe validar con sus sesiones.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LEVEL 10-15 — newbie hunts
+# ═════════════════════════════════════════════════════════════════════════════
+
+[[hunt]]
+id            = "rotworms_darashia"
+name          = "Rotworms (Darashia desert)"
+level_min     = 10
+level_max     = 20
+city          = "darashia"
+exp_per_hour_estimate = 40_000
+waste_gp_per_hour     = 5_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [33172, 32473, 7]
+monsters      = ["rotworm"]
+notes         = """
+Spot clásico para arrancar. Rotworms dropean worms + crude iron, loot ~5k/h.
+Al lvl 15+ agregar carrion worms (pisos abajo).
+"""
+
+[[hunt]]
+id            = "trolls_thais"
+name          = "Trolls (outside Thais)"
+level_min     = 8
+level_max     = 15
+city          = "thais"
+exp_per_hour_estimate = 25_000
+waste_gp_per_hour     = 1_500
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [32384, 32258, 7]
+monsters      = ["troll", "troll_champion"]
+
+[[hunt]]
+id            = "orcs_thais"
+name          = "Orc Fortress (Thais mountain)"
+level_min     = 12
+level_max     = 25
+city          = "thais"
+exp_per_hour_estimate = 55_000
+waste_gp_per_hour     = 3_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [32921, 32079, 7]
+monsters      = ["orc", "orc_warrior", "orc_berserker", "orc_leader"]
+
+[[hunt]]
+id            = "minos_plains_of_havoc"
+name          = "Minotaurs (Plains of Havoc)"
+level_min     = 12
+level_max     = 22
+city          = "carlin"
+exp_per_hour_estimate = 50_000
+waste_gp_per_hour     = 2_500
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [32592, 32250, 7]
+monsters      = ["minotaur", "minotaur_archer", "minotaur_guard"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LEVEL 15-25 — transición
+# ═════════════════════════════════════════════════════════════════════════════
+
+[[hunt]]
+id            = "cyclops_edron"
+name          = "Cyclops Camp (Edron NE)"
+level_min     = 15
+level_max     = 28
+city          = "edron"
+exp_per_hour_estimate = 70_000
+waste_gp_per_hour     = 3_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [33292, 31684, 7]
+monsters      = ["cyclops", "cyclops_drone", "cyclops_smith"]
+notes         = "Loot: crude iron, piggy bank (raro). Buen gold/h."
+
+[[hunt]]
+id            = "mutated_rats_yalahar"
+name          = "Mutated Rats (Yalahar caves)"
+level_min     = 18
+level_max     = 30
+city          = "yalahar"
+exp_per_hour_estimate = 80_000
+waste_gp_per_hour     = 5_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [32849, 31232, 10]
+monsters      = ["mutated_rat"]
+
+[[hunt]]
+id            = "stone_golems_cormaya"
+name          = "Stone Golems (Cormaya south)"
+level_min     = 20
+level_max     = 35
+city          = "edron"
+exp_per_hour_estimate = 85_000
+waste_gp_per_hour     = 8_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [33236, 31915, 8]
+monsters      = ["stone_golem", "earth_elemental"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LEVEL 25-35 — mid-game
+# ═════════════════════════════════════════════════════════════════════════════
+
+[[hunt]]
+id            = "ancient_scarabs_darashia"
+name          = "Ancient Scarabs (Darashia desert cave)"
+level_min     = 25
+level_max     = 40
+city          = "darashia"
+exp_per_hour_estimate = 120_000
+waste_gp_per_hour     = 12_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [33279, 32577, 8]
+monsters      = ["ancient_scarab", "scarab"]
+notes         = "Holy weak mob — paladin muy efectivo con exori san."
+
+[[hunt]]
+id            = "abdendriel_wasps"
+name          = "Wasps (Ab'dendriel cave)"
+level_min     = 20
+level_max     = 35
+city          = "abdendriel"
+exp_per_hour_estimate = 70_000
+waste_gp_per_hour     = 5_000
+team_size     = 1
+vocations     = ["druid", "sorcerer", "monk", "paladin"]
+start_coord   = [32683, 31672, 7]
+monsters      = ["wasp", "honeycomb_bee"]
+notes         = "Hunt actual del user. Profile existe en assets/hunts/abdendriel_wasps.toml."
+cavebot_script = "assets/cavebot/abdendriel_wasps.toml"
+
+[[hunt]]
+id            = "water_elementals_portimi"
+name          = "Water Elementals (pre-Svargrond)"
+level_min     = 30
+level_max     = 45
+city          = "liberty_bay"
+exp_per_hour_estimate = 150_000
+waste_gp_per_hour     = 15_000
+team_size     = 1
+vocations     = ["sorcerer", "druid", "monk", "paladin"]
+start_coord   = [32151, 31732, 8]
+monsters      = ["water_elemental"]
+notes         = "Profit alto por small sapphires/small topazes."
+
+[[hunt]]
+id            = "dwarves_kazordoon"
+name          = "Dwarves (Kazordoon deep)"
+level_min     = 18
+level_max     = 30
+city          = "kazordoon"
+exp_per_hour_estimate = 80_000
+waste_gp_per_hour     = 4_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [32693, 31817, 12]
+monsters      = ["dwarf", "dwarf_soldier", "dwarf_guard"]
+
+[[hunt]]
+id            = "drakens_edron_bottom"
+name          = "Drakens (Edron sewers bottom)"
+level_min     = 30
+level_max     = 50
+city          = "edron"
+exp_per_hour_estimate = 180_000
+waste_gp_per_hour     = 18_000
+team_size     = 1
+vocations     = ["paladin", "druid", "sorcerer", "monk"]
+start_coord   = [33192, 31734, 10]
+monsters      = ["draken_warmaster", "draken_spellweaver"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LEVEL 35-50 — mid-late
+# ═════════════════════════════════════════════════════════════════════════════
+
+[[hunt]]
+id            = "mutated_tigers_yalahar"
+name          = "Mutated Tigers (Yalahar)"
+level_min     = 35
+level_max     = 50
+city          = "yalahar"
+exp_per_hour_estimate = 200_000
+waste_gp_per_hour     = 20_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [32857, 31263, 9]
+monsters      = ["mutated_tiger", "mutated_rat"]
+
+[[hunt]]
+id            = "hero_cave_edron"
+name          = "Hero Cave (Edron north)"
+level_min     = 40
+level_max     = 55
+city          = "edron"
+exp_per_hour_estimate = 220_000
+waste_gp_per_hour     = 25_000
+team_size     = 1
+vocations     = ["paladin", "druid", "sorcerer", "monk"]
+start_coord   = [33091, 31630, 8]
+monsters      = ["hero", "valkyrie", "dwarf_geomancer"]
+
+[[hunt]]
+id            = "asura_palace_low"
+name          = "Asura Palace lower floors"
+level_min     = 45
+level_max     = 70
+city          = "port_hope"
+exp_per_hour_estimate = 280_000
+waste_gp_per_hour     = 30_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [33083, 32842, 8]
+monsters      = ["slick_water_elemental", "diamond_servant", "true_dawnfire_asura"]
+
+[[hunt]]
+id            = "corym_mine_port_hope"
+name          = "Corym Mine (Port Hope)"
+level_min     = 35
+level_max     = 55
+city          = "port_hope"
+exp_per_hour_estimate = 170_000
+waste_gp_per_hour     = 15_000
+team_size     = 1
+vocations     = ["knight", "paladin", "druid", "sorcerer", "monk"]
+start_coord   = [32547, 32806, 8]
+monsters      = ["corym_charlatan", "corym_vanguard", "corym_skirmisher"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# RESUMEN POR VOCACIÓN / LEVEL (orientativo)
+# ═════════════════════════════════════════════════════════════════════════════
+# Knight 10-20:  rotworms → orc_fortress → minos
+# Knight 20-35:  cyclops → stone_golems → dwarves
+# Knight 35-50:  mutated_tigers → hero_cave → corym
+#
+# Paladin 10-20: rotworms → orc_fortress → cyclops (paladin-friendly por ranged)
+# Paladin 20-35: ancient_scarabs (holy) → drakens
+# Paladin 35-50: mutated_tigers → hero_cave → asura_palace_low
+#
+# Druid 10-20:   rotworms → abdendriel_wasps (22+) → orc_fortress
+# Druid 20-35:   ancient_scarabs → water_elementals → drakens (exevo flam hur)
+# Druid 35-50:   mutated_tigers → hero_cave
+#
+# Sorcerer 10-20: rotworms → abdendriel_wasps → orc_fortress
+# Sorcerer 20-35: water_elementals (sd rune) → drakens
+# Sorcerer 35-50: hero_cave → asura_palace_low
+#
+# Monk 10-20:    rotworms → orc_fortress → minos (fist OK vs humanoids)
+# Monk 20-35:    abdendriel_wasps → ancient_scarabs → dwarves
+# Monk 35-50:    mutated_tigers → corym_mine → hero_cave

@@ -1,0 +1,41 @@
+# orcs_thais.toml — Orc Fortress spawn en Thais mountain.
+# Level 12-25, spot clásico.
+
+name        = "orcs_thais"
+description = "Orc Fortress en las montañas al este de Thais. Mix de orc/warrior/berserker/leader. EXP buena, loot variado."
+level_range = [12, 25]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "orc_tooth",
+    "orc_leather",
+    "meat",
+]
+non_stackables = [
+    "studded_armor",
+    "chain_armor",
+    "mace",
+    "axe",
+]
+drop = []
+
+[supplies]
+health_potion       = { min = 30, target = 80 }
+mana_potion         = { min = 20, target = 60 }
+strong_mana_potion  = { min = 10, target = 40 }  # para level 20+
+# food (documentación): dragon_ham - no check automático (no template)
+
+[monsters]
+orc             = { hp = 70,  xp = 25 }
+orc_warrior     = { hp = 125, xp = 50 }
+orc_berserker   = { hp = 210, xp = 95 }
+orc_leader      = { hp = 420, xp = 190 }
+
+[metrics]
+expected_xp_per_hour    = 55_000
+expected_kills_per_hour = 180
+expected_loot_gp_per_hour = 8_000
+expected_cycle_min      = 75

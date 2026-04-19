@@ -1,0 +1,216 @@
+# vocations.toml — Spells, supplies y equipment por vocación oficial Tibia 12
+# para level range 10-50 (Fase 1 del plan).
+#
+# Cada entrada describe:
+#   - heal/attack spells con cost + min level
+#   - mana/hp consumo típico (para capacity planning de supplies)
+#   - supplies recomendados por sub-rango de level
+#   - weapon progression (sólo nombres — templates en assets/templates/inventory/)
+#
+# Referencia spells: wiki.fandom.com + TibiaMonk (Monk)
+# Actualización: 2026-04-19
+
+# ═════════════════════════════════════════════════════════════════════════════
+# KNIGHT (tanque melee)
+# ═════════════════════════════════════════════════════════════════════════════
+[knight]
+role         = "tank_melee"
+main_stat    = "hp"
+hp_priority  = "high"     # se tanquea → HP pot > mana pot
+mana_priority = "low"
+
+[knight.spells.heal]
+exura_ico     = { level = 8,  mana = 12,  cooldown_s = 1.0, kind = "self_heal", hotkey_default = "F1" }
+exura_gran    = { level = 14, mana = 60,  cooldown_s = 1.0, kind = "self_heal_strong", hotkey_default = "F2" }
+
+[knight.spells.buff]
+utito_tempo   = { level = 10, mana = 60,  cooldown_s = 120.0, kind = "melee_damage_boost", hotkey_default = "F3" }
+utani_hur     = { level = 14, mana = 60,  cooldown_s = 10.0,  kind = "speed_boost", hotkey_default = "F4" }
+utamo_tempo   = { level = 12, mana = 30,  cooldown_s = 10.0,  kind = "shield_boost" }
+utori_kor     = { level = 20, mana = 115, cooldown_s = 120.0, kind = "pvp_attack_buff" }
+
+[knight.spells.attack]
+exori_ico     = { level = 18, mana = 30,  cooldown_s = 6.0, kind = "single_target" }
+groeshh       = { level = 35, mana = 40,  cooldown_s = 6.0, kind = "front_area" }
+exori         = { level = 42, mana = 160, cooldown_s = 30.0, kind = "area_around" }
+exori_min     = { level = 50, mana = 300, cooldown_s = 30.0, kind = "area_big" }
+
+[knight.supplies]
+# Supplies típicos por sub-rango. Cantidades orientadas a 2h hunt.
+# Los `item_name` deben existir como template en assets/templates/inventory/.
+"10-20" = { hp_pot = "health_potion",        hp_qty = 100, mana_pot = "mana_potion",       mana_qty = 50 }
+"20-35" = { hp_pot = "strong_health_potion", hp_qty = 100, mana_pot = "strong_mana_potion", mana_qty = 50 }
+"35-50" = { hp_pot = "great_health_potion",  hp_qty = 150, mana_pot = "great_mana_potion",  mana_qty = 100 }
+food    = { item = "meat", qty = 20 }
+
+[knight.weapons]
+"10-15" = ["knight_axe", "barbarian_axe"]
+"15-30" = ["headchopper", "warlord_sword"]
+"30-50" = ["fire_axe", "thunder_hammer", "queen_bone_sword"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PALADIN (ranged distance)
+# ═════════════════════════════════════════════════════════════════════════════
+[paladin]
+role          = "ranged_dps"
+main_stat     = "mana"
+hp_priority   = "medium"
+mana_priority = "medium"
+
+[paladin.spells.heal]
+exura         = { level = 8,  mana = 20,  cooldown_s = 1.0, kind = "self_heal", hotkey_default = "F1" }
+exura_gran    = { level = 14, mana = 60,  cooldown_s = 1.0, kind = "self_heal_strong", hotkey_default = "F2" }
+exura_san     = { level = 35, mana = 230, cooldown_s = 1.0, kind = "self_heal_vip", hotkey_default = "F3" }
+
+[paladin.spells.buff]
+utamo_tempo   = { level = 20, mana = 70,  cooldown_s = 10.0, kind = "shield_boost" }
+utani_hur     = { level = 14, mana = 60,  cooldown_s = 10.0, kind = "speed_boost", hotkey_default = "F4" }
+
+[paladin.spells.attack]
+exori_san     = { level = 20, mana = 35,  cooldown_s = 6.0,  kind = "single_target_holy" }
+exori_mas_san = { level = 23, mana = 70,  cooldown_s = 12.0, kind = "area_holy" }
+exori_con     = { level = 25, mana = 25,  cooldown_s = 6.0,  kind = "piercing_single" }
+exeta_con     = { level = 30, mana = 90,  cooldown_s = 40.0, kind = "caldera_holy" }
+exori_gran_san = { level = 50, mana = 80, cooldown_s = 6.0,  kind = "single_target_strong_holy" }
+
+[paladin.supplies]
+"10-20" = { hp_pot = "health_potion",        hp_qty = 50,  mana_pot = "mana_potion",       mana_qty = 100, ammo = "spear",   ammo_qty = 300 }
+"20-35" = { hp_pot = "strong_health_potion", hp_qty = 50,  mana_pot = "strong_mana_potion", mana_qty = 150, ammo = "royal_spear", ammo_qty = 300 }
+"35-50" = { hp_pot = "great_health_potion",  hp_qty = 100, mana_pot = "great_mana_potion",  mana_qty = 200, ammo = "assassin_star", ammo_qty = 500 }
+food    = { item = "meat", qty = 20 }
+
+[paladin.weapons]
+"10-20" = ["spear", "royal_spear"]
+"20-35" = ["crossbow_+_power_bolt", "crossbow_+_piercing_bolt"]
+"35-50" = ["yol_bow", "assassin_star"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DRUID (mage healer / wave)
+# ═════════════════════════════════════════════════════════════════════════════
+[druid]
+role          = "mage_support_wave"
+main_stat     = "mana"
+hp_priority   = "low"
+mana_priority = "high"
+
+[druid.spells.heal]
+exura         = { level = 8,  mana = 20,  cooldown_s = 1.0, kind = "self_heal", hotkey_default = "F1" }
+exura_gran    = { level = 14, mana = 60,  cooldown_s = 1.0, kind = "self_heal_strong", hotkey_default = "F2" }
+exura_sio     = { level = 16, mana = 85,  cooldown_s = 1.0, kind = "target_heal_party", hotkey_default = "F3" }
+exura_mas_res = { level = 36, mana = 420, cooldown_s = 4.0, kind = "mass_res" }
+
+[druid.spells.buff]
+utani_hur     = { level = 14, mana = 60,  cooldown_s = 10.0, kind = "speed_boost", hotkey_default = "F4" }
+utamo_vita    = { level = 14, mana = 50,  cooldown_s = 10.0, kind = "magic_shield" }
+
+[druid.spells.attack]
+exori_gran    = { level = 18, mana = 30,  cooldown_s = 6.0,  kind = "front_area" }
+exevo_flam_hur  = { level = 22, mana = 140, cooldown_s = 6.0,  kind = "fire_wave" }
+exori_mas_frigo = { level = 20, mana = 100, cooldown_s = 12.0, kind = "area_ice" }
+exevo_mas_vis = { level = 28, mana = 120, cooldown_s = 10.0, kind = "area_death" }
+exori_moe_ico = { level = 33, mana = 60,  cooldown_s = 6.0,  kind = "missile_single" }
+
+[druid.supplies]
+"10-20" = { hp_pot = "health_potion",        hp_qty = 30,  mana_pot = "mana_potion",        mana_qty = 150 }
+"20-35" = { hp_pot = "strong_health_potion", hp_qty = 30,  mana_pot = "strong_mana_potion", mana_qty = 250 }
+"35-50" = { hp_pot = "great_health_potion",  hp_qty = 50,  mana_pot = "great_mana_potion",  mana_qty = 300 }
+runes   = { item = "ultimate_healing_rune", qty = 50, note = "opcional para emergencias" }
+food    = { item = "dragon_ham", qty = 15 }
+
+[druid.weapons]
+"10-25" = ["wand_of_vortex", "wand_of_dragonbreath"]
+"25-45" = ["wand_of_decay", "wand_of_draconia"]
+"45-50" = ["wand_of_inferno", "wand_of_starstorm"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SORCERER (mage attack)
+# ═════════════════════════════════════════════════════════════════════════════
+[sorcerer]
+role          = "mage_dps"
+main_stat     = "mana"
+hp_priority   = "low"
+mana_priority = "high"
+
+[sorcerer.spells.heal]
+exura         = { level = 8,  mana = 20,  cooldown_s = 1.0, kind = "self_heal", hotkey_default = "F1" }
+exura_gran    = { level = 14, mana = 60,  cooldown_s = 1.0, kind = "self_heal_strong", hotkey_default = "F2" }
+# sorcerer no tiene exura_sio (heal target) — distingue de druid
+
+[sorcerer.spells.buff]
+utani_hur     = { level = 14, mana = 60,  cooldown_s = 10.0, kind = "speed_boost", hotkey_default = "F4" }
+utamo_vita    = { level = 14, mana = 50,  cooldown_s = 10.0, kind = "magic_shield" }
+
+[sorcerer.spells.attack]
+exori_vis     = { level = 13, mana = 30,  cooldown_s = 6.0,  kind = "single_death" }
+exori_flam    = { level = 18, mana = 30,  cooldown_s = 6.0,  kind = "single_fire" }
+exevo_vis_lux = { level = 13, mana = 120, cooldown_s = 6.0,  kind = "death_wave" }
+exevo_gran_mas_vis = { level = 60, mana = 500, cooldown_s = 10.0, kind = "area_rage" }
+exori_mort    = { level = 25, mana = 20,  cooldown_s = 6.0,  kind = "curse_single" }
+
+[sorcerer.spells.runes]
+# Runes craftables con adori/adura
+uh_rune       = { name = "ultimate_healing_rune", adori_mana = 400, adori_sm_charges = 2 }
+sd_rune       = { name = "sudden_death_rune",     adori_mana = 985, adori_sm_charges = 3 }
+hmm_rune      = { name = "heavy_magic_missile_rune", adori_mana = 120 }
+
+[sorcerer.supplies]
+"10-20" = { hp_pot = "health_potion",        hp_qty = 30,  mana_pot = "mana_potion",        mana_qty = 150 }
+"20-35" = { hp_pot = "strong_health_potion", hp_qty = 30,  mana_pot = "strong_mana_potion", mana_qty = 250 }
+"35-50" = { hp_pot = "great_health_potion",  hp_qty = 50,  mana_pot = "great_mana_potion",  mana_qty = 300 }
+runes   = { item = "sudden_death_rune", qty = 100, note = "para target-single heavy hitters" }
+food    = { item = "dragon_ham", qty = 15 }
+
+[sorcerer.weapons]
+"10-25" = ["wand_of_vortex", "wand_of_dragonbreath"]
+"25-45" = ["wand_of_decay", "wand_of_draconia"]
+"45-50" = ["wand_of_inferno", "wand_of_voodoo"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MONK (nueva vocación 2025+, fist fighting + harmony/virtue)
+# Ref: https://tibia.fandom.com/wiki/Monk, https://www.tibiamonk.com/en/abilities
+# ═════════════════════════════════════════════════════════════════════════════
+[monk]
+role            = "martial_support_hybrid"
+main_stat       = "hp+mana_hybrid"
+hp_priority     = "medium"
+mana_priority   = "medium"
+unique_mechanic = "harmony_virtue"    # Builder spells generan Harmony, Spender la consumen
+notes           = """
+Monks tienen spells categorizados:
+  - Builder: generan Harmony (resource) — low mana cost, baja damage
+  - Spender: consumen Harmony — high damage single/area
+  - Virtue (passive): cuando se genera/gasta Harmony, el party member con menor %HP es healed
+Imbuements: Punch (no Slash/Bash/Chop). Top priority: Fist Fighting +4.
+"""
+
+[monk.spells.heal]
+exura         = { level = 8,  mana = 20,  cooldown_s = 1.0, kind = "self_heal", hotkey_default = "F1" }
+exura_gran    = { level = 14, mana = 60,  cooldown_s = 1.0, kind = "self_heal_strong", hotkey_default = "F2" }
+
+[monk.spells.buff]
+utani_hur     = { level = 14, mana = 60,  cooldown_s = 10.0, kind = "speed_boost", hotkey_default = "F4" }
+# TODO: completar buffs específicos monk (Virtue-related) tras validación wiki
+
+[monk.spells.builder]
+# Builder spells: generan Harmony stack. Usados en sustain.
+# Placeholders — verificar nombres exactos en wiki
+punch_flurry  = { level = 10, mana = 15, cooldown_s = 2.0, harmony_gain = 1, kind = "builder_single" }
+palm_strike   = { level = 15, mana = 25, cooldown_s = 4.0, harmony_gain = 2, kind = "builder_area" }
+
+[monk.spells.spender]
+# Spender spells: consumen Harmony para damage burst.
+dragon_fist   = { level = 20, mana = 50, cooldown_s = 8.0,  harmony_cost = 3, kind = "spender_single" }
+tiger_stance  = { level = 30, mana = 100, cooldown_s = 12.0, harmony_cost = 5, kind = "spender_area" }
+
+[monk.supplies]
+"10-20" = { hp_pot = "health_potion",        hp_qty = 60,  mana_pot = "mana_potion",       mana_qty = 100 }
+"20-35" = { hp_pot = "strong_health_potion", hp_qty = 80,  mana_pot = "strong_mana_potion", mana_qty = 120 }
+"35-50" = { hp_pot = "great_health_potion",  hp_qty = 100, mana_pot = "great_mana_potion",  mana_qty = 150 }
+food    = { item = "dragon_ham", qty = 20 }
+
+[monk.weapons]
+# Fist fighting — hands/gloves son los "weapons"
+"10-20" = ["sparring_gloves", "brass_knuckles"]
+"20-35" = ["apprentice_fist_wraps", "dragon_fang_knuckles"]
+"35-50" = ["master_fist_wraps", "crystal_knuckles"]
+# TODO: completar con nombres exactos tras validación wiki

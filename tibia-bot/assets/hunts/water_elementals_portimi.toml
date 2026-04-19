@@ -1,0 +1,42 @@
+# water_elementals_portimi.toml — Water Elementals pre-Svargrond area.
+# Level 30-45, mage-friendly (sorcerer con SD, druid con exevo flam hur).
+
+name        = "water_elementals_portimi"
+description = "Water elementals en las cuevas pre-Svargrond (Liberty Bay / Port Hope access). Fire-weak mob — druid/sorcerer ideal. Profit alto por gemas."
+level_range = [30, 45]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "platinum_coin",
+    "small_sapphire",
+    "small_topaz",
+    "small_emerald",
+    "water_elemental_pieces",
+]
+non_stackables = [
+    "glacier_shoes",
+    "glacier_amulet",
+    "star_amulet",
+    "focus_cape",
+]
+drop = []
+
+[supplies]
+strong_health_potion = { min = 50,  target = 120 }
+great_mana_potion    = { min = 100, target = 250 }
+# food (documentación): dragon_ham - no check automático (no template)
+# sorcerer specific
+sudden_death_rune    = { min = 30,  target = 100 }
+# druid specific alt
+ultimate_healing_rune = { min = 30, target = 80 }
+
+[monsters]
+water_elemental = { hp = 1_050, xp = 580 }
+
+[metrics]
+expected_xp_per_hour    = 150_000
+expected_kills_per_hour = 100
+expected_loot_gp_per_hour = 40_000
+expected_cycle_min      = 120

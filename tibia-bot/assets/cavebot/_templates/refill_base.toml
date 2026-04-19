@@ -1,0 +1,122 @@
+# refill_base.toml — plantilla standalone de refill loop.
+#
+# Útil cuando el cavebot principal invoca refill como subrutina
+# (via `goto refill`). Incluye:
+#   - walk_to_depot
+#   - deposit loot
+#   - walk_to_npc
+#   - buy mana/health/runes/food
+#   - walk_back_to_start
+#
+# Reemplazar todos los <PLACEHOLDER> con coords reales.
+
+[cavebot]
+loop = false   # refill ejecuta una vez, luego vuelve al hunt
+
+[[step]]
+kind = "label"
+name = "refill_start"
+
+# ─── 1. Walk al depot ───────────────────────────────────────────────────────
+[[step]]
+kind = "node"
+x = 32732  # depot coord — ver assets/catalogs/cities.toml
+y = 31634
+z = 7
+
+# ─── 2. Deposit loot (stow_all_items del whitelist del profile) ─────────────
+[[step]]
+kind         = "stow_all_items"
+slot_vx      = 1585   # primer slot del 1er backpack del strip
+slot_vy      = 22
+menu_offset_x = 87    # offset del "Stow all items of this type" desde click
+menu_offset_y = 258
+menu_wait_ms    = 600
+stow_process_ms = 1200
+max_iterations  = 6
+from_profile    = true   # usa [loot].stackables del hunt_profile
+
+# ─── 3. Walk al NPC shopkeeper ──────────────────────────────────────────────
+[[step]]
+kind = "node"
+x = 32737  # NPC coord — ver cities.toml
+y = 31638
+z = 7
+
+# ─── 4. Abrir trade ─────────────────────────────────────────────────────────
+# Tibia 12: "hi" + "trade" abre la ventana sin click al bag icon.
+# Si el NPC no acepta `trade`, usar bag_button_vx/vy + bag_button_template
+# (ver open_npc_trade docs).
+
+[[step]]
+kind             = "open_npc_trade"
+greeting_phrases = ["hi", "trade"]
+wait_button_ms   = 1500
+
+[step.verify]
+# Opcional: validar que la ventana se abrió. Requiere template pequeño
+# calibrado (ej "Currency:" 130×22). Si no tenés, comentar [step.verify].
+template   = "npc_trade"
+timeout_ms = 4000
+on_fail    = "safety_pause"
+
+# ─── 5. Comprar mana potions ────────────────────────────────────────────────
+# IMPORTANTE: el `item_vx/vy` apunta al item EN LA TRADE WINDOW (no en el
+# inventario). Calibrar con /vision/cursor mientras la window está abierta.
+
+[[step]]
+kind        = "type_in_field"
+field_vx    = 180      # click en "Type to search" input
+field_vy    = 150
+text        = "mana potion"
+wait_after_click_ms = 200
+
+[[step]]
+kind        = "buy_item"
+item_vx     = 200      # click sobre "Mana Potion" en la lista filtrada
+item_vy     = 300
+amount_vx   = 400      # campo amount
+amount_vy   = 500
+confirm_vx  = 480      # botón Buy
+confirm_vy  = 540
+quantity    = 100      # cantidad por ciclo de compra
+spacing_ms  = 200
+
+# ─── 6. Comprar health potions ──────────────────────────────────────────────
+[[step]]
+kind        = "type_in_field"
+field_vx    = 180
+field_vy    = 150
+text        = "health potion"
+wait_after_click_ms = 200
+
+[[step]]
+kind        = "buy_item"
+item_vx     = 200
+item_vy     = 300
+amount_vx   = 400
+amount_vy   = 500
+confirm_vx  = 480
+confirm_vy  = 540
+quantity    = 50
+spacing_ms  = 200
+
+# ─── 7. Cerrar trade ────────────────────────────────────────────────────────
+[[step]]
+kind = "close_npc_trade"
+bye_vx = 117    # botón "Bye" o "X" de la trade window
+bye_vy = 298
+
+# ─── 8. Volver al hunt ──────────────────────────────────────────────────────
+# El cavebot principal capturó qué step era (`current_label_name` API).
+# Aquí vuelve a la label principal del hunt.
+
+[[step]]
+kind = "node"
+x = 32683   # spawn point del hunt
+y = 31672
+z = 7
+
+[[step]]
+kind = "label"
+name = "refill_end"

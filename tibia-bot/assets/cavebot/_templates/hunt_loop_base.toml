@@ -1,0 +1,150 @@
+# hunt_loop_base.toml — plantilla genérica de hunt loop.
+#
+# Reemplazar:
+#   <HUNT_PROFILE>    → nombre del profile en assets/hunts/<name>.toml
+#   <NODE_X>, <NODE_Y>, <NODE_Z> → coords de cada waypoint
+#   <LOOT_VX>, <LOOT_VY>         → click coord para loot (viewport)
+#   <ENEMIES_MIN>                → threshold de enemigos para stand_until
+#
+# Estructura del loop:
+#   1. Verificar supplies (jump a refill si faltan)
+#   2. Walk nodes hasta el primer spawn
+#   3. Stand_until que haya enemigos
+#   4. Loot
+#   5. Repetir walk+stand+loot por cada waypoint
+#   6. Goto start (loop forever)
+
+[cavebot]
+loop         = true
+hunt_profile = "<HUNT_PROFILE>"
+
+# ─── Start / checkpoint de entrada ──────────────────────────────────────────
+[[step]]
+kind = "label"
+name = "start"
+
+# ─── Verificar supplies al inicio del loop ──────────────────────────────────
+# Si faltan supplies, saltar a refill; si no, seguir al hunt.
+[[step]]
+kind         = "check_supplies"
+on_fail      = "refill"
+from_profile = true
+# NOTE: from_profile lee los `min` de assets/hunts/<HUNT_PROFILE>.toml [supplies]
+
+# ─── Walk al primer spawn point ─────────────────────────────────────────────
+# Cada node es un tile coord absoluto. Usar `path_finder` bin para
+# autogenerar el path entre el depot y el spawn:
+#
+#   cargo run --release --bin path_finder -- \
+#       --walkability assets/walkability.bin \
+#       --from <DEPOT_X>,<DEPOT_Y>,<DEPOT_Z> \
+#       --to <SPAWN_X>,<SPAWN_Y>,<SPAWN_Z> \
+#       --simplify --output nodes.toml
+#
+# y pegar las entries de nodes.toml aquí.
+
+[[step]]
+kind = "label"
+name = "hunt_loop"
+
+# Ejemplo de nodes (reemplazar con path real):
+[[step]]
+kind = "node"
+x = 32683
+y = 31672
+z = 7
+
+# ─── Stand hasta que haya enemigos ──────────────────────────────────────────
+# `enemies_gte` espera hasta que el battle list detecte N enemies.
+# `max_wait_ms` es timeout — si no aparecen, continuar (evita stuck).
+
+[[step]]
+kind         = "stand"
+until        = "enemies_gte(1)"
+max_wait_ms  = 15000
+
+# ─── Loot (click derecho sobre corpse) ──────────────────────────────────────
+# El coord es VIEWPORT-relative (no tile). Para hunts con loot en coord fija,
+# usar `loot_visible` condition + click fixed.
+
+[[step]]
+kind = "goto_if"
+when = "not:loot_visible"
+label = "next_node"    # skip loot si no hay corpse
+
+[[step]]
+kind = "loot"
+vx   = 660           # centro del viewport típico; ajustar
+vy   = 400
+
+# ─── Siguiente waypoint ─────────────────────────────────────────────────────
+[[step]]
+kind = "label"
+name = "next_node"
+
+[[step]]
+kind = "node"
+x = 32690
+y = 31680
+z = 7
+
+# ─── Loop: volver al inicio ─────────────────────────────────────────────────
+[[step]]
+kind  = "goto"
+label = "start"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# REFILL SECTION (invocada via goto_if desde check_supplies o hp/mana low)
+# ═════════════════════════════════════════════════════════════════════════════
+
+[[step]]
+kind = "label"
+name = "refill"
+
+# Walk al depot — reemplazar con nodes reales desde path_finder
+[[step]]
+kind = "node"
+x = 32732   # ejemplo: abdendriel depot
+y = 31634
+z = 7
+
+# Abrir depot chest + stow all items
+[[step]]
+kind       = "deposit"
+chest_vx   = 1200   # viewport coord del depot chest (calibrar con /vision/cursor)
+chest_vy   = 400
+stow_vx    = 1300   # "Stow all" context menu item
+stow_vy    = 480
+menu_wait_ms = 600
+process_ms   = 800
+
+# Ir al NPC + comprar supplies
+# IMPORTANTE: los open_npc_trade + buy_item son estructurados más abajo.
+# Requieren NPC nearby — walk al NPC primero con nodes.
+
+[[step]]
+kind = "node"
+x = 32737   # coord de Xodet (Ab'dendriel)
+y = 31638
+z = 7
+
+[[step]]
+kind = "open_npc_trade"
+greeting_phrases = ["hi", "trade"]    # Tibia 12 acepta `trade` chat command
+wait_button_ms   = 1500
+
+[[step]]
+kind         = "buy_item"
+item_vx      = 200    # click coord del item en la trade window
+item_vy      = 300
+amount_vx    = 400    # campo amount / +/- buttons
+amount_vy    = 500
+confirm_vx   = 480
+confirm_vy   = 540
+quantity     = 100    # cuántos comprar por vez
+spacing_ms   = 200
+
+# Volver al hunt
+[[step]]
+kind = "goto"
+label = "hunt_loop"

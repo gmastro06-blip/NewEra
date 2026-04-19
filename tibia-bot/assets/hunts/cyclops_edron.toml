@@ -1,0 +1,39 @@
+# cyclops_edron.toml — Cyclops camp al NE de Edron.
+# Level 15-28, loot de crude_iron + piggy_bank (raro).
+
+name        = "cyclops_edron"
+description = "Cyclops camp NE de Edron — mix de cyclops + cyclops_drone + cyclops_smith. Loot ferrous (crude_iron)."
+level_range = [15, 28]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "crude_iron",
+    "meat",
+    "dragon_ham",
+]
+non_stackables = [
+    "piggy_bank",           # raro, alto valor
+    "cyclops_toe",
+    "cape",
+    "studded_helmet",
+]
+drop = []
+
+[supplies]
+health_potion       = { min = 40, target = 90 }
+mana_potion         = { min = 20, target = 60 }
+strong_mana_potion  = { min = 10, target = 40 }
+# food (documentación): dragon_ham - no check automático (no template)
+
+[monsters]
+cyclops         = { hp = 260, xp = 150 }
+cyclops_drone   = { hp = 385, xp = 195 }
+cyclops_smith   = { hp = 470, xp = 260 }
+
+[metrics]
+expected_xp_per_hour    = 70_000
+expected_kills_per_hour = 100
+expected_loot_gp_per_hour = 12_000
+expected_cycle_min      = 90

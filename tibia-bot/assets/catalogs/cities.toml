@@ -1,0 +1,192 @@
+# cities.toml — Ciudades Tibia 12 con POIs relevantes para level 10-50.
+#
+# Cada ciudad incluye:
+#   - depot_coord: tile absoluto del depot chest principal (x, y, z)
+#   - bank_coord: NPC banker (opcional, mismos depots suelen tener banker cerca)
+#   - npcs: lista de shopkeepers relevantes (runes, potions, food, gear)
+#   - temple_coord: punto de respawn
+#   - notes: info operativa
+#
+# IMPORTANTE: coords son APROXIMADAS basadas en knowledge pre-2026. El usuario
+# debe validar con `curl /vision/perception | jq .game_coords` parado sobre
+# el tile real. Los coords exactos del depot chest pueden diferir ±2 tiles
+# según el server version.
+#
+# Ref: tibia.fandom.com + TibiaMaps
+
+# ═════════════════════════════════════════════════════════════════════════════
+# THAIS — newbie ground central, mainland south
+# ═════════════════════════════════════════════════════════════════════════════
+[thais]
+depot_coord   = [32369, 32241, 7]
+temple_coord  = [32369, 32241, 7]
+recommended_for_levels = "10-25"
+
+[[thais.npcs]]
+name      = "Aldo"
+role      = "runes_magic"
+coord     = [32361, 32244, 7]
+sells     = ["hmm_rune", "light_healing_rune", "intense_healing_rune"]
+
+[[thais.npcs]]
+name      = "Frodo"
+role      = "potions"
+coord     = [32289, 32220, 6]
+sells     = ["health_potion", "mana_potion"]
+note      = "Tavern upstairs"
+
+[[thais.npcs]]
+name      = "Rachel"
+role      = "food"
+coord     = [32345, 32229, 7]
+sells     = ["meat", "bread", "dragon_ham"]
+
+[[thais.npcs]]
+name      = "Shiessu"
+role      = "backpacks"
+coord     = [32344, 32236, 7]
+sells     = ["backpack", "golden_backpack", "bag"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CARLIN — central-north, dwarf/human mix
+# ═════════════════════════════════════════════════════════════════════════════
+[carlin]
+depot_coord   = [32360, 31782, 7]
+temple_coord  = [32360, 31782, 7]
+recommended_for_levels = "15-35"
+
+[[carlin.npcs]]
+name      = "Lorien"
+role      = "runes_magic"
+coord     = [32371, 31772, 7]
+sells     = ["hmm_rune", "uh_rune", "sd_rune"]
+
+[[carlin.npcs]]
+name      = "Atrad"
+role      = "potions"
+coord     = [32323, 31784, 7]
+sells     = ["health_potion", "mana_potion", "strong_health_potion", "strong_mana_potion"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VENORE — swamp city, east
+# ═════════════════════════════════════════════════════════════════════════════
+[venore]
+depot_coord   = [32954, 32022, 7]
+temple_coord  = [32957, 32076, 7]
+recommended_for_levels = "15-40"
+
+[[venore.npcs]]
+name      = "Lugri"
+role      = "runes_magic"
+coord     = [32951, 32025, 7]
+sells     = ["hmm_rune", "uh_rune"]
+
+[[venore.npcs]]
+name      = "Tamoril"
+role      = "potions"
+coord     = [32957, 32027, 7]
+sells     = ["health_potion", "mana_potion", "strong_mana_potion"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# AB'DENDRIEL — elven city, NE
+# ═════════════════════════════════════════════════════════════════════════════
+[abdendriel]
+depot_coord   = [32732, 31634, 7]
+temple_coord  = [32732, 31634, 7]
+recommended_for_levels = "10-30"
+
+[[abdendriel.npcs]]
+name      = "Xodet"
+role      = "runes_magic"
+coord     = [32737, 31638, 7]
+sells     = ["hmm_rune", "uh_rune"]
+note      = "Usado por el cavebot actual abdendriel_wasps.toml"
+
+[[abdendriel.npcs]]
+name      = "Aleryneresia"
+role      = "potions"
+coord     = [32689, 31597, 7]
+sells     = ["mana_potion", "health_potion"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# KAZORDOON — dwarf city, mountain deep
+# ═════════════════════════════════════════════════════════════════════════════
+[kazordoon]
+depot_coord   = [32647, 31925, 11]
+temple_coord  = [32650, 31917, 14]
+recommended_for_levels = "15-50"
+note          = "depot en floor 11 (dwarf level), muchos lvl changes"
+
+[[kazordoon.npcs]]
+name      = "Haroun"
+role      = "runes_magic"
+coord     = [32658, 31899, 11]
+sells     = ["hmm_rune", "uh_rune", "sd_rune"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DARASHIA — desert city, east, rotworm capital
+# ═════════════════════════════════════════════════════════════════════════════
+[darashia]
+depot_coord   = [33213, 32454, 1]
+temple_coord  = [33213, 32454, 1]
+recommended_for_levels = "15-40"
+note          = "acceso fácil a Rotworms/Scarabs en el desierto"
+
+[[darashia.npcs]]
+name      = "Alesar"
+role      = "runes_magic"
+coord     = [33210, 32450, 1]
+
+[[darashia.npcs]]
+name      = "Memech"
+role      = "potions"
+coord     = [33218, 32458, 1]
+sells     = ["mana_potion", "health_potion"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PORT HOPE — jungle, south
+# ═════════════════════════════════════════════════════════════════════════════
+[port_hope]
+depot_coord   = [32596, 32772, 7]
+temple_coord  = [32596, 32772, 7]
+recommended_for_levels = "20-50"
+note          = "acceso a Banuta (apes), Corym mines"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# EDRON — central-east, mid-level hub
+# ═════════════════════════════════════════════════════════════════════════════
+[edron]
+depot_coord   = [33194, 31791, 7]
+temple_coord  = [33195, 31797, 7]
+recommended_for_levels = "15-50"
+note          = "cyclops camp + Stonehome zone cercano"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LIBERTY BAY — pirate city, SW islands
+# ═════════════════════════════════════════════════════════════════════════════
+[liberty_bay]
+depot_coord   = [32285, 32892, 6]
+temple_coord  = [32317, 32826, 7]
+recommended_for_levels = "25-45"
+note          = "acceso a Water Elementals + Svargrond crossing"
+
+[[liberty_bay.npcs]]
+name      = "Chuckles"
+role      = "runes_magic"
+coord     = [32283, 32886, 6]
+sells     = ["hmm_rune", "sd_rune", "uh_rune"]
+
+[[liberty_bay.npcs]]
+name      = "Yasir"
+role      = "potions"
+coord     = [32287, 32895, 6]
+sells     = ["strong_health_potion", "great_mana_potion"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# YALAHAR — largest city, all-levels hub
+# ═════════════════════════════════════════════════════════════════════════════
+[yalahar]
+depot_coord   = [32791, 31250, 6]
+temple_coord  = [32787, 31275, 6]
+recommended_for_levels = "30-50"
+note          = "hunts internos (Mutated Tigers, Dark Apprentices), muy big city"

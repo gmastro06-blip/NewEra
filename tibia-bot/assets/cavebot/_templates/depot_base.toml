@@ -1,0 +1,81 @@
+# depot_base.toml — plantilla standalone de deposit loop.
+#
+# Solo maneja deposit — NO compra supplies. Para ciclo completo usar
+# refill_base.toml (que incluye deposit + buy).
+#
+# Casos de uso:
+#   - Hunt donde el user deposita con alta frecuencia pero no recompra tan seguido
+#   - Debug: testing del deposit standalone
+#
+# Reemplazar <PLACEHOLDER> con coords reales.
+
+[cavebot]
+loop = false
+
+[[step]]
+kind = "label"
+name = "deposit_start"
+
+# Walk al depot chest
+[[step]]
+kind = "node"
+x = 32732
+y = 31634
+z = 7
+
+# Para bags stacked verticalmente en el sidebar derecho, usar un
+# stow_all_items POR CADA backpack. Coords son del primer slot del bag.
+# Revisar assets/calibration.toml [inventory_backpack_strip] para el strip
+# actual.
+
+# Bag 1 (más arriba del strip, typical y=22)
+[[step]]
+kind         = "stow_all_items"
+slot_vx      = 1585
+slot_vy      = 22
+menu_offset_x = 87
+menu_offset_y = 258
+menu_wait_ms    = 600
+stow_process_ms = 1200
+max_iterations  = 6
+from_profile    = true
+
+# Bag 2 (typical y=22 + backpack_h 68 = 90)
+[[step]]
+kind         = "stow_all_items"
+slot_vx      = 1585
+slot_vy      = 90
+menu_offset_x = 87
+menu_offset_y = 258
+menu_wait_ms    = 600
+stow_process_ms = 1200
+max_iterations  = 6
+from_profile    = true
+
+# Bag 3 (y=158)
+[[step]]
+kind         = "stow_all_items"
+slot_vx      = 1585
+slot_vy      = 158
+menu_offset_x = 87
+menu_offset_y = 258
+menu_wait_ms    = 600
+stow_process_ms = 1200
+max_iterations  = 6
+from_profile    = true
+
+# Bag 4 (y=226) — si tu layout tiene 4 bags
+[[step]]
+kind         = "stow_all_items"
+slot_vx      = 1585
+slot_vy      = 226
+menu_offset_x = 87
+menu_offset_y = 258
+menu_wait_ms    = 600
+stow_process_ms = 1200
+max_iterations  = 6
+from_profile    = true
+
+[[step]]
+kind = "label"
+name = "deposit_end"

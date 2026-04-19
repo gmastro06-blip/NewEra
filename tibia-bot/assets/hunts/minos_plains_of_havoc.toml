@@ -1,0 +1,39 @@
+# minos_plains_of_havoc.toml — Minotaurs en Plains of Havoc (Carlin area).
+# Level 12-22. Spot newbie clásico.
+
+name        = "minos_plains_of_havoc"
+description = "Minotaurs + archers + guards en Plains of Havoc al sur de Carlin. Acceso fácil, bajo waste."
+level_range = [12, 22]
+vocation    = "any"
+
+[loot]
+stackables = [
+    "gold_coin",
+    "minotaur_leather",
+    "meat",
+    "bread",
+    "arrow",   # drop de minotaur_archer
+]
+non_stackables = [
+    "brass_armor",
+    "chain_helmet",
+    "short_sword",
+]
+drop = []
+
+[supplies]
+health_potion = { min = 30, target = 70 }
+mana_potion   = { min = 15, target = 40 }
+# food (documentación): dragon_ham - no check automático (no template)
+
+[monsters]
+minotaur         = { hp = 100, xp = 50 }
+minotaur_archer  = { hp = 165, xp = 70 }
+minotaur_guard   = { hp = 185, xp = 100 }
+minotaur_mage    = { hp = 185, xp = 110 }
+
+[metrics]
+expected_xp_per_hour    = 50_000
+expected_kills_per_hour = 150
+expected_loot_gp_per_hour = 6_000
+expected_cycle_min      = 80
