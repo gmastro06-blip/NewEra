@@ -129,7 +129,7 @@ npc_trade   = { x = 50,   y = 25, w = 420, h = 650 }
 x              = 1567
 y              = 22
 backpack_w     = 174
-backpack_h     = 68     # 2026-04-20: validated live — h>68 produce false positives de white_key contra title bars de backpacks colapsados (Golden/Bag). Trade-off aceptado: slot 11 del greenBP interno queda cortado, pero detecta 4 items correctos en vez de mezclar con 5 FPs
+backpack_h     = 54     # 2026-04-20: validated live con 4 backpacks expandidos (title+row cada uno = ~50-54 px)
 backpack_count = 4     # Backpack + Golden + Green + Bag
 slot_x_offset  = 18    # margen interno del backpack al 1er slot
 slot_y_offset  = 0     # slots al top del backpack (sin offset)
