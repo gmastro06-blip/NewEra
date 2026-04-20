@@ -7,18 +7,27 @@ level_range = [25, 40]
 vocation    = "any"
 
 [loot]
+# Drops wiki: ancient_scarab
+# Ref: https://tibia.fandom.com/wiki/Ancient_Scarab
+# NOTA: ancient_scarab NO dropea platinum_coin, small_diamond, small_sapphire,
+#       ni meat (errores del profile original 72affad).
 stackables = [
     "gold_coin",
-    "platinum_coin",
     "scarab_coin",
-    "small_diamond",
-    "small_sapphire",
-    "meat",
+    "scarab_pincers",
+    "small_amethyst",        # sin template
+    "small_emerald",
+    "strong_health_potion",
 ]
 non_stackables = [
-    "scarab_shield",
-    "scarab_amulet",
-    "magic_light_wand",
+    "scarab_shield",         # no template
+    "scarab_amulet",         # no template
+    "magic_light_wand",      # no template
+    "ancient_amulet",        # no template
+    "daramian_waraxe",       # no template (weapon)
+    "plate_armor",           # no template
+    "springsprout_rod",      # no template (druid wand)
+    "terra_hood",            # no template
 ]
 drop = []
 
@@ -31,8 +40,11 @@ great_mana_potion    = { min = 50,  target = 150 }
 # royal_spear = { ... } - no template, track manual
 
 [monsters]
-scarab          = { hp = 320, xp = 180 }
-ancient_scarab  = { hp = 1_350, xp = 950 }
+# HP/XP wiki-validated (2026-04-19):
+#   - ancient_scarab: hp=1000 xp=720 (profile 72affad decía 1350/950 — errores)
+#   - scarab (regular): hp=320 xp=180 (sin validar, común en misma zona)
+scarab          = { hp = 320,   xp = 180 }
+ancient_scarab  = { hp = 1_000, xp = 720 }
 
 [metrics]
 expected_xp_per_hour    = 120_000

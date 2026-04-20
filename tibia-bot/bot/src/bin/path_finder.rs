@@ -171,12 +171,32 @@ fn remap_if_needed(
 }
 
 /// BFS esférico por Chebyshev distance: itera shell por shell (d=1,2,…,radius),
-/// devuelve el primer tile walkable. No prioriza dirección — devuelve el
-/// primero que encuentre en la shell actual.
+/// devuelve el **primer** tile walkable encontrado en la shell actual.
+///
+/// **Orden de iteración** (determinista, importa para reproducibilidad):
+/// por cada shell `r`, itera `dz` outer → `dy` middle → `dx` inner, todos
+/// de `-r` a `+r`. El primer `(dx, dy, dz)` con `|dx|=r ∨ |dy|=r ∨ |dz|=r`
+/// (condición de shell) cuyo tile es walkable se devuelve inmediatamente.
+///
+/// **Semántica Chebyshev, NO Euclidean**: dentro de la misma shell `r`, un
+/// tile en la esquina (distancia Chebyshev `r`, Euclidean `r·√3`) tiene la
+/// misma prioridad que uno en la cara (Chebyshev `r`, Euclidean `r`). Si
+/// necesitás "Euclidean nearest", hay que ordenar candidatos dentro de cada
+/// shell por `dx²+dy²+dz²` antes de devolver.
 fn nearest_walkable(
     grid: &WalkabilityGrid,
     center: (i32, i32, i32),
     radius: i32,
+) -> Option<(i32, i32, i32)> {
+    nearest_walkable_with(center, radius, |x, y, z| grid.is_walkable(x, y, z))
+}
+
+/// Versión pura de `nearest_walkable` que toma un predicado en vez de un grid.
+/// Permite tests unit sin construir `WalkabilityGrid`.
+fn nearest_walkable_with<F: Fn(i32, i32, i32) -> bool>(
+    center: (i32, i32, i32),
+    radius: i32,
+    is_walkable: F,
 ) -> Option<(i32, i32, i32)> {
     for r in 1..=radius {
         for dz in -r..=r {
@@ -189,7 +209,7 @@ fn nearest_walkable(
                     let x = center.0 + dx;
                     let y = center.1 + dy;
                     let z = center.2 + dz;
-                    if grid.is_walkable(x, y, z) {
+                    if is_walkable(x, y, z) {
                         return Some((x, y, z));
                     }
                 }
@@ -321,5 +341,91 @@ mod tests {
         assert_eq!(chebyshev((0, 0, 0), (0, 5, 2)), 5);
         assert_eq!(chebyshev((10, 10, 7), (10, 10, 7)), 0);
         assert_eq!(chebyshev((5, 5, 5), (-5, 5, 5)), 10);
+    }
+
+    // ─── nearest_walkable_with edge cases ─────────────────────────────
+
+    #[test]
+    fn nearest_walkable_radius_zero_returns_none() {
+        // radius=0: el loop `1..=0` está vacío, nunca itera.
+        let result = nearest_walkable_with((10, 10, 7), 0, |_, _, _| true);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn nearest_walkable_all_unwalkable_returns_none() {
+        // Predicado siempre falso: no importa el radius, devuelve None.
+        let result = nearest_walkable_with((10, 10, 7), 5, |_, _, _| false);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn nearest_walkable_finds_tile_at_shell_one() {
+        // Solo (11, 10, 7) walkable: está a distancia Chebyshev = 1.
+        let result = nearest_walkable_with((10, 10, 7), 5, |x, y, z| {
+            (x, y, z) == (11, 10, 7)
+        });
+        let found = result.expect("debería encontrar walkable");
+        assert_eq!(chebyshev((10, 10, 7), found), 1);
+    }
+
+    #[test]
+    fn nearest_walkable_finds_tile_at_radius_boundary() {
+        // Walkable solo en (15, 10, 7): distancia Chebyshev = 5, radius = 5.
+        let result = nearest_walkable_with((10, 10, 7), 5, |x, y, z| {
+            (x, y, z) == (15, 10, 7)
+        });
+        assert_eq!(result, Some((15, 10, 7)));
+    }
+
+    #[test]
+    fn nearest_walkable_respects_radius_limit() {
+        // Walkable en (16, 10, 7): fuera del radio 5 (distancia = 6).
+        let result = nearest_walkable_with((10, 10, 7), 5, |x, y, z| {
+            (x, y, z) == (16, 10, 7)
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn nearest_walkable_iteration_order_is_dz_dy_dx() {
+        // Dos tiles walkable en shell r=1:
+        //   A = (10, 10, 6)  → dz=-1, dy=0, dx=0
+        //   B = (10, 10, 8)  → dz=+1, dy=0, dx=0
+        // El orden dz outer → dy → dx significa dz=-1 se visita ANTES que
+        // dz=+1, así que debe devolver A.
+        let result = nearest_walkable_with((10, 10, 7), 3, |x, y, z| {
+            (x, y, z) == (10, 10, 6) || (x, y, z) == (10, 10, 8)
+        });
+        assert_eq!(result, Some((10, 10, 6)));
+    }
+
+    #[test]
+    fn nearest_walkable_prefers_inner_shell_over_outer() {
+        // Walkable en shell r=3 (coord (13, 10, 7)) y shell r=1 (coord (11, 10, 7)).
+        // Debe devolver el de shell r=1 porque itera shells crecientes.
+        let result = nearest_walkable_with((10, 10, 7), 5, |x, y, z| {
+            (x, y, z) == (11, 10, 7) || (x, y, z) == (13, 10, 7)
+        });
+        assert_eq!(result, Some((11, 10, 7)));
+    }
+
+    #[test]
+    fn nearest_walkable_chebyshev_vs_euclidean_semantic() {
+        // Dentro de shell r=2:
+        //   A = (12, 10, 7)  → Chebyshev=2, Euclidean=2.0  (en cara)
+        //   B = (12, 12, 7)  → Chebyshev=2, Euclidean=~2.83 (en esquina)
+        // Con semántica Chebyshev (la actual), devuelve el PRIMERO por orden de
+        // iteración, no el Euclidean-más-cercano. Iteración dz=0, dy ∈ [-2,2],
+        // dx ∈ [-2,2]: visita dy=-2 primero. (10, 8, 7)? solo si es walkable.
+        // Aquí A tiene dy=0 (shell solo si |dx|=2 → sí, dx=+2). B tiene dy=+2.
+        // Orden: dy=-2 (no walkable) → dy=-1 (no walkable) → dy=0, dx=-2 (no) →
+        // dx=+2 = A (walkable). Devuelve A.
+        let result = nearest_walkable_with((10, 10, 7), 5, |x, y, z| {
+            (x, y, z) == (12, 10, 7) || (x, y, z) == (12, 12, 7)
+        });
+        // Cualquiera de los dos es legítimo como Chebyshev=2, pero la impl
+        // actual devuelve A por el orden de iteración dy outer.
+        assert_eq!(result, Some((12, 10, 7)));
     }
 }
