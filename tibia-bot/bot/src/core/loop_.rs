@@ -108,6 +108,11 @@ pub struct BotLoop {
     /// `NO_FRAME_PAUSE_TICKS` se dispara una safety pause y se vuelve a 0
     /// para no re-disparar en loop.
     no_frame_ticks: u32,
+    /// Capa de filtrado temporal (EMA, hysteresis, median, majority vote).
+    /// Se aplica ENTRE `Vision::tick` y el consumo por FSM/cavebot. El raw
+    /// se conserva en `state.last_perception` para HTTP/recorder — solo los
+    /// consumers de decisión ven la señal filtrada.
+    perception_filter: crate::sense::filter::PerceptionFilter,
 }
 
 /// Umbral de ticks consecutivos sin frame NDI antes de pausar por seguridad.
@@ -209,6 +214,7 @@ impl BotLoop {
             dataset_recorder: None,
             region_monitor,
             no_frame_ticks: 0,
+            perception_filter: crate::sense::filter::PerceptionFilter::new(),
         }
     }
 
@@ -586,7 +592,7 @@ impl BotLoop {
             }
 
             let vision_start = Instant::now();
-            let perception = if let Some(ref frame) = *frame_arc {
+            let perception_raw = if let Some(ref frame) = *frame_arc {
                 self.vision.tick(frame, tick_num)
             } else {
                 crate::sense::perception::Perception {
@@ -595,6 +601,15 @@ impl BotLoop {
                 }
             };
             let vision_cost_ms = vision_start.elapsed().as_secs_f32() * 1000.0;
+
+            // ── PERCEPTION FILTER ─────────────────────────────────────────────
+            // Aplica smoothing temporal (EMA HP/mana ligera, hysteresis
+            // target_active, majority vote game_coords, hold on coord None).
+            // El raw queda en `perception_raw` para recorder/HTTP; el FSM,
+            // cavebot y safety gates consumen `perception` (filtered).
+            // Coste típico del apply: <5 µs (sólo clones + aritmética de
+            // primitivas). No requiere bench dedicado.
+            let perception = self.perception_filter.apply(&perception_raw);
 
             // ── ANCHOR DRIFT HYSTERESIS → SAFETY PAUSE ────────────────────────
             // Si el AnchorTracker reporta drift inconsistente (>=2 anchors
@@ -1335,12 +1350,14 @@ impl BotLoop {
                     }
                 }
                 // ── VisionMetrics ──────────────────────────────────────────
-                // Extract ratios before moving perception into last_perception.
-                let hp_ratio   = perception.vitals.hp.map(|b| b.ratio);
-                let mana_ratio = perception.vitals.mana.map(|b| b.ratio);
-                // F1 recorder: grabar snapshot serializable antes de mover perception.
+                // Métricas usan RAW — medir sobre signal filtrada sesga
+                // histogramas (cada pico ruidoso se suaviza antes de verse).
+                let hp_ratio   = perception_raw.vitals.hp.map(|b| b.ratio);
+                let mana_ratio = perception_raw.vitals.mana.map(|b| b.ratio);
+                // F1 recorder: snapshot del RAW para preservar replay
+                // bit-exactness. El replay tool reconstruye el filter offline.
                 if let Some(ref mut rec) = self.recorder {
-                    let snap = perception.to_snapshot();
+                    let snap = perception_raw.to_snapshot();
                     rec.record(&snap);
                 }
                 // Fase 2.2 ML: dataset capture de inventory slots.
@@ -1366,7 +1383,10 @@ impl BotLoop {
                         })
                         .collect();
                 }
-                g.last_perception = Some(perception);
+                // HTTP `/vision/perception` lee `last_perception` → exponemos
+                // RAW para diagnóstico fiel. Los consumers de decisión (FSM,
+                // cavebot) ya consumieron `perception` (filtered) arriba.
+                g.last_perception = Some(perception_raw);
 
                 if let Some(r) = hp_ratio   { g.vision_metrics.push_hp(r);   }
                 if let Some(r) = mana_ratio { g.vision_metrics.push_mana(r); }
