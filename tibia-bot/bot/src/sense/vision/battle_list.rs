@@ -179,7 +179,9 @@ impl BattleListDetector {
             }
         }
 
-        BattleList { entries, slot_debug }
+        // enemy_count_filtered = None aquí (raw vision). Lo popula
+        // PerceptionFilter aguas abajo en el game loop.
+        BattleList { entries, slot_debug, enemy_count_filtered: None }
     }
 
     /// Reset del estado interno. Llamar si el panel se reconfigura o si
@@ -541,7 +543,7 @@ mod tests {
             BattleEntry { kind: EntryKind::Monster, row: 1, hp_ratio: Some(0.3), name: None, is_being_attacked: false },
             BattleEntry { kind: EntryKind::Player,  row: 2, hp_ratio: None,      name: None, is_being_attacked: false },
         ];
-        let bl = BattleList { entries, slot_debug: vec![] };
+        let bl = BattleList { entries, slot_debug: vec![], enemy_count_filtered: None };
         assert_eq!(bl.enemy_count(), 2);
         assert!(bl.has_player());
         assert!(bl.has_enemies());
@@ -651,7 +653,7 @@ mod tests {
             BattleEntry { kind: EntryKind::Monster, row: 0, hp_ratio: None, name: None, is_being_attacked: false },
             BattleEntry { kind: EntryKind::Monster, row: 1, hp_ratio: None, name: None, is_being_attacked: false },
         ];
-        let bl = BattleList { entries, slot_debug: vec![] };
+        let bl = BattleList { entries, slot_debug: vec![], enemy_count_filtered: None };
         assert!(!bl.has_attacked_entry());
     }
 
@@ -662,7 +664,7 @@ mod tests {
             BattleEntry { kind: EntryKind::Monster, row: 1, hp_ratio: None, name: None, is_being_attacked: true  },
             BattleEntry { kind: EntryKind::Monster, row: 2, hp_ratio: None, name: None, is_being_attacked: false },
         ];
-        let bl = BattleList { entries, slot_debug: vec![] };
+        let bl = BattleList { entries, slot_debug: vec![], enemy_count_filtered: None };
         assert!(bl.has_attacked_entry());
     }
 

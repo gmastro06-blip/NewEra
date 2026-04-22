@@ -202,6 +202,35 @@ async fn main() -> Result<()> {
                  .with_metrics(Arc::clone(&metrics)))
     };
 
+    // ── 8b. Periodic bridge ping ─────────────────────────────────────────
+    // Task tokio que llama actuator.ping() cada 2s para mantener actualizado
+    // last_pong + last_rtt en PicoHandle. HealthSystem lee estos atomics
+    // como inputs para BridgeRttHigh / BridgeUnreachable.
+    //
+    // Cadence 2s: cubre la warning threshold de 2000ms en HealthConfig sin
+    // saturar el canal. 30 pings/min = 1800/hora — negligible.
+    {
+        let actuator_ping = Arc::clone(&actuator);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                match actuator_ping.ping().await {
+                    Ok(r) if r.ok => {
+                        tracing::trace!("bridge ping OK: rtt={:.1} ms", r.latency_ms);
+                    }
+                    Ok(r) => {
+                        tracing::debug!("bridge ping non-OK reply: body={}", r.body);
+                    }
+                    Err(e) => {
+                        tracing::debug!("bridge ping failed: {:#}", e);
+                    }
+                }
+            }
+        });
+    }
+
     // ── 7. Vision (carga calibration.toml y templates desde assets/) ───────
     let assets_dir = std::env::args()
         .nth(2)

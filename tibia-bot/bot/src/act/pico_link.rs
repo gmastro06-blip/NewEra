@@ -11,8 +11,8 @@
 /// La Pico responde "OK\n" o "ERR <razón>\n" o "PONG\n" para PING.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -46,6 +46,13 @@ pub struct PicoHandle {
     /// `true` cuando el bridge reporta NOFOCUS (Tibia no tiene el foco).
     /// El game loop lee esto para activar safety pause.
     focus_lost: Arc<AtomicBool>,
+    /// Unix ms timestamp del último PONG recibido. 0 = nunca hubo pong.
+    /// Actualizado por el ping task periódico (ver `spawn_periodic_ping`)
+    /// y también por llamadas on-demand a `Actuator::ping()`.
+    last_pong_unix_ms: Arc<AtomicU64>,
+    /// RTT del último ping en µs (0 = nunca medido). Usado por HealthSystem
+    /// como input para BridgeRttHigh / BridgeUnreachable.
+    last_rtt_us: Arc<AtomicU32>,
 }
 
 impl PicoHandle {
@@ -72,6 +79,40 @@ impl PicoHandle {
     /// Retorna `true` si el bridge reportó NOFOCUS (Tibia sin foco).
     pub fn is_focus_lost(&self) -> bool {
         self.focus_lost.load(Ordering::Relaxed)
+    }
+
+    /// Millis transcurridos desde el último PONG recibido. `u32::MAX` si nunca
+    /// hubo pong (bot recién arrancado, bridge desconectado cold boot).
+    /// Usado por HealthSystem como input para BridgeUnreachable.
+    pub fn last_pong_ms_ago(&self) -> u32 {
+        let last = self.last_pong_unix_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return u32::MAX;
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        now_ms.saturating_sub(last).min(u32::MAX as u64) as u32
+    }
+
+    /// Último RTT medido en ms. `None` si nunca hubo ping exitoso.
+    /// Usado por HealthSystem como input para BridgeRttHigh.
+    pub fn last_rtt_ms(&self) -> Option<u32> {
+        let us = self.last_rtt_us.load(Ordering::Relaxed);
+        if us == 0 { None } else { Some(us / 1000) }
+    }
+
+    /// Registra un pong exitoso. Llamado desde `Actuator::ping()` cuando el
+    /// reply vuelve con `ok=true`. También usable por el periodic ping task.
+    pub fn record_pong(&self, rtt_ms: f64) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_pong_unix_ms.store(now_ms, Ordering::Relaxed);
+        let rtt_us = (rtt_ms * 1000.0).min(u32::MAX as f64) as u32;
+        self.last_rtt_us.store(rtt_us.max(1), Ordering::Relaxed);  // max(1) para distinguir "nunca" de "1us"
     }
 
     /// Pide al bridge (via WinAPI) la geometría actual del virtual desktop y
@@ -172,12 +213,19 @@ pub fn spawn(config: PicoConfig) -> PicoHandle {
     let (tx, rx) = tokio::sync::mpsc::channel::<PicoCommand>(256);
     let focus_lost = Arc::new(AtomicBool::new(false));
     let focus_lost_clone = Arc::clone(&focus_lost);
+    let last_pong_unix_ms = Arc::new(AtomicU64::new(0));
+    let last_rtt_us       = Arc::new(AtomicU32::new(0));
 
     tokio::spawn(async move {
         run_link_loop(config, rx, focus_lost_clone).await;
     });
 
-    PicoHandle { tx, focus_lost }
+    PicoHandle {
+        tx,
+        focus_lost,
+        last_pong_unix_ms,
+        last_rtt_us,
+    }
 }
 
 /// Loop principal de PicoLink. Se reconecta con backoff exponencial.

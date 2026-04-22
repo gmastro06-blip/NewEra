@@ -459,6 +459,7 @@ mod tests {
         Perception {
             vitals: CharVitals { hp: Some(full_hp), mana: Some(full_hp) },
             battle: BattleList {
+                enemy_count_filtered: None,
                 entries: vec![BattleEntry {
                     kind:     EntryKind::Monster,
                     row:      0,
@@ -598,6 +599,7 @@ mod tests {
             battle: BattleList {
                 entries,
                 slot_debug: vec![],
+                enemy_count_filtered: None,
             },
             ..Default::default()
         }

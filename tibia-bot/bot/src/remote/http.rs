@@ -2674,8 +2674,8 @@ async fn handle_prometheus_metrics(State(s): State<AppState>) -> Response {
     }
     let all_kinds = [
         "frame_stale", "tick_overrun", "vision_slow", "anchor_drift",
-        "low_detection_confidence", "bridge_rtt_high", "action_failure_rate",
-        "high_jitter", "frame_seq_gap",
+        "low_detection_confidence", "bridge_rtt_high", "bridge_unreachable",
+        "action_failure_rate", "high_jitter", "frame_seq_gap",
         "blind_mode", "compute_saturation", "io_unreliable",
     ];
     writeln!(out, "# HELP tibia_health_issue_active 1 if issue type is currently emitted").ok();

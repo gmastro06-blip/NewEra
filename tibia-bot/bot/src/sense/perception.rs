@@ -221,6 +221,11 @@ pub struct BattleList {
     /// Datos de diagnóstico por slot escaneado (uno por fila del panel).
     /// Sólo se rellena durante el escaneo; vacío cuando no hay frame reciente.
     pub slot_debug: Vec<SlotDebug>,
+    /// Enemy count filtrado por `PerceptionFilter` (median rolling window).
+    /// `None` = no hay filter aplicado (raw perception desde Vision, o Vision
+    /// degradado). Usuarios que prefieran el valor estable llaman
+    /// `enemy_count_effective()`.
+    pub enemy_count_filtered: Option<u32>,
 }
 
 impl BattleList {
@@ -238,6 +243,15 @@ impl BattleList {
 
     pub fn enemy_count(&self) -> usize {
         self.entries.iter().filter(|e| matches!(e.kind, EntryKind::Monster)).count()
+    }
+
+    /// Enemy count "efectivo" para consumers de decisión (FSM, cavebot).
+    /// Retorna el valor filtrado por `PerceptionFilter` si está disponible,
+    /// else el raw derivado de `entries`. Usar ESTE método en lugar de
+    /// `enemy_count()` para decisiones que deban ser robustas a un frame
+    /// de oclusión transient.
+    pub fn enemy_count_effective(&self) -> u32 {
+        self.enemy_count_filtered.unwrap_or_else(|| self.enemy_count() as u32)
     }
 
     /// `true` si cualquier entry tiene `is_being_attacked=true`. Usado para

@@ -122,9 +122,25 @@ impl Actuator {
     }
 
     /// Ping a la Pico para verificar latencia del pipeline.
+    /// Actualiza los atomics de last_pong / last_rtt en PicoHandle vía
+    /// `record_pong()`. HealthSystem + HTTP lo leen lock-free.
     pub async fn ping(&self) -> Result<PicoReply> {
-        // No registramos PING — es heartbeat, no acción.
-        self.pico.send("PING").await
+        let reply = self.pico.send("PING").await?;
+        if reply.ok {
+            self.pico.record_pong(reply.latency_ms);
+        }
+        Ok(reply)
+    }
+
+    /// Accesor para HealthSystem: millis desde el último PONG exitoso.
+    /// `u32::MAX` si nunca hubo pong (cold boot antes del primer ping).
+    pub fn last_pong_ms_ago(&self) -> u32 {
+        self.pico.last_pong_ms_ago()
+    }
+
+    /// Accesor para HealthSystem: último RTT (ms). `None` si nunca.
+    pub fn last_rtt_ms(&self) -> Option<u32> {
+        self.pico.last_rtt_ms()
     }
 
     /// Retorna `true` si el bridge reportó que Tibia no tiene el foco.

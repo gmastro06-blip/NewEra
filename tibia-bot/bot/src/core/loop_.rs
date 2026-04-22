@@ -860,7 +860,11 @@ impl BotLoop {
             // para que pueda decidir según mana disponible, etc.
             let hp_ratio   = perception.vitals.hp.map(|b| b.ratio);
             let mana_ratio = perception.vitals.mana.map(|b| b.ratio);
-            let enemy_count = perception.battle.enemy_count() as u32;
+            // Decisiones FSM (spell table, healing) usan enemy_count_effective —
+            // el median del filter evita que un frame de oclusión dispare un
+            // cambio de spell. Para kill counter y diagnostic, se sigue usando
+            // el valor raw via `enemy_count()` más abajo.
+            let enemy_count = perception.battle.enemy_count_effective();
             let mut heal_override: Option<u8> = None;
             let mut tick_override: Option<u8> = None;
 
@@ -1055,7 +1059,7 @@ impl BotLoop {
             let spell_ctx = crate::core::spell_table::SpellContext {
                 hp:      hp_ratio.unwrap_or(0.5),
                 mana:    mana_ratio.unwrap_or(0.5),
-                enemies: perception.battle.enemy_count() as u32,
+                enemies: enemy_count,  // effective: estabilizado por PerceptionFilter
                 tick:    tick_num,
             };
             if heal_override.is_none() {
@@ -1523,9 +1527,11 @@ impl BotLoop {
                     valid_anchors,
                     total_anchors,
                     anchor_confidence_bp: anchor_conf_bp,
-                    vitals_confidence_bp: 10_000, // pendiente accesor en filter
-                    target_confidence_bp: 10_000,
-                    enemies_visible: perception.battle.enemy_count().min(255) as u8,
+                    vitals_confidence_bp:
+                        (self.perception_filter.vitals_confidence() * 10_000.0).clamp(0.0, 10_000.0) as u16,
+                    target_confidence_bp:
+                        (self.perception_filter.target_confidence() * 10_000.0).clamp(0.0, 10_000.0) as u16,
+                    enemies_visible: perception.battle.enemy_count_effective().min(255) as u8,
                     inventory_items: perception.inventory_counts.len().min(255) as u8,
                     flags,
                 };
@@ -1543,7 +1549,8 @@ impl BotLoop {
                 // siguiente con flag config opt-in.
                 let extras = crate::health::system::ExtraInputs {
                     anchor_drift_streak,
-                    bridge_rtt_ms: None, // TODO: wire bridge ack hook
+                    bridge_rtt_ms:           self.actuator.last_rtt_ms(),
+                    bridge_last_pong_ms_ago: self.actuator.last_pong_ms_ago(),
                 };
                 let health_status = self.health.evaluate_tick(&m, &self.metrics, extras);
 

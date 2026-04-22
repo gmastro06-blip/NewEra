@@ -118,6 +118,13 @@ impl HysteresisState {
         Self { off_confirm: off_confirm.max(1), state: false, off_streak: 0 }
     }
 
+    /// Streak actual de "false consecutivos mientras state=true". Expuesto
+    /// para que PerceptionFilter calcule target_confidence (degrada durante
+    /// el hold period). 0 = no hay hold activo; `off_confirm` = próximo tick
+    /// desactiva.
+    pub fn off_streak(&self) -> u32 { self.off_streak }
+    pub fn off_confirm(&self) -> u32 { self.off_confirm }
+
     /// Procesa un nuevo raw, retorna el estado filtrado.
     pub fn update(&mut self, raw: bool) -> bool {
         if raw {
@@ -273,6 +280,16 @@ impl VitalsDebouncer {
         self.last_stable = None;
         self.bad_frames  = 0;
     }
+
+    /// Confidence [0..1] derivada del estado interno.
+    /// - `1.0`: lecturas consecutivas buenas (bad_frames=0).
+    /// - Decae linealmente hasta `0.0` cuando bad_frames alcanza panic_thr.
+    /// - Expuesto para HealthSystem::LowDetectionConfidence.
+    pub fn confidence(&self) -> f32 {
+        if self.panic_thr == 0 { return 1.0; }
+        let ratio = self.bad_frames as f32 / self.panic_thr as f32;
+        (1.0 - ratio).clamp(0.0, 1.0)
+    }
 }
 
 // ── PerceptionFilter ──────────────────────────────────────────────────────
@@ -385,14 +402,12 @@ impl PerceptionFilter {
         }
 
         // ── enemy_count: median 3 sobre el count derivado de la BattleList.
-        //    BattleList.enemy_count() es una función derivada de los slots;
-        //    no podemos mutar el count sin restructurar la BattleList. Por
-        //    ahora solo alimentamos el median y lo exponemos por accesor
-        //    separado; no muta el Perception filtrado. Cavebot/FSM que hoy
-        //    miran `battle.enemy_count()` siguen viendo raw — migrarlo
-        //    requiere refactor de BattleList (backlog, no este PR).
-        self.last_enemy_count_filtered =
-            self.enemy_count_median.update(raw.battle.enemy_count() as u32);
+        //    Ahora que BattleList expone `enemy_count_filtered: Option<u32>`
+        //    propagamos el valor directamente al Perception filtrado.
+        //    Consumers llamar `battle.enemy_count_effective()` para decisiones.
+        let filtered_count = self.enemy_count_median.update(raw.battle.enemy_count() as u32);
+        self.last_enemy_count_filtered = filtered_count;
+        out.battle.enemy_count_filtered = Some(filtered_count);
 
         // ── game_coords: majority vote con fallback al último Some.
         match raw.game_coords {
@@ -436,6 +451,29 @@ impl PerceptionFilter {
     /// Diagnóstico: estado is_moving del último apply (None si no se llamó
     /// o si raw venía sin minimap calibrado).
     pub fn current_is_moving(&self) -> Option<bool> { self.prev_is_moving }
+
+    /// Confidence [0..1] de los vitales (min de hp + mana debouncer).
+    /// Refleja cuántos frames bad consecutivos hay — útil para el
+    /// HealthSystem::LowDetectionConfidence.
+    pub fn vitals_confidence(&self) -> f32 {
+        self.hp_debouncer.confidence().min(self.mana_debouncer.confidence())
+    }
+
+    /// Confidence [0..1] del target_active. 1.0 cuando hysteresis está en
+    /// estado estable; degrada linealmente durante el hold (state=true con
+    /// false consecutivos acumulando) hasta 0.5 justo antes de desactivar.
+    /// Significa: "el signal puede que esté a punto de apagarse; actuar
+    /// con cautela".
+    pub fn target_confidence(&self) -> f32 {
+        if self.target_hysteresis.is_active() && self.target_hysteresis.off_streak() > 0 {
+            let confirm = self.target_hysteresis.off_confirm().max(1) as f32;
+            let ratio = self.target_hysteresis.off_streak() as f32 / confirm;
+            // Degrada de 1.0 a 0.5 durante el hold.
+            (1.0 - ratio * 0.5).clamp(0.5, 1.0)
+        } else {
+            1.0
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -760,6 +798,69 @@ mod tests {
         // Otro bad: cuenta desde 1 (no acumula los previos).
         let r = d.update(None, true);
         assert_eq!(r.unwrap().ratio, 0.5);
+    }
+
+    #[test]
+    fn vitals_debouncer_confidence_full_when_all_good() {
+        let mut d = VitalsDebouncer::new(5);
+        d.update(Some(vbar(0.9)), false);
+        assert!((d.confidence() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn vitals_debouncer_confidence_decays_linearly() {
+        let mut d = VitalsDebouncer::new(5);
+        d.update(Some(vbar(0.9)), false);
+        d.update(None, true);  // 1 bad → conf = 1 - 1/5 = 0.8
+        assert!((d.confidence() - 0.8).abs() < 0.01);
+        d.update(None, true);  // 2 bad → 0.6
+        assert!((d.confidence() - 0.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn vitals_debouncer_confidence_zero_at_panic() {
+        let mut d = VitalsDebouncer::new(5);
+        for _ in 0..5 { d.update(None, true); }
+        assert!(d.confidence() < 0.01);
+    }
+
+    #[test]
+    fn filter_vitals_confidence_is_min_of_hp_mana() {
+        let mut f = PerceptionFilter::new();
+        // HP good, mana in bad streak 3/5 → mana conf = 0.4, hp conf = 1.0.
+        let mut p = Perception::default();
+        p.vitals.hp = Some(vbar(0.9));
+        p.vitals.mana = None; // bad
+        f.apply(&p);
+        f.apply(&p);
+        f.apply(&p);
+        // min(1.0, 1 - 3/5) = 0.4
+        let c = f.vitals_confidence();
+        assert!((c - 0.4).abs() < 0.01, "got {}", c);
+    }
+
+    #[test]
+    fn filter_target_confidence_full_when_stable() {
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+        p.target_active = Some(true);
+        f.apply(&p);
+        assert!((f.target_confidence() - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn filter_target_confidence_degrades_during_hold() {
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+        // Activar hysteresis.
+        p.target_active = Some(true);
+        f.apply(&p);
+        // off_confirm=2 (default). 1 false consecutivo → off_streak=1.
+        p.target_active = Some(false);
+        f.apply(&p);
+        let c = f.target_confidence();
+        // 1 - 0.5 * 1/2 = 0.75
+        assert!((c - 0.75).abs() < 0.01, "got {}", c);
     }
 
     #[test]

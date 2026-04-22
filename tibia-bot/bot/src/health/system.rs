@@ -45,9 +45,12 @@ pub struct HealthSystem {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExtraInputs {
     /// Streak consecutivo de DriftStatus != Ok. Vive en BotLoop.
-    pub anchor_drift_streak: u32,
+    pub anchor_drift_streak:      u32,
     /// RTT actual del bridge (último ack medido). None si nunca medido.
-    pub bridge_rtt_ms:       Option<u32>,
+    pub bridge_rtt_ms:            Option<u32>,
+    /// Millis desde el último PONG exitoso del bridge. `u32::MAX` si nunca.
+    /// Usado para emitir `HealthIssue::BridgeUnreachable`.
+    pub bridge_last_pong_ms_ago:  u32,
 }
 
 impl HealthSystem {
@@ -221,6 +224,26 @@ impl HealthSystem {
                 out.push(HealthIssue::BridgeRttHigh {
                     rtt_ms: rtt, threshold_ms: cfg.bridge_rtt_warning_ms,
                     severity: Severity::Warning,
+                });
+            }
+        }
+
+        // Bridge unreachable: last_pong demasiado viejo. u32::MAX antes del
+        // primer ping (cold boot) — NO emitir issue durante boot inicial;
+        // el periodic ping task se asegura de que a los 2s tengamos data.
+        // Si last_pong > critical (5s default) con bot ya corriendo (>10s),
+        // el bridge está roto de verdad.
+        if extras.bridge_last_pong_ms_ago != u32::MAX
+           && m.tick > 300  // ~10 s @ 30 Hz — evita warns en cold boot
+        {
+            let ago = extras.bridge_last_pong_ms_ago;
+            if ago >= cfg.bridge_pong_critical_ms {
+                out.push(HealthIssue::BridgeUnreachable {
+                    last_pong_ms_ago: ago, severity: Severity::Critical,
+                });
+            } else if ago >= cfg.bridge_pong_warning_ms {
+                out.push(HealthIssue::BridgeUnreachable {
+                    last_pong_ms_ago: ago, severity: Severity::Warning,
                 });
             }
         }

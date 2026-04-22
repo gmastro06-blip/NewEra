@@ -154,6 +154,13 @@ pub enum HealthIssue {
         threshold_ms: u32,
         severity:     Severity,
     },
+    /// Bridge unreachable: último PONG > umbral ms atrás.
+    /// Complementa BridgeRttHigh — cuando el bridge NO responde, ni siquiera
+    /// hay RTT que medir. Disparado por el ping periódico (cadencia 2s).
+    BridgeUnreachable {
+        last_pong_ms_ago: u32,
+        severity:         Severity,
+    },
     /// Tasa de éxito de acciones por action_kind bajo threshold.
     /// `action_kind` (no `kind`) para no colisionar con `#[serde(tag = "kind")]`.
     ActionFailureRate {
@@ -193,6 +200,7 @@ impl HealthIssue {
             HealthIssue::AnchorDrift      { severity, .. } => *severity,
             HealthIssue::LowDetectionConfidence { severity, .. } => *severity,
             HealthIssue::BridgeRttHigh    { severity, .. } => *severity,
+            HealthIssue::BridgeUnreachable { severity, .. } => *severity,
             HealthIssue::ActionFailureRate { severity, .. } => *severity,
             HealthIssue::HighJitter       { severity, .. } => *severity,
             HealthIssue::FrameSeqGap      { severity, .. } => *severity,
@@ -209,6 +217,7 @@ impl HealthIssue {
             HealthIssue::AnchorDrift      { .. } => "anchor_drift",
             HealthIssue::LowDetectionConfidence { .. } => "low_detection_confidence",
             HealthIssue::BridgeRttHigh    { .. } => "bridge_rtt_high",
+            HealthIssue::BridgeUnreachable { .. } => "bridge_unreachable",
             HealthIssue::ActionFailureRate { .. } => "action_failure_rate",
             HealthIssue::HighJitter       { .. } => "high_jitter",
             HealthIssue::FrameSeqGap      { .. } => "frame_seq_gap",
@@ -250,6 +259,9 @@ pub struct HealthConfig {
     pub jitter_critical_ms:        f32,
     pub bridge_rtt_warning_ms:     u32,
     pub bridge_rtt_critical_ms:    u32,
+    /// Umbral ms del último PONG antes de emitir BridgeUnreachable.
+    pub bridge_pong_warning_ms:    u32,
+    pub bridge_pong_critical_ms:   u32,
     pub vitals_conf_warning:       f32,
     pub vitals_conf_critical:      f32,
     pub action_rate_warning:       f32,
@@ -290,6 +302,10 @@ impl Default for HealthConfig {
             // Bridge: serial RTT ~5 ms en hardware, TCP +1 ms.
             bridge_rtt_warning_ms:   30,
             bridge_rtt_critical_ms:  80,
+            // Bridge pong: cadencia ping 2s → >2s sin pong es warning,
+            // >5s (2+ pings perdidos consecutivos) es critical.
+            bridge_pong_warning_ms:  2_500,
+            bridge_pong_critical_ms: 5_000,
             // Vitals confidence: 0.5 = bad reads frecuentes, <0.2 = invisible.
             vitals_conf_warning:     0.50,
             vitals_conf_critical:    0.20,
