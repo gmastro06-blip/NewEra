@@ -50,6 +50,8 @@ pub struct AppState {
     pub calibration: Arc<Calibration>,
     /// Canal para enviar comandos al game loop (hot-reload de waypoints, etc).
     pub loop_tx:     Sender<LoopCommand>,
+    /// Métricas runtime (histogramas + ArcSwap last_tick). Lectura lock-free.
+    pub metrics:     Arc<crate::instrumentation::MetricsRegistry>,
 }
 
 /// Construye el Router de axum con todos los endpoints registrados.
@@ -106,6 +108,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/dataset/stop",          post(handle_dataset_stop))
         .route("/dataset/status",        get(handle_dataset_status))
         .route("/vision/region_monitor", get(handle_region_monitor))
+        .route("/instrumentation/last_tick",   get(handle_instr_last_tick))
+        .route("/instrumentation/percentiles", get(handle_instr_percentiles))
+        .route("/instrumentation/histograms",  get(handle_instr_histograms))
+        .route("/instrumentation/windows",     get(handle_instr_windows))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         // V-007 mitigation: stealth_mode hide debug endpoints.
         .layer(axum::middleware::from_fn_with_state(state.clone(), stealth_middleware))
@@ -2128,6 +2134,169 @@ async fn handle_region_monitor(State(s): State<AppState>)
     Json(g.region_monitor_diffs.clone())
 }
 
+// ── Instrumentation endpoints ─────────────────────────────────────────────────
+//
+// Lock-free reads sobre MetricsRegistry (ArcSwap + atomics). Útil para:
+// - Dashboard live (last_tick): ver el snapshot del último tick procesado.
+// - Diagnóstico latency (percentiles): p50/p95/p99 acumulados desde boot.
+// - Análisis profundo (histograms): distribución completa por bucket.
+// - Jitter / FPS estable (windows): rolling stats.
+//
+// Costo: O(1) para last_tick, O(buckets) para percentiles. Sin contención.
+
+/// GET /instrumentation/last_tick
+/// Snapshot del último TickMetrics publicado por el game loop.
+async fn handle_instr_last_tick(State(s): State<AppState>)
+    -> Json<crate::instrumentation::TickMetrics>
+{
+    let snap = s.metrics.last_tick_snapshot();
+    Json(*snap)  // TickMetrics es Copy
+}
+
+/// GET /instrumentation/percentiles
+/// Resumen agregado de percentiles (p50/p95/p99/mean/max) por etapa del
+/// pipeline. Acumulados desde boot — son histogramas globales, no rolling.
+#[derive(serde::Serialize)]
+struct PercentilesResponse {
+    frame_age:        crate::instrumentation::Percentiles,
+    vision_total:     crate::instrumentation::Percentiles,
+    filter:           crate::instrumentation::Percentiles,
+    fsm:              crate::instrumentation::Percentiles,
+    dispatch:         crate::instrumentation::Percentiles,
+    tick_total:       crate::instrumentation::Percentiles,
+    action_rtt:       crate::instrumentation::Percentiles,
+    e2e_capture_emit: crate::instrumentation::Percentiles,
+    samples:          PercentileSampleCounts,
+}
+
+#[derive(serde::Serialize)]
+struct PercentileSampleCounts {
+    frame_age:        u64,
+    vision_total:     u64,
+    filter:           u64,
+    fsm:              u64,
+    dispatch:         u64,
+    tick_total:       u64,
+    action_rtt:       u64,
+}
+
+async fn handle_instr_percentiles(State(s): State<AppState>)
+    -> Json<PercentilesResponse>
+{
+    use crate::instrumentation::Percentiles;
+    let r = &s.metrics;
+    Json(PercentilesResponse {
+        frame_age:        Percentiles::from(&r.frame_age),
+        vision_total:     Percentiles::from(&r.vision_total),
+        filter:           Percentiles::from(&r.filter),
+        fsm:              Percentiles::from(&r.fsm),
+        dispatch:         Percentiles::from(&r.dispatch),
+        tick_total:       Percentiles::from(&r.tick_total),
+        action_rtt:       Percentiles::from(&r.action_rtt),
+        e2e_capture_emit: Percentiles::from(&r.e2e_capture_emit),
+        samples: PercentileSampleCounts {
+            frame_age:    r.frame_age.count(),
+            vision_total: r.vision_total.count(),
+            filter:       r.filter.count(),
+            fsm:          r.fsm.count(),
+            dispatch:     r.dispatch.count(),
+            tick_total:   r.tick_total.count(),
+            action_rtt:   r.action_rtt.count(),
+        },
+    })
+}
+
+/// GET /instrumentation/histograms
+/// Histograma raw (bucket counts) por etapa. Útil para Grafana heatmap o
+/// análisis offline. Más caro que /percentiles (más data) pero sigue O(buckets).
+#[derive(serde::Serialize)]
+struct HistogramsResponse {
+    frame_age:        crate::instrumentation::HistogramSnapshot,
+    vision_total:     crate::instrumentation::HistogramSnapshot,
+    filter:           crate::instrumentation::HistogramSnapshot,
+    fsm:              crate::instrumentation::HistogramSnapshot,
+    dispatch:         crate::instrumentation::HistogramSnapshot,
+    tick_total:       crate::instrumentation::HistogramSnapshot,
+    action_rtt:       crate::instrumentation::HistogramSnapshot,
+    e2e_capture_emit: crate::instrumentation::HistogramSnapshot,
+    vision_readers:   Vec<ReaderHistEntry>,
+}
+
+#[derive(serde::Serialize)]
+struct ReaderHistEntry {
+    reader: &'static str,
+    hist:   crate::instrumentation::HistogramSnapshot,
+}
+
+async fn handle_instr_histograms(State(s): State<AppState>)
+    -> Json<HistogramsResponse>
+{
+    let r = &s.metrics;
+    let vision_readers: Vec<ReaderHistEntry> = crate::instrumentation::ReaderId::all()
+        .iter()
+        .map(|id| ReaderHistEntry {
+            reader: id.label(),
+            hist:   r.vision_readers[*id as usize].snapshot(),
+        })
+        .collect();
+    Json(HistogramsResponse {
+        frame_age:        r.frame_age.snapshot(),
+        vision_total:     r.vision_total.snapshot(),
+        filter:           r.filter.snapshot(),
+        fsm:              r.fsm.snapshot(),
+        dispatch:         r.dispatch.snapshot(),
+        tick_total:       r.tick_total.snapshot(),
+        action_rtt:       r.action_rtt.snapshot(),
+        e2e_capture_emit: r.e2e_capture_emit.snapshot(),
+        vision_readers,
+    })
+}
+
+/// GET /instrumentation/windows
+/// Rolling window stats — jitter, mean, FPS. Útil para detectar degradación
+/// progresiva sin tener que comparar percentiles globales.
+#[derive(serde::Serialize)]
+struct WindowsResponse {
+    #[serde(flatten)]
+    snapshot: crate::instrumentation::registry::WindowsSnapshot,
+    measured_fps: f32,
+    counters: CountersSummary,
+}
+
+#[derive(serde::Serialize)]
+struct CountersSummary {
+    ticks_total:    u64,
+    ticks_overrun:  u64,
+    frame_seq_gaps: u64,
+    actions_emitted_total: u64,
+    actions_acked_total:   u64,
+    actions_failed_total:  u64,
+}
+
+async fn handle_instr_windows(State(s): State<AppState>) -> Json<WindowsResponse> {
+    use std::sync::atomic::Ordering;
+    let r = &s.metrics;
+    let snapshot = r.windows_snapshot();
+    let actions_emitted_total: u64 = r.actions_emitted.iter()
+        .map(|c| c.load(Ordering::Relaxed)).sum();
+    let actions_acked_total: u64 = r.actions_acked.iter()
+        .map(|c| c.load(Ordering::Relaxed)).sum();
+    let actions_failed_total: u64 = r.actions_failed.iter()
+        .map(|c| c.load(Ordering::Relaxed)).sum();
+    Json(WindowsResponse {
+        snapshot,
+        measured_fps: r.measured_fps(),
+        counters: CountersSummary {
+            ticks_total:   r.ticks_total.load(Ordering::Relaxed),
+            ticks_overrun: r.ticks_overrun.load(Ordering::Relaxed),
+            frame_seq_gaps: r.frame_seq_gaps.load(Ordering::Relaxed),
+            actions_emitted_total,
+            actions_acked_total,
+            actions_failed_total,
+        },
+    })
+}
+
 fn send_cmd(s: &AppState, cmd: LoopCommand, name: &str) -> Json<CommandAck> {
     match s.loop_tx.send(cmd) {
         Ok(()) => Json(CommandAck {
@@ -2426,6 +2595,7 @@ mod tests {
             config,
             calibration,
             loop_tx,
+            metrics: Arc::new(crate::instrumentation::MetricsRegistry::new()),
         }
     }
 
@@ -2583,6 +2753,117 @@ mod tests {
         assert!(v.get("counts").is_some());
         // Sin perception cargada, counts es vacío.
         assert_eq!(v["counts"], serde_json::json!({}));
+    }
+
+    // ── Instrumentation endpoints ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_instrumentation_last_tick_returns_default_when_no_ticks() {
+        let state = test_state().await;
+        let app = build_router(state);
+        let (status, body) = get(app, "/instrumentation/last_tick").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        // Sin ticks aún → TickMetrics::default() → tick=0, todo a 0.
+        assert_eq!(v["tick"], 0);
+        assert_eq!(v["frame_age_us"], 0);
+        assert_eq!(v["last_action_kind"], "none");
+    }
+
+    #[tokio::test]
+    async fn get_instrumentation_last_tick_reflects_recorded_tick() {
+        let state = test_state().await;
+        // Simulamos un tick procesado.
+        let m = crate::instrumentation::TickMetrics {
+            tick: 42,
+            frame_age_us: 75_000,
+            tick_total_us: 18_500,
+            last_action_kind: crate::instrumentation::ActionKindTag::Heal,
+            ..Default::default()
+        };
+        state.metrics.record_tick(m);
+
+        let app = build_router(state);
+        let (status, body) = get(app, "/instrumentation/last_tick").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(v["tick"], 42);
+        assert_eq!(v["frame_age_us"], 75_000);
+        assert_eq!(v["tick_total_us"], 18_500);
+        assert_eq!(v["last_action_kind"], "heal");
+    }
+
+    #[tokio::test]
+    async fn get_instrumentation_percentiles_returns_zeros_when_empty() {
+        let state = test_state().await;
+        let app = build_router(state);
+        let (status, body) = get(app, "/instrumentation/percentiles").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        // Sin samples, p50/p95/p99 deben ser 0.
+        assert_eq!(v["frame_age"]["p50"], 0);
+        assert_eq!(v["samples"]["frame_age"], 0);
+    }
+
+    #[tokio::test]
+    async fn get_instrumentation_percentiles_reflects_distribution() {
+        let state = test_state().await;
+        for i in 1..=100u32 {
+            let m = crate::instrumentation::TickMetrics {
+                tick: i as u64,
+                tick_total_us: i * 100, // 100..10000 µs
+                ..Default::default()
+            };
+            state.metrics.record_tick(m);
+        }
+        let app = build_router(state);
+        let (status, body) = get(app, "/instrumentation/percentiles").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(v["samples"]["tick_total"], 100);
+        // p99 > p50 (distribución creciente).
+        assert!(v["tick_total"]["p99"].as_u64().unwrap()
+              > v["tick_total"]["p50"].as_u64().unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_instrumentation_histograms_includes_all_readers() {
+        let state = test_state().await;
+        let app = build_router(state);
+        let (status, body) = get(app, "/instrumentation/histograms").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        let readers = v["vision_readers"].as_array().expect("array");
+        assert_eq!(readers.len(), crate::instrumentation::ReaderId::COUNT);
+        // Todos los reader entries tienen label.
+        let labels: Vec<&str> = readers.iter()
+            .map(|r| r["reader"].as_str().unwrap())
+            .collect();
+        assert!(labels.contains(&"hp_mana"));
+        assert!(labels.contains(&"battle"));
+        assert!(labels.contains(&"inventory"));
+    }
+
+    #[tokio::test]
+    async fn get_instrumentation_windows_returns_counters_and_fps() {
+        let state = test_state().await;
+        // Push 20 ticks de 33 ms.
+        for i in 0..20u32 {
+            let m = crate::instrumentation::TickMetrics {
+                tick: i as u64,
+                tick_total_us: 33_000,
+                ..Default::default()
+            };
+            state.metrics.record_tick(m);
+        }
+        let app = build_router(state);
+        let (status, body) = get(app, "/instrumentation/windows").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(v["counters"]["ticks_total"], 20);
+        // FPS measured ≈ 1e6 / 33000 ≈ 30
+        let fps = v["measured_fps"].as_f64().unwrap();
+        assert!(fps > 29.0 && fps < 31.0, "fps={}", fps);
     }
 
     #[tokio::test]

@@ -216,25 +216,8 @@ async fn main() -> Result<()> {
     // el loop drena max 4 por tick para no saturar el budget.
     let (loop_tx, loop_rx) = crossbeam_channel::unbounded::<crate::core::loop_::LoopCommand>();
 
-    // ── 9. HTTP server ─────────────────────────────────────────────────────
-    let app_state = AppState {
-        game_state:  Arc::clone(&shared_state),
-        buffer:      Arc::clone(&frame_buffer),
-        actuator:    Arc::clone(&actuator),
-        config:      config.clone(),
-        calibration: Arc::clone(&calibration),
-        loop_tx:     loop_tx.clone(),
-    };
-
-    tokio::spawn(async move {
-        if let Err(e) = serve(app_state).await {
-            error!("HTTP server error: {:#}", e);
-        }
-    });
-
-    // ── 10. Game loop ───────────────────────────────────────────────────────
-    // Capturamos el handle del runtime tokio para poder despachar acciones
-    // async desde el thread síncrono del game loop (ver loop_.rs::dispatch_action).
+    // ── 9. Game loop (construido ANTES del HTTP server para que el AppState
+    //    reciba el handle al MetricsRegistry compartido).
     let rt_handle = tokio::runtime::Handle::current();
     let bot_loop = BotLoop::new(
         config.clone(),
@@ -246,6 +229,26 @@ async fn main() -> Result<()> {
         vision,
         loop_rx,
     );
+    let metrics_handle = bot_loop.metrics_handle();
+
+    // ── 10. HTTP server ─────────────────────────────────────────────────────
+    let app_state = AppState {
+        game_state:  Arc::clone(&shared_state),
+        buffer:      Arc::clone(&frame_buffer),
+        actuator:    Arc::clone(&actuator),
+        config:      config.clone(),
+        calibration: Arc::clone(&calibration),
+        loop_tx:     loop_tx.clone(),
+        metrics:     metrics_handle,
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = serve(app_state).await {
+            error!("HTTP server error: {:#}", e);
+        }
+    });
+
+    // ── 11. Lanzar el game loop ─────────────────────────────────────────────
     bot_loop.spawn();
     info!("Game loop lanzado a {} Hz", config.loop_config.target_fps);
 
