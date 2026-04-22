@@ -63,6 +63,25 @@ use crate::sense::vision::crop::{crop_bgra, Roi};
 /// ```
 pub const MATCH_THRESHOLD: f32 = 0.80;
 
+/// Score gap para Non-Max Suppression **cross-slot** (Fase 1.2).
+///
+/// Después de asignar el best-match por slot, agrupamos por template name.
+/// Para cada grupo, sólo contamos slots cuyo score está dentro de
+/// `NMS_SCORE_GAP` del mejor score del grupo.
+///
+/// **Motivación**: en sesión live 2026-04-20, dragon_ham detectaba 4 slots
+/// cuando había 2 reales. Probable causa: 2 slots legítimos con score ~0.92
+/// + 2 slots borderline con score ~0.81 (arriba del threshold global 0.80).
+/// Con NMS_SCORE_GAP=0.08, los borderline quedan descartados (0.81 < 0.92 - 0.08).
+///
+/// **Trade-off**: si un slot legítimo tiene score bajo (ej. stack count
+/// distorsiona la correlación), se descarta. Por eso el gap es 0.08 — no
+/// demasiado estricto pero suficiente para filtrar FPs evidentes.
+///
+/// NMS sólo aplica si hay ≥2 matches del mismo template. Con 1 match, no
+/// hay "grupo" que filtrar.
+const NMS_SCORE_GAP: f32 = 0.08;
+
 struct ItemTemplate {
     name:      String,
     template:  GrayImage,
@@ -182,50 +201,25 @@ impl InventoryReader {
     /// Esta función se mantiene como API simple para casos sin OCR.
     #[allow(dead_code)]
     pub fn read(&self, frame: &Frame) -> HashMap<String, u32> {
-        let mut counts: HashMap<String, u32> = HashMap::new();
         if self.is_empty() {
-            return counts;
+            return HashMap::new();
         }
+        // 1. Collect: por cada slot el best match que pasa su threshold.
+        //    Guardamos scores crudos para aplicar NMS cross-slot después.
+        let mut scores_per_template: HashMap<String, Vec<f32>> = HashMap::new();
         for slot in &self.slots {
-            // Extraer pixels del slot (BGRA) y convertir a luma8 para matching.
             let Some(patch_bgra) = crop_bgra(frame, Roi::new(slot.x, slot.y, slot.w, slot.h)) else {
                 continue;
             };
             let luma = bgra_to_luma(&patch_bgra, slot.w, slot.h);
-            let slot_img = GrayImage::from_raw(slot.w, slot.h, luma);
-            let Some(slot_img) = slot_img else { continue };
+            let Some(slot_img) = GrayImage::from_raw(slot.w, slot.h, luma) else { continue };
 
-            // Match cada template contra este slot — encontrar el MEJOR
-            // (no el primero alfabético). Esto evita que templates parecidos
-            // ganen por orden de iteración.
-            // Guarda (score, name, threshold) del best match para comparar
-            // con su threshold específico — no con el global.
-            let mut best: Option<(f32, &str, f32)> = None;
-            for tpl in &self.templates {
-                if slot_img.width() < tpl.template.width()
-                    || slot_img.height() < tpl.template.height()
-                {
-                    continue;
-                }
-                let result = match_template(
-                    &slot_img,
-                    &tpl.template,
-                    MatchTemplateMethod::CrossCorrelationNormalized,
-                );
-                // CCORR_NORMED: **mayor = mejor**, buscamos el max.
-                let score = result.iter().cloned().fold(f32::MIN, f32::max);
-                let current_best_score = best.map_or(f32::MIN, |(s, _, _)| s);
-                if score > current_best_score {
-                    best = Some((score, tpl.name.as_str(), tpl.threshold));
-                }
-            }
-            if let Some((score, name, threshold)) = best {
-                if score >= threshold {
-                    *counts.entry(name.to_string()).or_insert(0) += 1;
-                }
+            if let Some((score, name)) = best_match_for_slot(&slot_img, &self.templates) {
+                scores_per_template.entry(name).or_default().push(score);
             }
         }
-        counts
+        // 2. NMS cross-slot: por template, filtrar scores fuera del gap del top.
+        apply_nms(scores_per_template)
     }
 
     /// Versión extendida que también lee el stack count via OCR (M1).
@@ -238,6 +232,10 @@ impl InventoryReader {
         if self.is_empty() {
             return InventoryReading { slot_counts, stack_totals };
         }
+        // 1. Collect: match por slot, guardar scores crudos + stacks por template.
+        //    Usamos Vec<(score, stack)> para poder aplicar NMS después manteniendo
+        //    la correspondencia score↔stack (ambos se filtran al descartar el slot).
+        let mut data_per_template: HashMap<String, Vec<(f32, u32)>> = HashMap::new();
         for slot in &self.slots {
             let Some(patch_bgra) = crop_bgra(frame, Roi::new(slot.x, slot.y, slot.w, slot.h)) else {
                 continue;
@@ -245,38 +243,28 @@ impl InventoryReader {
             let luma = bgra_to_luma(&patch_bgra, slot.w, slot.h);
             let Some(slot_img) = GrayImage::from_raw(slot.w, slot.h, luma) else { continue };
 
-            // Best-match (no first-match) para evitar bias alfabético.
-            // Guarda threshold per-template del best match.
-            let mut best: Option<(f32, &str, f32)> = None;
-            for tpl in &self.templates {
-                if slot_img.width() < tpl.template.width()
-                    || slot_img.height() < tpl.template.height()
-                {
-                    continue;
-                }
-                let result = match_template(
-                    &slot_img, &tpl.template,
-                    MatchTemplateMethod::CrossCorrelationNormalized,
-                );
-                let score = result.iter().cloned().fold(f32::MIN, f32::max);
-                let current_best_score = best.map_or(f32::MIN, |(s, _, _)| s);
-                if score > current_best_score {
-                    best = Some((score, tpl.name.as_str(), tpl.threshold));
-                }
+            if let Some((score, name)) = best_match_for_slot(&slot_img, &self.templates) {
+                let stack = if !self.digit_templates.is_empty() {
+                    super::inventory_ocr::read_slot_count(&slot_img, &self.digit_templates)
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
+                data_per_template.entry(name).or_default().push((score, stack));
             }
-            if let Some((score, name, threshold)) = best {
-                if score >= threshold {
-                    let name_string = name.to_string();
-                    *slot_counts.entry(name_string.clone()).or_insert(0) += 1;
-                    let stack = if !self.digit_templates.is_empty() {
-                        super::inventory_ocr::read_slot_count(&slot_img, &self.digit_templates)
-                            .unwrap_or(1)
-                    } else {
-                        1
-                    };
-                    *stack_totals.entry(name_string).or_insert(0) += stack;
-                }
+        }
+        // 2. NMS cross-slot: por template, filtrar slots fuera del gap del top score.
+        for (name, mut data) in data_per_template {
+            if data.is_empty() {
+                continue;
             }
+            data.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let top_score = data[0].0;
+            let kept: Vec<(f32, u32)> = data.into_iter()
+                .filter(|(s, _)| *s >= top_score - NMS_SCORE_GAP)
+                .collect();
+            slot_counts.insert(name.clone(), kept.len() as u32);
+            stack_totals.insert(name, kept.iter().map(|(_, s)| *s).sum());
         }
         InventoryReading { slot_counts, stack_totals }
     }
@@ -340,6 +328,62 @@ fn load_thresholds(path: &Path) -> HashMap<String, f32> {
                 );
             }
         }
+    }
+    out
+}
+
+/// Encuentra el template con mayor score para un slot dado, aplicando el
+/// threshold per-template del ganador. Devuelve `Some((score, name))` sólo
+/// si el score pasa el threshold del template ganador, o `None` si no.
+///
+/// Nota importante: el threshold se compara contra el ganador, no contra
+/// cada candidato. Si el best_match es `dragon_ham` con threshold 0.88 y
+/// score 0.87, se rechaza — aunque otros templates hayan pasado su threshold
+/// más laxo con scores menores. Esto evita que un template "casi matchea" y
+/// otro "débilmente matchea" compitan y el ganador "casi" quede contado.
+fn best_match_for_slot(
+    slot_img: &GrayImage,
+    templates: &[ItemTemplate],
+) -> Option<(f32, String)> {
+    let mut best: Option<(f32, &str, f32)> = None;
+    for tpl in templates {
+        if slot_img.width() < tpl.template.width()
+            || slot_img.height() < tpl.template.height()
+        {
+            continue;
+        }
+        let result = match_template(
+            slot_img,
+            &tpl.template,
+            MatchTemplateMethod::CrossCorrelationNormalized,
+        );
+        let score = result.iter().cloned().fold(f32::MIN, f32::max);
+        let current_best_score = best.map_or(f32::MIN, |(s, _, _)| s);
+        if score > current_best_score {
+            best = Some((score, tpl.name.as_str(), tpl.threshold));
+        }
+    }
+    match best {
+        Some((score, name, threshold)) if score >= threshold => {
+            Some((score, name.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Aplica Non-Max Suppression cross-slot sobre los scores agrupados por template.
+/// Para cada template: ordena scores desc, quita los que estén fuera del
+/// `NMS_SCORE_GAP` del top. Retorna count final por template.
+fn apply_nms(scores_per_template: HashMap<String, Vec<f32>>) -> HashMap<String, u32> {
+    let mut out: HashMap<String, u32> = HashMap::new();
+    for (name, mut scores) in scores_per_template {
+        if scores.is_empty() {
+            continue;
+        }
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let top_score = scores[0];
+        let kept = scores.iter().filter(|&&s| s >= top_score - NMS_SCORE_GAP).count();
+        out.insert(name, kept as u32);
     }
     out
 }
@@ -425,6 +469,55 @@ mod tests {
         assert_eq!(out.get("good"), Some(&0.3));
         assert!(out.get("bad").is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── NMS cross-slot (Fase 1.2) ──────────────────────────────────────
+
+    #[test]
+    fn apply_nms_single_score_keeps_it() {
+        let mut input = HashMap::new();
+        input.insert("dragon_ham".to_string(), vec![0.85]);
+        let out = apply_nms(input);
+        assert_eq!(out.get("dragon_ham"), Some(&1));
+    }
+
+    #[test]
+    fn apply_nms_all_scores_within_gap_keeps_all() {
+        // Scores [0.93, 0.90, 0.88] — todos within NMS_SCORE_GAP=0.08 del top=0.93
+        // (0.93 - 0.08 = 0.85, todos ≥ 0.85)
+        let mut input = HashMap::new();
+        input.insert("dragon_ham".to_string(), vec![0.93, 0.90, 0.88]);
+        let out = apply_nms(input);
+        assert_eq!(out.get("dragon_ham"), Some(&3));
+    }
+
+    #[test]
+    fn apply_nms_filters_borderline_scores() {
+        // Scores [0.93, 0.85, 0.82, 0.81] — top=0.93, cutoff=0.85
+        // Solo los ≥ 0.85 se mantienen → [0.93, 0.85] = 2
+        let mut input = HashMap::new();
+        input.insert("dragon_ham".to_string(), vec![0.93, 0.85, 0.82, 0.81]);
+        let out = apply_nms(input);
+        assert_eq!(out.get("dragon_ham"), Some(&2),
+            "0.81 y 0.82 < 0.85 (0.93 - 0.08), deben filtrarse");
+    }
+
+    #[test]
+    fn apply_nms_multiple_templates_independent() {
+        let mut input = HashMap::new();
+        input.insert("vial".to_string(),       vec![0.95, 0.92]);
+        input.insert("dragon_ham".to_string(), vec![0.90, 0.80]);
+        let out = apply_nms(input);
+        // vial: ambos within 0.08 de 0.95 → 2
+        assert_eq!(out.get("vial"), Some(&2));
+        // dragon_ham: 0.80 < 0.90 - 0.08 = 0.82 → sólo 1
+        assert_eq!(out.get("dragon_ham"), Some(&1));
+    }
+
+    #[test]
+    fn apply_nms_empty_input_returns_empty() {
+        let out = apply_nms(HashMap::new());
+        assert!(out.is_empty());
     }
 
     #[test]
