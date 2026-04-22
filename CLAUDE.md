@@ -843,6 +843,21 @@ sesión live (restricción actual: no live hasta recuperar confianza — ver
 | #2 Dataset bg writer thread | `8ac9d1d` | 9/9 `dataset_recorder::*` (incl. backpressure) | ❌ no testeado live |
 | #1 Anchors consenso + DriftStatus → FSM | `6cbbaa0` | 16/16 `anchors::*` | ❌ flanco Ok→Inconsistent→Ok no validado con Tibia redibujando UI |
 
+### Observability Fase 1 — LANDED (commit `fc5ae1a`)
+
+3 cambios mínimos previos a sesión live para cerrar gaps de instrumentación:
+
+1. **Periodic bridge ping** cada 2s — `Actuator.last_pong_ms_ago()` +
+   `last_rtt_ms()` alimentan `ExtraInputs` del HealthSystem.
+   `HealthIssue::BridgeUnreachable` variant nuevo.
+2. **PerceptionFilter confidence** — `vitals_confidence()` +
+   `target_confidence()` reemplazan hardcoded 10000 bp en `TickMetrics`.
+3. **BattleList.enemy_count_filtered** propagado — `enemy_count_effective()`
+   consumido por FSM spell decisions + TickMetrics observability.
+
+Plan completo Fase 2 (sesión live) + Fase 3 (post-mortem rules) en
+`Obsidian Vault/tibia-bot/sessions/2026-04-22-observability-fase1-live-plan.md`.
+
 ### Deuda técnica priorizada (sin live)
 
 1. **bincode → postcard migration** (advertencia `bincode` unmaintained).
