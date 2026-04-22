@@ -603,12 +603,13 @@ impl BotLoop {
             let vision_cost_ms = vision_start.elapsed().as_secs_f32() * 1000.0;
 
             // ── PERCEPTION FILTER ─────────────────────────────────────────────
-            // Aplica smoothing temporal (EMA HP/mana ligera, hysteresis
-            // target_active, majority vote game_coords, hold on coord None).
-            // El raw queda en `perception_raw` para recorder/HTTP; el FSM,
-            // cavebot y safety gates consumen `perception` (filtered).
-            // Coste típico del apply: <5 µs (sólo clones + aritmética de
-            // primitivas). No requiere bench dedicado.
+            // Aplica smoothing temporal (vitals_debouncer + EMA, hysteresis
+            // target_active y is_moving, majority vote game_coords, hold on
+            // coord None, median enemy_count). Raw va a recorder/HTTP; el
+            // FSM, cavebot y safety gates consumen `perception` (filtered).
+            // Coste medido empírico (bench `perception_filter_apply_steady_state`,
+            // commit subsiguiente al wire): ~271 ns/apply en release. 0.001%
+            // del budget 33 ms/tick — efectivamente gratis.
             let perception = self.perception_filter.apply(&perception_raw);
 
             // ── ANCHOR DRIFT HYSTERESIS → SAFETY PAUSE ────────────────────────

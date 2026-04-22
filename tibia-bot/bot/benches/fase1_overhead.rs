@@ -123,5 +123,67 @@ fn bench_region_monitor_tick(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_inventory_exact_vs_shift, bench_region_monitor_tick);
+// ── PerceptionFilter::apply overhead ───────────────────────────────────
+//
+// Mide el costo real de aplicar el filter sobre un Perception "típico".
+// Claim del commit a1e86e6: "<5 µs típico". Este bench lo valida y da
+// regression signal si añadimos primitivas costosas.
+//
+// Escenario: char en hunt activo — vitals presentes, target_active Some,
+// is_moving Some(true), 3 enemies en battle list, game_coords Some.
+
+fn bench_perception_filter_apply(c: &mut Criterion) {
+    use tibia_bot::sense::filter::PerceptionFilter;
+    use tibia_bot::sense::perception::{
+        BattleEntry, BattleList, CharVitals, EntryKind, Perception, VitalBar,
+    };
+
+    let mk_perception = |hp: f32, mana: f32, n_enemies: usize| Perception {
+        vitals: CharVitals {
+            hp:   Some(VitalBar { ratio: hp, filled_px: (hp * 100.0) as u32, total_px: 100 }),
+            mana: Some(VitalBar { ratio: mana, filled_px: (mana * 100.0) as u32, total_px: 100 }),
+        },
+        battle: BattleList {
+            entries: (0..n_enemies).map(|i| BattleEntry {
+                kind: EntryKind::Monster,
+                row: i as u8,
+                hp_ratio: Some(1.0),
+                name: None,
+                is_being_attacked: i == 0,
+            }).collect(),
+            ..Default::default()
+        },
+        target_active: Some(true),
+        is_moving:     Some(true),
+        game_coords:   Some((32015, 32212, 7)),
+        ..Default::default()
+    };
+
+    // Pre-warm el filter con varios apply para que las medianas/votos estén
+    // pobladas (representa steady-state del bot, no boot-up).
+    let mut filter = PerceptionFilter::new();
+    let p_warmup = mk_perception(0.9, 0.8, 3);
+    for _ in 0..10 { let _ = filter.apply(&p_warmup); }
+
+    c.bench_function("perception_filter_apply_steady_state", |b| {
+        // Alterna ligeramente HP/mana/enemies para ejercitar EMAs/medians.
+        let mut tick = 0u32;
+        b.iter(|| {
+            let hp   = 0.85 + ((tick % 7) as f32) * 0.01;
+            let mana = 0.75 + ((tick % 5) as f32) * 0.02;
+            let n    = ((tick % 4) + 2) as usize; // 2..5 enemies
+            let p    = mk_perception(hp, mana, n);
+            let out  = filter.apply(black_box(&p));
+            tick += 1;
+            black_box(out);
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_inventory_exact_vs_shift,
+    bench_region_monitor_tick,
+    bench_perception_filter_apply,
+);
 criterion_main!(benches);
