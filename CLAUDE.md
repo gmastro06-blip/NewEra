@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 **tibia-bot** is a distributed Tibia game automation system across two machines:
-- **PC Gaming (Windows)**: Runs Tibia + OBS with DistroAV NDI output + the `bridge` binary + Raspberry Pi Pico 2 via USB
+- **PC Gaming (Windows)**: Runs Tibia + OBS with DistroAV NDI output + the `bridge` binary + Arduino Leonardo via USB (firmware en `arduino/tibia_hid_bridge/`, usa librería HID-Project `AbsoluteMouse`)
 - **PC Processor (Linux)**: Runs the main `bot` binary — video capture, vision, FSM, actuator commands
 
 All code is Rust in a Cargo workspace with two members: `bot/` and `bridge/`.
@@ -81,8 +81,8 @@ To also build the walkability grid for pathfinding, add `--walkability assets/wa
 ### Data flow (30 Hz game loop)
 
 ```
-NDI thread          Game loop (30 Hz)              Pico bridge
-──────────          ─────────────────              ───────────
+NDI thread          Game loop (30 Hz)              Arduino bridge
+──────────          ─────────────────              ──────────────
 OBS NDI stream      ┌──────────────────┐           bridge binary
     ↓               │ 1. Sense         │           (TCP :9000 ↔
 FrameBuffer ──────► │    read frame    │           serial COM)
@@ -90,7 +90,7 @@ FrameBuffer ──────► │    read frame    │           serial COM)
                     │ 2. Think         │           TCP commands
                     │    update FSM    │               │
                     │ 3. Act ──────────┼──────────►PicoLink
-                    │    send command  │           (pico_link.rs)
+                    │    send command  │           (pico_link.rs — nombre legacy)
                     └──────────────────┘
                            ↕
                     SharedState (RwLock)
@@ -125,7 +125,7 @@ FrameBuffer ──────► │    read frame    │           serial COM)
 Three-stage transform (all unit-tested in `act/coords.rs`):
 1. **Viewport coords** — pixel position within the NDI-captured crop
 2. **Desktop coords** — add window offset from `CoordsConfig`
-3. **HID absolute** — scale to 0–32767 range for Pico HID reports
+3. **HID absolute** — scale to 0–32767 range for Arduino HID reports
 
 ### NDI pixel format
 
@@ -147,12 +147,12 @@ Count total matching pixels, not edge detection. Edge detection breaks when text
 |---------|--------|
 | NDI capture (gaming → bot) | ≤ 80 ms |
 | Bot processing per tick | ≤ 30 ms |
-| Command → bridge → Pico → HID | ≤ 15 ms |
+| Command → bridge → Arduino → HID | ≤ 15 ms |
 | **End-to-end** | **≤ 130 ms** |
 
-## Pico Command Protocol
+## HID Bridge Command Protocol
 
-ASCII line-based over TCP (bot → bridge → Pico serial at 115200 baud):
+ASCII line-based over TCP (bot → bridge → Arduino serial at 115200 baud):
 
 ```
 MOUSE_MOVE <x> <y>
@@ -170,7 +170,7 @@ El bridge soporta dos caminos de inyección de input, configurables via `bridge_
 ```toml
 [input]
 mode = "sendinput"   # Windows SendInput API, sin hardware extra
-# mode = "serial"    # Arduino Leonardo / Pico via USB HID
+# mode = "serial"    # Arduino Leonardo via USB HID
 ```
 
 ### Cuándo usar cada uno
@@ -204,7 +204,7 @@ GET  /status                  — JSON: tick count, FSM state, latencies, metric
 POST /pause | /resume         — pause/resume bot
 
 # Test / diagnostics
-POST /test/pico/ping          — ping Pico, measure RTT
+POST /test/pico/ping          — ping HID bridge (endpoint nombre legacy), measure RTT
 GET  /test/grab               — current NDI frame as PNG
 POST /test/click              — test click at viewport coords {"x":N,"y":N}
 POST /test/heal               — test heal action
@@ -257,7 +257,7 @@ POST /recording/stop          — stop writing and flush
 
 ## Monitoring stack (Prometheus + Grafana)
 
-`monitoring/docker-compose.yml` levanta Prometheus + Grafana con un dashboard `tibia-bot` pre-cargado (9 paneles: status, NDI, tick proc, Pico RTT, enemies, HP/Mana over time, latencies, throughput, inventory slots).
+`monitoring/docker-compose.yml` levanta Prometheus + Grafana con un dashboard `tibia-bot` pre-cargado (9 paneles: status, NDI, tick proc, bridge RTT, enemies, HP/Mana over time, latencies, throughput, inventory slots).
 
 ```bash
 cd monitoring/
