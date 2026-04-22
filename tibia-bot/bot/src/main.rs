@@ -176,7 +176,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── 7. Actuator ────────────────────────────────────────────────────────
+    // ── 7. MetricsRegistry compartido ─────────────────────────────────────
+    // Se construye ANTES del Actuator para que ambos (Actuator + BotLoop)
+    // compartan el mismo Arc. Actuator usa record_action_ack al recibir
+    // ACK del bridge; BotLoop usa record_tick + ArcSwap publish.
+    let metrics = Arc::new(crate::instrumentation::MetricsRegistry::new());
+
+    // ── 8. Actuator ────────────────────────────────────────────────────────
     // El Actuator toma ownership del PicoHandle; cualquier código que
     // necesite enviar comandos debe pasar por el Actuator compartido.
     // Si safety está activo, inyectamos pre-send jitter gaussiano.
@@ -189,9 +195,11 @@ async fn main() -> Result<()> {
             "Safety: pre-send jitter ON ({:.0}±{:.0}ms)",
             jitter.mean_ms, jitter.std_ms
         );
-        Arc::new(Actuator::with_jitter(pico_handle, &coords_cfg, jitter))
+        Arc::new(Actuator::with_jitter(pico_handle, &coords_cfg, jitter)
+                 .with_metrics(Arc::clone(&metrics)))
     } else {
-        Arc::new(Actuator::new(pico_handle, &coords_cfg))
+        Arc::new(Actuator::new(pico_handle, &coords_cfg)
+                 .with_metrics(Arc::clone(&metrics)))
     };
 
     // ── 7. Vision (carga calibration.toml y templates desde assets/) ───────
@@ -226,6 +234,7 @@ async fn main() -> Result<()> {
         Arc::clone(&shared_state),
         Arc::clone(&frame_buffer),
         Arc::clone(&actuator),
+        Arc::clone(&metrics),     // shared con Actuator (record_action_ack)
         rt_handle,
         vision,
         loop_rx,

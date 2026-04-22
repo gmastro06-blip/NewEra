@@ -137,6 +137,7 @@ impl BotLoop {
         state:     SharedState,
         buffer:    Arc<FrameBuffer>,
         actuator:  Arc<Actuator>,
+        metrics:   Arc<crate::instrumentation::MetricsRegistry>,
         rt_handle: Handle,
         vision:    Vision,
         commands:  Receiver<LoopCommand>,
@@ -224,7 +225,7 @@ impl BotLoop {
             region_monitor,
             no_frame_ticks: 0,
             perception_filter: crate::sense::filter::PerceptionFilter::new(),
-            metrics: std::sync::Arc::new(crate::instrumentation::MetricsRegistry::new()),
+            metrics,
             health:  crate::health::HealthSystem::new(crate::health::HealthConfig::default()),
         }
     }
