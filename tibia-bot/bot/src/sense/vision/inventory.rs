@@ -98,6 +98,29 @@ const NMS_SCORE_GAP: f32 = 0.08;
 /// usa el slot completo sin stripping.
 pub const STACK_COUNT_HEIGHT_PX: u32 = 8;
 
+/// Padding en píxeles que añadimos al slot ROI para permitir matching
+/// shift-tolerant (Fase 1.4).
+///
+/// **Motivación**: en sesión live 2026-04-20 vimos que cambiar `backpack_h`
+/// de 68 a 76 (offset acumulado 4-8 px en rows inferiores) cambiaba
+/// completamente la detection. Un offset pixel-exact de calibración no es
+/// realista — la posición del icon dentro del slot puede variar ±1-2 px
+/// por scaling NDI, anti-aliasing, o frame timing.
+///
+/// **Approach**: extraer un patch `(slot.w + 2*SHIFT_PX) × (slot.h + 2*SHIFT_PX)`
+/// alrededor de cada slot ROI. `imageproc::match_template` con sliding window
+/// devuelve el max sobre TODAS las posiciones — automáticamente eligiendo el
+/// mejor offset dentro de ±SHIFT_PX.
+///
+/// **Cost**: 5x5 = 25 positions por template (vs 1 sin shift). Templates
+/// 32×24 sobre patch 36×28 = 5×5 sliding positions. Total ~25× cost del
+/// matching, pero sigue dentro del budget porque imageproc usa FFT
+/// para correlation (cost no escala lineal con N positions).
+///
+/// **Fallback**: si el slot está cerca del edge del frame y no hay espacio
+/// para padding, usamos el slot original sin shift tolerance.
+pub const SHIFT_TOLERANCE_PX: u32 = 2;
+
 struct ItemTemplate {
     name:      String,
     template:  GrayImage,
@@ -224,11 +247,9 @@ impl InventoryReader {
         //    Guardamos scores crudos para aplicar NMS cross-slot después.
         let mut scores_per_template: HashMap<String, Vec<f32>> = HashMap::new();
         for slot in &self.slots {
-            let Some(patch_bgra) = crop_bgra(frame, Roi::new(slot.x, slot.y, slot.w, slot.h)) else {
+            let Some((slot_img, _used_shift)) = extract_slot_with_shift_tolerance(frame, slot) else {
                 continue;
             };
-            let luma = bgra_to_luma(&patch_bgra, slot.w, slot.h);
-            let Some(slot_img) = GrayImage::from_raw(slot.w, slot.h, luma) else { continue };
 
             if let Some((score, name)) = best_match_for_slot(&slot_img, &self.templates) {
                 scores_per_template.entry(name).or_default().push(score);
@@ -253,15 +274,23 @@ impl InventoryReader {
         //    la correspondencia score↔stack (ambos se filtran al descartar el slot).
         let mut data_per_template: HashMap<String, Vec<(f32, u32)>> = HashMap::new();
         for slot in &self.slots {
-            let Some(patch_bgra) = crop_bgra(frame, Roi::new(slot.x, slot.y, slot.w, slot.h)) else {
+            let Some((slot_img_padded, _used_shift)) = extract_slot_with_shift_tolerance(frame, slot) else {
                 continue;
             };
-            let luma = bgra_to_luma(&patch_bgra, slot.w, slot.h);
-            let Some(slot_img) = GrayImage::from_raw(slot.w, slot.h, luma) else { continue };
 
-            if let Some((score, name)) = best_match_for_slot(&slot_img, &self.templates) {
+            if let Some((score, name)) = best_match_for_slot(&slot_img_padded, &self.templates) {
+                // OCR sobre el slot ORIGINAL (sin padding) — el OCR scanea
+                // bottom-right corner que puede estar en distinta posición
+                // si usamos el padded slot. Re-extract sólo el slot exacto.
                 let stack = if !self.digit_templates.is_empty() {
-                    super::inventory_ocr::read_slot_count(&slot_img, &self.digit_templates)
+                    crop_bgra(frame, Roi::new(slot.x, slot.y, slot.w, slot.h))
+                        .and_then(|bgra| {
+                            let luma = bgra_to_luma(&bgra, slot.w, slot.h);
+                            GrayImage::from_raw(slot.w, slot.h, luma)
+                        })
+                        .and_then(|exact_slot| {
+                            super::inventory_ocr::read_slot_count(&exact_slot, &self.digit_templates)
+                        })
                         .unwrap_or(1)
                 } else {
                     1
@@ -346,6 +375,38 @@ fn load_thresholds(path: &Path) -> HashMap<String, f32> {
         }
     }
     out
+}
+
+/// Extrae el patch BGRA de un slot, intentando primero con padding
+/// `SHIFT_TOLERANCE_PX` en cada lado (para shift-tolerant matching). Si
+/// el slot está cerca del edge del frame y el padding cae fuera, fallback
+/// al slot original sin padding. Devuelve el GrayImage convertido + bool
+/// `used_shift_tolerance` para diagnóstico.
+fn extract_slot_with_shift_tolerance(
+    frame: &Frame,
+    slot:  &RoiDef,
+) -> Option<(GrayImage, bool)> {
+    // Intento 1: slot + padding SHIFT_TOLERANCE_PX en cada lado.
+    let pad = SHIFT_TOLERANCE_PX;
+    if slot.x >= pad && slot.y >= pad {
+        let padded_roi = Roi::new(
+            slot.x - pad,
+            slot.y - pad,
+            slot.w + 2 * pad,
+            slot.h + 2 * pad,
+        );
+        if let Some(patch_bgra) = crop_bgra(frame, padded_roi) {
+            let luma = bgra_to_luma(&patch_bgra, padded_roi.w, padded_roi.h);
+            if let Some(img) = GrayImage::from_raw(padded_roi.w, padded_roi.h, luma) {
+                return Some((img, true));
+            }
+        }
+    }
+    // Fallback: slot exacto sin padding (cerca de edge).
+    let patch_bgra = crop_bgra(frame, Roi::new(slot.x, slot.y, slot.w, slot.h))?;
+    let luma = bgra_to_luma(&patch_bgra, slot.w, slot.h);
+    let img = GrayImage::from_raw(slot.w, slot.h, luma)?;
+    Some((img, false))
 }
 
 /// Strippea las últimas `STACK_COUNT_HEIGHT_PX` rows del bottom del slot/template.
@@ -591,6 +652,51 @@ mod tests {
         assert_eq!(stripped.get_pixel(0, 0).0[0], 100);
         // Bottom pixel del stripped (era y=23 del original) preservado.
         assert_eq!(stripped.get_pixel(0, 23).0[0], 100);
+    }
+
+    // ── Shift-tolerant slot extraction (Fase 1.4) ─────────────────────
+
+    fn make_test_frame(w: u32, h: u32, fill: u8) -> Frame {
+        Frame {
+            width:       w,
+            height:      h,
+            data:        vec![fill; (w * h * 4) as usize],
+            captured_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn extract_slot_uses_padding_when_room() {
+        // Slot en el centro del frame: hay room para padding.
+        let frame = make_test_frame(200, 200, 128);
+        let slot = RoiDef::new(50, 50, 32, 32);
+        let (img, used_shift) = extract_slot_with_shift_tolerance(&frame, &slot).unwrap();
+        assert!(used_shift, "Slot en centro debe usar padding");
+        assert_eq!(img.width(), 32 + 2 * SHIFT_TOLERANCE_PX);
+        assert_eq!(img.height(), 32 + 2 * SHIFT_TOLERANCE_PX);
+    }
+
+    #[test]
+    fn extract_slot_falls_back_at_top_left_corner() {
+        // Slot en (0, 0): no hay room para padding hacia arriba/izq.
+        let frame = make_test_frame(200, 200, 128);
+        let slot = RoiDef::new(0, 0, 32, 32);
+        let (img, used_shift) = extract_slot_with_shift_tolerance(&frame, &slot).unwrap();
+        assert!(!used_shift, "Slot en (0,0) debe fallback a sin padding");
+        assert_eq!(img.width(), 32);
+        assert_eq!(img.height(), 32);
+    }
+
+    #[test]
+    fn extract_slot_falls_back_when_padded_exceeds_right_edge() {
+        // Slot cerca del right edge del frame.
+        let frame = make_test_frame(50, 50, 128);
+        // Slot 32x32 en (16, 16) → padded sería (14, 14) 36×36 = (14..50). OK!
+        // Pero (18, 18) 32×32 → padded (16,16) 36×36 = (16..52) — fuera por 2.
+        let slot = RoiDef::new(18, 18, 32, 32);
+        let (img, used_shift) = extract_slot_with_shift_tolerance(&frame, &slot).unwrap();
+        assert!(!used_shift, "padded fuera del frame debe fallback");
+        assert_eq!(img.width(), 32);
     }
 
     #[test]
