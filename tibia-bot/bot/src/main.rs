@@ -22,6 +22,7 @@ mod act;
 mod cavebot;
 mod config;
 mod core;
+mod health;
 mod instrumentation;
 mod remote;
 mod safety;
