@@ -27,7 +27,7 @@
 use crate::sense::frame_buffer::Frame;
 use crate::sense::perception::{BattleEntry, BattleList, EntryKind, SlotDebug};
 use crate::sense::vision::calibration::RoiDef;
-use crate::sense::vision::color::{is_bar_filled, is_monster_red, is_npc_yellow, is_player_blue};
+use crate::sense::vision::color::{is_attack_highlight, is_bar_filled, is_monster_red, is_npc_yellow, is_player_blue};
 use crate::sense::vision::crop::{count_pixels, longest_horizontal_run, Roi};
 
 /// Altura en píxeles de cada entrada en la lista de batalla de Tibia (1920x1080).
@@ -144,12 +144,15 @@ impl BattleListDetector {
             );
             let kind = border_kind.or(hp_bar_kind);
 
-            // Detectar highlight de "atacando este slot". En cliente clásico
-            // el rojo es estático (indica "es un monstruo"), en moderno es
-            // dinámico (indica "este slot está siendo atacado ahora"). En
-            // ambos casos, si hay ≥2 hits rojos en el borde, es signal de
-            // target activo sobre este slot.
-            let is_being_attacked = detect_is_being_attacked(red_hits);
+            // Detectar highlight de "atacando este slot".
+            // Estrategia dual:
+            //  (1) Clientes clásicos: borde rojo en el left edge → red_hits ≥ 2.
+            //  (2) Tibia 12: cuadrado cyan/purple alrededor del icono del slot
+            //      (medido live 2026-04-20 en Abdendriel). Escaneamos el área
+            //      del icono (first ~25 cols) buscando pixels is_attack_highlight.
+            let is_being_attacked = detect_is_being_attacked(
+                frame, panel_roi, entry_y, red_hits,
+            );
 
             // Actualizar state para el próximo frame.
             self.slot_was_monster[row] = matches!(kind, Some(EntryKind::Monster));
@@ -242,27 +245,54 @@ fn classify_hits(red: u32, blue: u32, yellow: u32) -> Option<EntryKind> {
 /// de 22px es un signal muy específico porque el fondo del panel es gris.
 const ATTACK_BORDER_MIN_HITS: u32 = 2;
 
-/// Detecta si un slot del battle list está siendo atacado activamente por
-/// el char (el cliente de Tibia pinta un highlight rojo en el borde del slot).
+/// Ancho del área a escanear para el highlight cyan/purple de Tibia 12.
+/// El icono del mob ocupa ~20-25 px horizontales al inicio del slot.
+const ICON_AREA_WIDTH_PX: u32 = 25;
+
+/// Hits mínimos de is_attack_highlight en el área del icono para considerar
+/// el slot como atacado (fuente Tibia 12). Calibrado live 2026-04-20:
+/// un slot atacado produce 30-100+ pixels cyan/purple en el borde del icono.
+/// Threshold 10 es conservador — rechaza icons-con-trazas-cyan-intrínsecas
+/// (algunos mobs tienen sprite azul que no alcanza los 10 px).
+const ATTACK_HIGHLIGHT_MIN_HITS: u32 = 10;
+
+/// Detecta si un slot del battle list está siendo atacado activamente.
 ///
-/// **Approach**: escaneamos el borde izquierdo del slot (las mismas columnas
-/// que `count_border_hits`) buscando píxeles con **dominancia RGB de rojo**
-/// (R claramente mayor que G y B). Esto es equivalente al `is_monster_red`
-/// usado por el detector de bordes clásico, pero semánticamente distinto:
+/// **Estrategia dual** (cliente-agnóstica):
+/// 1. **Clientes clásicos**: borde rojo estático en left edge → `red_hits ≥ 2`.
+/// 2. **Tibia 12**: cuadrado cyan/purple alrededor del icono cuando el target
+///    es seleccionado via click izquierdo. Detectamos pixels
+///    `is_attack_highlight` en el area del icono (first ICON_AREA_WIDTH_PX=25
+///    columns del slot).
 ///
-/// - En clientes clásicos, el borde rojo = "es un monstruo" (statico).
-/// - En clientes modernos, el borde rojo = "este monstruo está siendo
-///   atacado AHORA" (dinámico — aparece/desaparece según el state).
+/// Cualquier de las dos fuentes que supere su threshold activa `true`.
 ///
-/// Ambas interpretaciones son útiles — en cliente moderno, si detectamos
-/// cualquier red_hits > 0 en un slot que YA clasificamos como Monster
-/// (via HP bar), es porque el char está atacando ESE slot específico.
-///
-/// Inspirado en TibiaPilotNG (`battleList/core.py`) que comprueba valores
-/// grayscale específicos (76, 166) en corner pixels. Nuestra versión usa
-/// dominancia RGB que es más robusta frente al jitter JPEG del NDI.
-fn detect_is_being_attacked(red_hits: u32) -> bool {
-    red_hits >= ATTACK_BORDER_MIN_HITS
+/// **Evidencia live 2026-04-20** (sesión en Abdendriel wasps): el detector
+/// legacy de `red_hits` devolvía 0 en todos los slots (0/2505 frames con
+/// target_active en recording). Tibia 12 NO pinta borde rojo. El highlight
+/// es un cuadrado de color (146,146,209)..(91,203,245) alrededor del icono.
+fn detect_is_being_attacked(
+    frame:      &Frame,
+    panel_roi:  RoiDef,
+    entry_y:    u32,
+    red_hits:   u32,
+) -> bool {
+    // Fuente 1: cliente clásico (red border).
+    if red_hits >= ATTACK_BORDER_MIN_HITS {
+        return true;
+    }
+    // Fuente 2: Tibia 12 (cyan/purple highlight alrededor del icon).
+    let icon_roi = Roi::new(
+        panel_roi.x,
+        entry_y,
+        ICON_AREA_WIDTH_PX.min(panel_roi.w),
+        ENTRY_HEIGHT_PX,
+    );
+    if !icon_roi.fits_in(frame.width, frame.height) {
+        return false;
+    }
+    let hits = count_pixels(frame, icon_roi, is_attack_highlight);
+    hits >= ATTACK_HIGHLIGHT_MIN_HITS
 }
 
 /// Detecta una entrada de battle list por presencia de píxeles "HP bar" verdes.
@@ -520,14 +550,60 @@ mod tests {
 
     // ── Attack detection (post-TibiaPilotNG audit) ────────────────────
 
+    /// Helper: pinta un cuadrado de highlight cyan/purple en el icon area del slot.
+    /// Simula el highlight de Tibia 12 para "target seleccionado".
+    fn paint_cyan_highlight(frame: &mut Frame, panel_x: u32, entry_y: u32, pixel_count: u32) {
+        let stride = frame.width as usize * 4;
+        // Pintar pixels (91, 203, 245) — muestra empírica sesión 2026-04-20.
+        // Distribuir dentro del icon area (primeros 20 cols del slot, toda la altura).
+        let mut painted = 0u32;
+        'outer: for row in 0..ENTRY_HEIGHT_PX {
+            for col in 0..20u32 {
+                if painted >= pixel_count { break 'outer; }
+                let off = (entry_y + row) as usize * stride + (panel_x + col) as usize * 4;
+                if off + 3 >= frame.data.len() { continue; }
+                frame.data[off]     = 91;
+                frame.data[off + 1] = 203;
+                frame.data[off + 2] = 245;
+                frame.data[off + 3] = 255;
+                painted += 1;
+            }
+        }
+    }
+
     #[test]
-    fn detect_is_being_attacked_threshold() {
-        // 0, 1 red hits → no atacado
-        assert!(!detect_is_being_attacked(0));
-        assert!(!detect_is_being_attacked(1));
-        // 2+ red hits → atacado
-        assert!(detect_is_being_attacked(2));
-        assert!(detect_is_being_attacked(10));
+    fn detect_is_being_attacked_red_border_classic() {
+        // Fuente 1: borde rojo clásico (red_hits ≥ 2).
+        let frame = make_empty_frame(500, 200);
+        let roi   = RoiDef::new(400, 10, 80, ENTRY_HEIGHT_PX);
+        // Con red_hits=0 pero sin cyan, debe ser false.
+        assert!(!detect_is_being_attacked(&frame, roi, 10, 0));
+        assert!(!detect_is_being_attacked(&frame, roi, 10, 1));
+        // Con red_hits ≥ 2 (threshold clásico), pasa sin necesitar cyan.
+        assert!(detect_is_being_attacked(&frame, roi, 10, 2));
+        assert!(detect_is_being_attacked(&frame, roi, 10, 50));
+    }
+
+    #[test]
+    fn detect_is_being_attacked_cyan_highlight_tibia12() {
+        // Fuente 2: highlight cyan/purple alrededor del icono (Tibia 12).
+        let mut frame = make_empty_frame(500, 200);
+        let panel_x   = 400u32;
+        let entry_y   = 10u32;
+        // Pintar 15 pixels cyan en el icon area (> threshold 10).
+        paint_cyan_highlight(&mut frame, panel_x, entry_y, 15);
+        let roi = RoiDef::new(panel_x, entry_y, 80, ENTRY_HEIGHT_PX);
+        // Sin red_hits, la fuente 2 debe activar.
+        assert!(detect_is_being_attacked(&frame, roi, entry_y, 0));
+    }
+
+    #[test]
+    fn detect_is_being_attacked_cyan_below_threshold() {
+        // Muy pocos pixels cyan (< threshold 10) → no dispara.
+        let mut frame = make_empty_frame(500, 200);
+        paint_cyan_highlight(&mut frame, 400, 10, 5);
+        let roi = RoiDef::new(400, 10, 80, ENTRY_HEIGHT_PX);
+        assert!(!detect_is_being_attacked(&frame, roi, 10, 0));
     }
 
     #[test]

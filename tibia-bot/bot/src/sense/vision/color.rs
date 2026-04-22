@@ -94,6 +94,30 @@ pub fn is_npc_yellow(px: &[u8]) -> bool {
     in_rgb_range(px, (180, 160, 0), (255, 255, 80))
 }
 
+/// Retorna true si el píxel RGBA corresponde al highlight cyan/purple que
+/// Tibia 12 pinta alrededor del icono del mob actualmente siendo atacado
+/// (target seleccionado via click izquierdo en el viewport).
+///
+/// **Evidencia empírica (sesión live 2026-04-20)**: en Tibia 12 el highlight
+/// NO es rojo como en clientes clásicos. Es un cuadrado cyan/purple claro
+/// alrededor del icono del slot atacado, con píxeles típicos:
+///   - `(146, 146, 209)` — light purple
+///   - `(75, 196, 225)`  — cyan
+///   - `(91, 203, 245)`  — bright cyan
+///   - `(95, 216, 245)`  — light sky blue
+///
+/// Patrón común: **B dominante por ≥40, B ≥ 180, G ≥ 130**.
+/// El umbral `G ≥ 130` distingue esta señal del `is_player_blue` (R,G ≤ 80)
+/// evitando que un slot con borde azul de jugador sea interpretado como
+/// "atacado".
+#[inline]
+pub fn is_attack_highlight(px: &[u8]) -> bool {
+    let r = px[0] as i32;
+    let g = px[1] as i32;
+    let b = px[2] as i32;
+    b >= 180 && b > r + 40 && g >= 130
+}
+
 /// Distancia al cuadrado entre dos colores RGB (evita sqrt).
 #[inline]
 #[allow(dead_code)] // extension point: color matching utility
@@ -181,5 +205,61 @@ mod tests {
     fn rgb_dist_sq_same_color() {
         let px = [100u8, 150, 200, 255]; // RGBA
         assert_eq!(rgb_dist_sq(&px, 100, 150, 200), 0);
+    }
+
+    // ─── is_attack_highlight — muestras empíricas de sesión live 2026-04-20 ─
+
+    #[test]
+    fn attack_highlight_light_purple() {
+        // Muestra live: (146, 146, 209)
+        let px = [146u8, 146, 209, 255];
+        assert!(is_attack_highlight(&px));
+    }
+
+    #[test]
+    fn attack_highlight_cyan() {
+        // Muestra live: (75, 196, 225)
+        let px = [75u8, 196, 225, 255];
+        assert!(is_attack_highlight(&px));
+    }
+
+    #[test]
+    fn attack_highlight_bright_sky_blue() {
+        // Muestra live: (91, 203, 245)
+        let px = [91u8, 203, 245, 255];
+        assert!(is_attack_highlight(&px));
+    }
+
+    #[test]
+    fn attack_highlight_rejects_pure_player_blue() {
+        // is_player_blue range: R,G ≤ 80. El highlight requiere G ≥ 130.
+        let player_blue = [50u8, 50, 220, 255];
+        assert!(is_player_blue(&player_blue));
+        assert!(!is_attack_highlight(&player_blue));
+    }
+
+    #[test]
+    fn attack_highlight_rejects_hp_green() {
+        let green = [20u8, 200, 20, 255]; // HP bar verde
+        assert!(!is_attack_highlight(&green));
+    }
+
+    #[test]
+    fn attack_highlight_rejects_monster_red() {
+        let red = [220u8, 20, 20, 255];
+        assert!(!is_attack_highlight(&red));
+    }
+
+    #[test]
+    fn attack_highlight_rejects_gray_background() {
+        let gray = [90u8, 88, 90, 255];
+        assert!(!is_attack_highlight(&gray));
+    }
+
+    #[test]
+    fn attack_highlight_rejects_dim_blue() {
+        // Requires B ≥ 180, so dim blues should fail
+        let dim = [50u8, 100, 150, 255];
+        assert!(!is_attack_highlight(&dim));
     }
 }
