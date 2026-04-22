@@ -102,6 +102,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics",               get(handle_prometheus_metrics))
         .route("/recording/start",       post(handle_recording_start))
         .route("/recording/stop",        post(handle_recording_stop))
+        .route("/dataset/start",         post(handle_dataset_start))
+        .route("/dataset/stop",          post(handle_dataset_stop))
+        .route("/dataset/status",        get(handle_dataset_status))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         // V-007 mitigation: stealth_mode hide debug endpoints.
         .layer(axum::middleware::from_fn_with_state(state.clone(), stealth_middleware))
@@ -2013,6 +2016,83 @@ async fn handle_recording_start(
 
 async fn handle_recording_stop(State(s): State<AppState>) -> Json<CommandAck> {
     send_cmd(&s, LoopCommand::StopRecording, "StopRecording")
+}
+
+// ── /dataset/start, /dataset/stop, /dataset/status (Fase 2.2 ML) ─────────────
+//
+// Captura crops 32×32 de inventory slots para entrenamiento ML.
+// Output: <dir>/manifest.csv + <dir>/crops/*.png
+//
+//   curl -X POST 'http://localhost:8080/dataset/start?dir=datasets/abdendriel&interval=15&tag=hunt1'
+//   curl -X POST 'http://localhost:8080/dataset/stop'
+//   curl -s     'http://localhost:8080/dataset/status'
+
+#[derive(Deserialize)]
+struct DatasetStartQuery {
+    /// Directorio destino (relativo, validado contra base allowed).
+    dir: String,
+    /// Cada cuántos ticks captura. Default 15 (~500ms a 30 Hz).
+    #[serde(default)]
+    interval: Option<u32>,
+    /// Etiqueta libre para el manifest CSV (ej. "abdendriel_session_1").
+    #[serde(default)]
+    tag: Option<String>,
+}
+
+async fn handle_dataset_start(
+    State(s): State<AppState>,
+    Query(q): Query<DatasetStartQuery>,
+) -> Json<CommandAck> {
+    // Validate path bajo `datasets/` para prevenir path traversal (V-003 pattern).
+    let base = Path::new("datasets");
+    let dir = match validate_load_path(&q.dir, base) {
+        Ok(p) => p,
+        Err(e) => {
+            return Json(CommandAck {
+                ok:      false,
+                message: format!("dir rejected: {}", e),
+            });
+        }
+    };
+    let interval = q.interval.unwrap_or(15).max(1);
+    let tag = q.tag.unwrap_or_else(|| "untagged".into());
+    let cmd = LoopCommand::StartDatasetCapture {
+        dir: dir.clone(), interval, tag: tag.clone(),
+    };
+    match s.loop_tx.send(cmd) {
+        Ok(()) => {
+            info!("DatasetCapture start solicitado: dir='{}' interval={} tag='{}'",
+                  dir.display(), interval, tag);
+            Json(CommandAck {
+                ok: true,
+                message: format!(
+                    "queued StartDatasetCapture dir='{}' interval={} tag='{}'",
+                    dir.display(), interval, tag
+                ),
+            })
+        }
+        Err(e) => Json(CommandAck { ok: false, message: format!("channel error: {}", e) }),
+    }
+}
+
+async fn handle_dataset_stop(State(s): State<AppState>) -> Json<CommandAck> {
+    send_cmd(&s, LoopCommand::StopDatasetCapture, "StopDatasetCapture")
+}
+
+#[derive(Serialize)]
+struct DatasetStatus {
+    active:      bool,
+    crops_total: u64,
+    dir:         String,
+}
+
+async fn handle_dataset_status(State(s): State<AppState>) -> Json<DatasetStatus> {
+    let g = s.game_state.read();
+    Json(DatasetStatus {
+        active:      g.dataset_active,
+        crops_total: g.dataset_crops_total,
+        dir:         g.dataset_dir.clone(),
+    })
 }
 
 fn send_cmd(s: &AppState, cmd: LoopCommand, name: &str) -> Json<CommandAck> {

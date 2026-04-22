@@ -63,6 +63,18 @@ pub enum LoopCommand {
     StartRecording { path: Option<String> },
     /// Detiene la grabación actual y flushea el archivo.
     StopRecording,
+    // ── Dataset capture (Fase 2.2 ML) ──────────────────────────────────
+    /// Inicia captura de crops de inventory para entrenamiento ML.
+    /// `dir`: directorio destino (validado para evitar path traversal).
+    /// `interval`: cada cuántos ticks captura (default 15).
+    /// `tag`: etiqueta libre para el manifest (ej. "abdendriel_session_1").
+    StartDatasetCapture {
+        dir:      PathBuf,
+        interval: u32,
+        tag:      String,
+    },
+    /// Detiene la captura actual y flushea el manifest.
+    StopDatasetCapture,
 }
 
 pub struct BotLoop {
@@ -86,6 +98,8 @@ pub struct BotLoop {
     cavebot_enabled: bool,
     /// Grabador opcional de Perception snapshots (F1 replay tool).
     recorder: Option<crate::sense::recorder::PerceptionRecorder>,
+    /// Capture opcional de crops de inventory para training ML (Fase 2.2).
+    dataset_recorder: Option<crate::sense::dataset_recorder::DatasetRecorder>,
     /// Contador consecutivo de ticks sin frame NDI (watchdog de visión).
     /// Se resetea a 0 cuando llega un frame. Cuando supera
     /// `NO_FRAME_PAUSE_TICKS` se dispara una safety pause y se vuelve a 0
@@ -175,6 +189,7 @@ impl BotLoop {
             cavebot,
             cavebot_enabled,
             recorder,
+            dataset_recorder: None,
             no_frame_ticks: 0,
         }
     }
@@ -1261,6 +1276,16 @@ impl BotLoop {
                     let snap = perception.to_snapshot();
                     rec.record(&snap);
                 }
+                // Fase 2.2 ML: dataset capture de inventory slots.
+                // Sólo si el recorder está activo Y hay un frame válido.
+                if let Some(ref mut ds_rec) = self.dataset_recorder {
+                    if let Some(frame) = (*frame_arc).as_ref() {
+                        let written = ds_rec.capture(frame, tick_num, tick_num);
+                        if written > 0 {
+                            g.dataset_crops_total += written as u64;
+                        }
+                    }
+                }
                 g.last_perception = Some(perception);
 
                 if let Some(r) = hp_ratio   { g.vision_metrics.push_hp(r);   }
@@ -1461,6 +1486,48 @@ impl BotLoop {
                     drop(rec); // flushes on drop
                 } else {
                     warn!("StopRecording ignorado: no hay recording activo");
+                }
+            }
+            LoopCommand::StartDatasetCapture { dir, interval, tag } => {
+                // Construye Vec<RoiDef> desde el inventory_backpack_strip
+                // calibrado en self.vision.calibration. Si no hay slots
+                // disponibles, log warn y aborta.
+                let slots = self.vision.inventory_slots();
+                if slots.is_empty() {
+                    warn!("StartDatasetCapture: no hay slots de inventory configurados");
+                    return;
+                }
+                let n_slots = slots.len();
+                let recorder = crate::sense::dataset_recorder::DatasetRecorder::new(
+                    dir.clone(), slots, interval, tag.clone(),
+                );
+                if recorder.is_enabled() {
+                    info!(
+                        "DatasetCapture iniciado: dir='{}' interval={} tag='{}' slots={}",
+                        dir.display(), interval, tag, n_slots
+                    );
+                    self.dataset_recorder = Some(recorder);
+                    let mut g = self.state.write();
+                    g.dataset_active = true;
+                    g.dataset_crops_total = 0;
+                    g.dataset_dir = dir.display().to_string();
+                } else {
+                    warn!(
+                        "StartDatasetCapture falló: no se pudo crear/abrir '{}'",
+                        dir.display()
+                    );
+                }
+            }
+            LoopCommand::StopDatasetCapture => {
+                if let Some(mut rec) = self.dataset_recorder.take() {
+                    rec.flush();
+                    let count = rec.total_crops();
+                    info!("DatasetCapture detenido: {} crops escritos", count);
+                    drop(rec);
+                    let mut g = self.state.write();
+                    g.dataset_active = false;
+                } else {
+                    warn!("StopDatasetCapture ignorado: no hay capture activa");
                 }
             }
         }

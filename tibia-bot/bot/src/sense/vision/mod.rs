@@ -133,6 +133,15 @@ pub struct Vision {
 }
 
 impl Vision {
+    /// Devuelve los slots de inventory configurados (para consumers externos
+    /// como `DatasetRecorder`). Vacío si no hay inventory_reader.
+    pub fn inventory_slots(&self) -> Vec<calibration::RoiDef> {
+        self.inventory_reader
+            .as_ref()
+            .map(|r| r.slots())
+            .unwrap_or_default()
+    }
+
     /// Crea un Vision cargando calibración y templates desde disco.
     /// `assets_dir` es la raíz del directorio de assets (p.ej. "assets/").
     /// Si la calibración no existe, se usa la default (no-op).

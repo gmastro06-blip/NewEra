@@ -229,6 +229,12 @@ impl InventoryReader {
         self.slots = slots;
     }
 
+    /// Devuelve clone de los slots configurados — útil para consumers
+    /// externos (ej. `DatasetRecorder` que captura crops por slot).
+    pub fn slots(&self) -> Vec<RoiDef> {
+        self.slots.clone()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.templates.is_empty() || self.slots.is_empty()
     }

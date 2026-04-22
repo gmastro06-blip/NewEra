@@ -228,6 +228,15 @@ pub struct GameState {
     /// Actualizado por Vision::tick cada `coords_detect_interval` frames.
     /// `None` hasta la primera detection.
     pub matcher_stats: Option<crate::sense::vision::game_coords::MatcherStatsSnapshot>,
+
+    // ── Dataset capture (Fase 2.2 ML) ───────────────────────────────────
+    /// `true` mientras `DatasetRecorder` está activo en el game loop.
+    pub dataset_active:      bool,
+    /// Total acumulado de crops escritos por el dataset_recorder activo.
+    /// Reset al iniciar nueva sesión de capture.
+    pub dataset_crops_total: u64,
+    /// Path del directorio donde se está escribiendo el dataset (vacío si inactive).
+    pub dataset_dir:         String,
 }
 
 /// Alias conveniente — todo el código usa este tipo.
