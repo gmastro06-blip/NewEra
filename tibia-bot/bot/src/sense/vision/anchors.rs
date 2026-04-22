@@ -129,6 +129,14 @@ struct MatchOutcome {
 
 // ── Estado compartido (background escribe, game loop lee) ─────────────────────
 
+/// TTL del `last_good`: si el ultimo match valido tiene mas que esto, el
+/// fallback degradado deja de ser confiable. La ventana real puede haber
+/// derivado mucho desde entonces — usar offset stale arriesga aplicar ROIs
+/// fuera de pantalla. 10 segundos es generoso para Tibia (la ventana no se
+/// mueve en hunt activo) pero corto para detectar cambios reales (resize,
+/// minimize/restore, redibujado de UI).
+const LAST_GOOD_TTL: Duration = Duration::from_secs(10);
+
 #[derive(Default)]
 struct AnchorShared {
     /// Current match (None si el anchor está actualmente lost).
@@ -138,6 +146,10 @@ struct AnchorShared {
     /// Último match bueno conocido, usado como fallback si `matches[i]` es
     /// None. Nunca se borra — persiste entre ciclos lost/recovered.
     last_good:   Vec<Option<AnchorMatch>>,
+    /// Timestamp del último update a `last_good[i]`. Usado para descartar
+    /// fallbacks demasiado viejos (LAST_GOOD_TTL). `None` significa que el
+    /// anchor nunca tuvo match exitoso desde startup.
+    last_good_at: Vec<Option<Instant>>,
 }
 
 // ── Slot de ancla (datos estáticos + scheduling) ──────────────────────────────
@@ -213,6 +225,7 @@ impl AnchorTracker {
         s.matches.push(None);
         s.fail_counts.push(0);
         s.last_good.push(None);
+        s.last_good_at.push(None);
     }
 
     /// Llamar una vez por tick desde el game loop. NUNCA bloquea.
@@ -234,9 +247,10 @@ impl AnchorTracker {
                                     "Anchor #{}: recovered after lost state", idx
                                 );
                             }
-                            s.matches[idx]   = Some(m);
-                            s.last_good[idx] = Some(m);
-                            s.fail_counts[idx] = 0;
+                            s.matches[idx]      = Some(m);
+                            s.last_good[idx]    = Some(m);
+                            s.last_good_at[idx] = Some(Instant::now());
+                            s.fail_counts[idx]  = 0;
                         } else {
                             s.fail_counts[idx] += 1;
                             if s.fail_counts[idx] == self.config.max_fails + 1 {
@@ -345,28 +359,32 @@ impl AnchorTracker {
     ///   resto se descarta con warning. Si ninguno forma cluster consistente
     ///   (todos divergen), retorna (0, 0) con warning.
     ///
-    /// Los matches lost usan `last_good` como fallback degradado.
+    /// Los matches lost usan `last_good` como fallback degradado SOLO si su
+    /// `last_good_at` está dentro de `LAST_GOOD_TTL`. Last_good viejo se
+    /// descarta — preferimos AllLost (pausa) que aplicar offset stale a las
+    /// ROIs (puede dar coords fuera del frame y crashear lectores).
     pub fn window_offset(&self) -> (i32, i32) {
+        let now = Instant::now();
         let s = self.shared.read();
         let valid: Vec<AnchorMatch> = s.matches.iter()
             .zip(s.last_good.iter())
+            .zip(s.last_good_at.iter())
             .zip(s.fail_counts.iter())
-            .filter_map(|((m, lg), &f)| {
+            .filter_map(|(((m, lg), lg_at), &f)| {
                 if f <= self.config.max_fails {
                     *m
                 } else {
-                    // Lost: usar last_good si existe (persistido desde último match).
-                    *lg
+                    // Lost: usar last_good si NO está stale (TTL).
+                    Self::filter_stale_fallback(*lg, *lg_at, now)
                 }
             })
             .collect();
         drop(s);
 
-        // AllLost: anchors configurados pero ninguno con valid ni last_good.
-        // Distinto de "sin anchors" (total_anchor_count==0 → no hay concepto
-        // de drift, se reporta Ok). Con anchors configurados y cero valid,
-        // el offset (0,0) no es confiable → DriftStatus::AllLost para que
-        // el FSM decida pausar.
+        // AllLost: anchors configurados pero ninguno con valid ni last_good
+        // fresco. Distinto de "sin anchors" (total_anchor_count==0 → no hay
+        // concepto de drift, se reporta Ok). Con anchors configurados y cero
+        // valid, el offset (0,0) no es confiable → DriftStatus::AllLost.
         let (offset, status) = if valid.is_empty() && !self.anchors.is_empty() {
             ((0, 0), DriftStatus::AllLost)
         } else {
@@ -374,6 +392,28 @@ impl AnchorTracker {
         };
         self.last_drift.store(status.as_u8(), Ordering::Relaxed);
         offset
+    }
+
+    /// Pure helper: retorna `last_good` solo si su timestamp está dentro de
+    /// `LAST_GOOD_TTL` desde `now`. Sin timestamp (anchor nunca matcheó) →
+    /// None. Stale (timestamp >TTL atrás) → None + log warn.
+    fn filter_stale_fallback(
+        last_good: Option<AnchorMatch>,
+        last_good_at: Option<Instant>,
+        now: Instant,
+    ) -> Option<AnchorMatch> {
+        match (last_good, last_good_at) {
+            (Some(m), Some(t)) if now.duration_since(t) <= LAST_GOOD_TTL => Some(m),
+            (Some(_), Some(t)) => {
+                tracing::warn!(
+                    "AnchorTracker: last_good stale ({:.1}s > TTL {:.1}s) — descartando",
+                    now.duration_since(t).as_secs_f32(),
+                    LAST_GOOD_TTL.as_secs_f32()
+                );
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Veredicto de consistencia del último `window_offset`. Expuesto al game
@@ -460,9 +500,22 @@ impl AnchorTracker {
             );
         }
 
-        let n  = cluster.len() as i32;
-        let ox = cluster.iter().map(|m| m.offset_x).sum::<i32>() / n;
-        let oy = cluster.iter().map(|m| m.offset_y).sum::<i32>() / n;
+        // Score-weighted average: matches con score más bajo (mejor SSE)
+        // dominan el promedio. weight = 1/(score+ε) para evitar div0.
+        // Si todos los scores son similares, equivale al avg simple.
+        // Si uno es notablemente peor (p.ej. 0.28 vs 0.05), pesa ~6× menos.
+        const SCORE_WEIGHT_EPS: f32 = 0.01;
+        let mut sum_w  = 0.0f32;
+        let mut sum_wx = 0.0f32;
+        let mut sum_wy = 0.0f32;
+        for m in &cluster {
+            let w = 1.0 / (m.score + SCORE_WEIGHT_EPS);
+            sum_w  += w;
+            sum_wx += m.offset_x as f32 * w;
+            sum_wy += m.offset_y as f32 * w;
+        }
+        let ox = (sum_wx / sum_w).round() as i32;
+        let oy = (sum_wy / sum_w).round() as i32;
         ((ox, oy), DriftStatus::Ok)
     }
 
@@ -631,6 +684,7 @@ mod tests {
             let mut s = t.shared.write();
             s.matches[0] = None; // lost
             s.last_good[0] = Some(test_match(7, 2)); // persisted
+            s.last_good_at[0] = Some(Instant::now()); // fresco (dentro de TTL)
             s.fail_counts[0] = t.config.max_fails + 5; // lost state
         }
         // Debe usar last_good como fallback.
@@ -654,12 +708,14 @@ mod tests {
     // ── Geometric consistency check (2+ anchors) ──────────────────────────
 
     /// Con 2 anchors coherentes (offsets dentro de tolerance), el promedio
-    /// los combina y el status es Ok.
+    /// los combina y el status es Ok. Score-weighted con scores iguales
+    /// equivale a avg simple, redondeado al entero más cercano (no truncado
+    /// como la integer-division previa). avg(5,6)=5.5→6, avg(2,1)=1.5→2.
     #[test]
     fn geometric_check_averages_consistent_pair() {
         let matches = vec![test_match(5, 2), test_match(6, 1)];
         let (offset, status) = AnchorTracker::cluster_offset(&matches);
-        assert_eq!(offset, (5, 1));
+        assert_eq!(offset, (6, 2));
         assert_eq!(status, DriftStatus::Ok);
     }
 
@@ -769,10 +825,88 @@ mod tests {
             let mut s = t.shared.write();
             s.matches[0] = None;
             s.last_good[0] = Some(test_match(3, 3));
+            s.last_good_at[0] = Some(Instant::now()); // dentro de TTL
             s.fail_counts[0] = t.config.max_fails + 2; // lost
         }
         let _ = t.window_offset();
         assert_eq!(t.drift_status(), DriftStatus::Ok);
+    }
+
+    // ── filter_stale_fallback (TTL del last_good) ─────────────────────
+
+    #[test]
+    fn stale_filter_returns_none_when_no_timestamp() {
+        let now = Instant::now();
+        // Sin timestamp (anchor nunca matcheó) → no hay last_good utilizable.
+        assert!(AnchorTracker::filter_stale_fallback(
+            Some(test_match(5, 5)), None, now,
+        ).is_none());
+    }
+
+    #[test]
+    fn stale_filter_returns_none_when_no_match() {
+        let now = Instant::now();
+        // Sin last_good (None) → None, irrespective de timestamp.
+        let t = now - std::time::Duration::from_secs(1);
+        assert!(AnchorTracker::filter_stale_fallback(None, Some(t), now).is_none());
+    }
+
+    #[test]
+    fn stale_filter_passes_recent_fallback() {
+        let now = Instant::now();
+        // 5s atrás está dentro del TTL (10s) → pass-through.
+        let t = now - std::time::Duration::from_secs(5);
+        let m = AnchorTracker::filter_stale_fallback(
+            Some(test_match(7, -3)), Some(t), now,
+        ).expect("recent last_good debe pasar");
+        assert_eq!((m.offset_x, m.offset_y), (7, -3));
+    }
+
+    #[test]
+    fn stale_filter_drops_old_fallback() {
+        let now = Instant::now();
+        // 11s atrás supera el TTL (10s) → descarta.
+        let t = now - std::time::Duration::from_secs(11);
+        assert!(AnchorTracker::filter_stale_fallback(
+            Some(test_match(7, -3)), Some(t), now,
+        ).is_none());
+    }
+
+    // ── Score-weighted cluster offset ─────────────────────────────────
+
+    fn match_with_score(ox: i32, oy: i32, score: f32) -> AnchorMatch {
+        AnchorMatch {
+            found_x: 0, found_y: 0, score,
+            offset_x: ox, offset_y: oy,
+        }
+    }
+
+    #[test]
+    fn weighted_cluster_prefers_low_score_match() {
+        // 2 matches dentro del cluster geom tolerance.
+        // Match A: offset=(0,0), score=0.05 (excelente).
+        // Match B: offset=(10,10), score=0.25 (mediocre).
+        // Avg simple = (5, 5). Weighted: A pesa ~5× más → cerca de (2, 2).
+        let matches = vec![
+            match_with_score(0, 0, 0.05),
+            match_with_score(10, 10, 0.25),
+        ];
+        let ((ox, oy), status) = AnchorTracker::cluster_offset(&matches);
+        assert_eq!(status, DriftStatus::Ok);
+        // Weighted hacia (0,0) — esperamos algo significativamente menor que (5,5).
+        assert!(ox < 4 && oy < 4, "weighted debe sesgar hacia low-score; got ({}, {})", ox, oy);
+        assert!(ox > 0 && oy > 0, "no debe colapsar a (0,0); got ({}, {})", ox, oy);
+    }
+
+    #[test]
+    fn weighted_cluster_equal_scores_equals_simple_avg() {
+        // Mismos scores → weighted == avg simple. Prueba retrocompat.
+        let matches = vec![
+            match_with_score(4, 0, 0.05),
+            match_with_score(6, 2, 0.05),
+        ];
+        let ((ox, oy), _) = AnchorTracker::cluster_offset(&matches);
+        assert_eq!((ox, oy), (5, 1));
     }
 
     /// Transición Ok → Inconsistent → Ok se refleja en status cada tick.
@@ -811,11 +945,12 @@ mod tests {
     fn recovery_updates_last_good() {
         let mut t = make_tracker();
         add_dummy_anchor(&mut t);
-        // Estado inicial: lost con last_good obsoleto.
+        // Estado inicial: lost con last_good obsoleto pero dentro de TTL.
         {
             let mut s = t.shared.write();
             s.matches[0] = None;
             s.last_good[0] = Some(test_match(1, 1));
+            s.last_good_at[0] = Some(Instant::now());
             s.fail_counts[0] = t.config.max_fails + 2;
         }
         assert_eq!(t.window_offset(), (1, 1));
@@ -827,6 +962,7 @@ mod tests {
             let new_match = test_match(10, 20);
             s.matches[0] = Some(new_match);
             s.last_good[0] = Some(new_match);
+            s.last_good_at[0] = Some(Instant::now());
             s.fail_counts[0] = 0;
         }
         // Ahora el offset refleja el nuevo match.
