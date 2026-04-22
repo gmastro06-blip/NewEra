@@ -1503,7 +1503,7 @@ impl BotLoop {
                     dispatch_us,
                     state_write_us: 0,  // no medido aún (las write() están dispersas)
                     tick_total_us,
-                    vision_per_reader_us: [0; crate::instrumentation::ReaderId::COUNT],
+                    vision_per_reader_us: self.vision.last_reader_costs(),
                     last_action_kind: action_kind_tag,
                     last_action_rtt_us: 0, // pendiente: instrumentar bridge thread
                     valid_anchors,

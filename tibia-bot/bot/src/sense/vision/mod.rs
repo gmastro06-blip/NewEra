@@ -113,6 +113,30 @@ pub struct Vision {
     /// reader delega primero a ML; si infer_slot devuelve None, fallback SSE.
     /// Sin feature `ml-runtime`, el reader devuelve None siempre (scaffold).
     ml_reader: Option<inventory_ml::MlInventoryReader>,
+    /// Costo µs del último tick por reader, indexado por
+    /// `crate::instrumentation::ReaderId as usize`. u16 cubre hasta 65 ms
+    /// por reader — si uno se acerca, satura (y deberías investigar).
+    /// Reseteado a [0; 12] al inicio de cada tick. Readers skippeados por
+    /// cadencia quedan en 0 — el consumer interpreta 0 como "no corrió".
+    last_reader_costs: [u16; crate::instrumentation::ReaderId::COUNT],
+}
+
+/// Macro para envolver un bloque de reader con timing. Escribe el costo µs
+/// (saturado a u16::MAX) en `$self.last_reader_costs[$id as usize]` y
+/// devuelve el valor del bloque sin modificarlo.
+///
+/// Borrow-safe: `__t` (Instant) no toca self; el body se evalúa primero
+/// (puede tomar &mut self libremente); el assignment a last_reader_costs
+/// ocurre cuando el body terminó y su borrow se liberó.
+#[allow(unused_macros)]
+macro_rules! timed_reader {
+    ($self:ident, $id:expr, $body:block) => {{
+        let __t = std::time::Instant::now();
+        let __r = $body;
+        $self.last_reader_costs[$id as usize] =
+            __t.elapsed().as_micros().min(u16::MAX as u128) as u16;
+        __r
+    }};
 }
 
 impl Vision {
@@ -287,7 +311,17 @@ impl Vision {
             last_inventory_stacks: std::collections::HashMap::new(),
             inventory_detect_interval: 15,
             ml_reader: None,  // populate via load_ml_model()
+            last_reader_costs: [0; crate::instrumentation::ReaderId::COUNT],
         }
+    }
+
+    /// Costos en µs por reader durante el último `tick()`. Indexado por
+    /// `crate::instrumentation::ReaderId as usize`. Readers que no
+    /// corrieron este tick (por cadencia) quedan en 0.
+    /// Llamado por BotLoop tras cada `vision.tick()` para poblar
+    /// `TickMetrics.vision_per_reader_us`.
+    pub fn last_reader_costs(&self) -> [u16; crate::instrumentation::ReaderId::COUNT] {
+        self.last_reader_costs
     }
 
     /// Carga configuración de game_coords: ndi_tile_scale, detect_interval,
@@ -435,6 +469,10 @@ impl Vision {
     pub fn tick(&mut self, frame: &Frame, frame_tick: u64) -> Perception {
         self.frame_count += 1;
 
+        // Reset per-reader cost array. Readers que no corran este tick
+        // (skip por cadencia) quedan en 0, semánticamente "no ejecutado".
+        self.last_reader_costs = [0; crate::instrumentation::ReaderId::COUNT];
+
         if !self.calibration.is_usable() {
             return Perception {
                 frame_tick,
@@ -444,7 +482,9 @@ impl Vision {
         }
 
         // Actualizar anclas (matching corre en thread de fondo).
-        self.tracker.tick(frame);
+        timed_reader!(self, crate::instrumentation::ReaderId::Anchors, {
+            self.tracker.tick(frame)
+        });
         let valid_anchors = self.tracker.valid_anchor_count();
         let total_anchors = self.tracker.total_anchor_count();
         // Loggear estado de anclas solo 1 vez por segundo (cada 30 ticks a 30Hz).
@@ -472,12 +512,11 @@ impl Vision {
         // aplica `PerceptionFilter` aguas abajo en el game loop. Vision aquí
         // solo lee la barra y emite lo que vio; cualquier overlay transient
         // se refleja en el raw — el filter decide si suavizarlo.
-        let raw_hp   = hp_roi.and_then(|r| read_hp_by_edge(frame, r));
-        let raw_mana = mana_roi.and_then(|r| read_mana_by_edge(frame, r));
-        let vitals = CharVitals {
-            hp:   raw_hp,
-            mana: raw_mana,
-        };
+        let vitals = timed_reader!(self, crate::instrumentation::ReaderId::HpMana, {
+            let raw_hp   = hp_roi.and_then(|r| read_hp_by_edge(frame, r));
+            let raw_mana = mana_roi.and_then(|r| read_mana_by_edge(frame, r));
+            CharVitals { hp: raw_hp, mana: raw_mana }
+        });
 
         // Leer battle list (stateful con histéresis).
         //
@@ -489,53 +528,62 @@ impl Vision {
         // template 34x34, ROI 180x100, <5ms) y skippear battle list si
         // greeting visible — real battle list no puede coexistir con
         // NPC dialog en este espacio.
-        let greeting_window_open = self.ui_detector
-            .match_now(frame, "npc_trade_bag")
-            .is_some();
-        let battle = if greeting_window_open {
-            // Greeting abierto → sin battle list real posible.
-            Default::default()
-        } else if let Some(roi) = self.calibration.battle_list.map(|r| self.tracker.adjust_roi(r)) {
-            self.battle_detector.read(frame, roi)
-        } else {
-            Default::default()
-        };
+        // Battle reader incluye el greeting check sync (gate semántico de la
+        // misma ROI) — los cuentamos juntos porque comparten área de pantalla
+        // y el greeting es un fallback gating del battle, no un reader aparte.
+        let battle = timed_reader!(self, crate::instrumentation::ReaderId::Battle, {
+            let greeting_window_open = self.ui_detector
+                .match_now(frame, "npc_trade_bag")
+                .is_some();
+            if greeting_window_open {
+                // Greeting abierto → sin battle list real posible.
+                Default::default()
+            } else if let Some(roi) = self.calibration.battle_list.map(|r| self.tracker.adjust_roi(r)) {
+                self.battle_detector.read(frame, roi)
+            } else {
+                Default::default()
+            }
+        });
 
         // Leer status icons.
-        let conditions = if let Some(roi) = self.calibration.status_icons.map(|r| self.tracker.adjust_roi(r)) {
-            self::status_icons::read_status_icons(frame, roi, &self.status_templates)
-        } else {
-            Default::default()
-        };
+        let conditions = timed_reader!(self, crate::instrumentation::ReaderId::Status, {
+            if let Some(roi) = self.calibration.status_icons.map(|r| self.tracker.adjust_roi(r)) {
+                self::status_icons::read_status_icons(frame, roi, &self.status_templates)
+            } else {
+                Default::default()
+            }
+        });
 
-        // Capturar minimapa y calcular diff de movimiento.
-        let minimap = self.calibration.minimap
-            .map(|r| self.tracker.adjust_roi(r))
-            .and_then(|r| self::minimap::capture_minimap(frame, r));
-
-        let minimap_diff = match (&self.prev_minimap, &minimap) {
-            (Some(prev), Some(curr)) => self::minimap::diff_l1(prev, curr),
-            _ => 0.0,
-        };
-        // is_moving RAW: el filter aplica la hysteresis asimétrica
-        // (MOVEMENT_CALM_FRAMES). None si no hay minimap calibrado.
-        let is_moving: Option<bool> = if self.calibration.minimap.is_some() {
-            Some(minimap_diff > MOVEMENT_DIFF_THRESHOLD)
-        } else {
-            None
-        };
-        // Log periódico del diff a DEBUG para calibración fina.
+        // Bloque minimap completo: capture + diff_l1 + displacement.
+        // Cross-correlation domina (~5 ms en debug). is_moving derivado
+        // es ns y se incluye dentro del scope para coherencia semántica.
+        let (minimap, minimap_diff, is_moving, minimap_displacement) =
+        timed_reader!(self, crate::instrumentation::ReaderId::Minimap, {
+            let minimap = self.calibration.minimap
+                .map(|r| self.tracker.adjust_roi(r))
+                .and_then(|r| self::minimap::capture_minimap(frame, r));
+            let minimap_diff = match (&self.prev_minimap, &minimap) {
+                (Some(prev), Some(curr)) => self::minimap::diff_l1(prev, curr),
+                _ => 0.0,
+            };
+            let is_moving: Option<bool> = if self.calibration.minimap.is_some() {
+                Some(minimap_diff > MOVEMENT_DIFF_THRESHOLD)
+            } else {
+                None
+            };
+            let minimap_displacement = match (&self.prev_minimap, &minimap) {
+                (Some(prev), Some(curr)) => self::minimap::displacement(prev, curr),
+                _ => None,
+            };
+            (minimap, minimap_diff, is_moving, minimap_displacement)
+        });
+        // Logs periódicos fuera del timing — son I/O, no medición de visión.
         if self.frame_count % 30 == 0 && minimap_diff > 0.0 {
             debug!(
                 "minimap_diff={:.6}, is_moving_raw={:?}, threshold={}",
                 minimap_diff, is_moving, MOVEMENT_DIFF_THRESHOLD
             );
         }
-        // Cross-correlation: desplazamiento en píxeles del minimap.
-        let minimap_displacement = match (&self.prev_minimap, &minimap) {
-            (Some(prev), Some(curr)) => self::minimap::displacement(prev, curr),
-            _ => None,
-        };
         if let Some((dx, dy)) = minimap_displacement {
             info!("minimap_displacement: ({}, {}) px", dx, dy);
         }
@@ -545,16 +593,18 @@ impl Vision {
         // Loot sparkles — área 3×3 tiles centrada en el char. Los corpses
         // con loot muestran un anillo de píxeles blancos que persiste hasta
         // ser looteado. Mucho más fiable que contar kills.
-        let loot_sparkles = if let Some(vp) = self.calibration.game_viewport {
-            let adjusted_vp = self.tracker.adjust_roi(vp);
-            if let Some(area) = self::loot::compute_loot_area(adjusted_vp, 64) {
-                self::loot::count_sparkle_pixels(frame, area)
+        let loot_sparkles = timed_reader!(self, crate::instrumentation::ReaderId::Loot, {
+            if let Some(vp) = self.calibration.game_viewport {
+                let adjusted_vp = self.tracker.adjust_roi(vp);
+                if let Some(area) = self::loot::compute_loot_area(adjusted_vp, 64) {
+                    self::loot::count_sparkle_pixels(frame, area)
+                } else {
+                    0
+                }
             } else {
                 0
             }
-        } else {
-            0
-        };
+        });
 
         // Target info bar: señal binaria "char tiene target".
         //
@@ -573,62 +623,59 @@ impl Vision {
         // La fuente (1) gana si está configurada; (2) es fallback transparente.
         // Si ninguna aplica (battle list vacío + no target ROI), `target_active`
         // queda en None y el FSM usa su fallback legacy de keepalive.
-        let (target_active, target_hits) = if let Some(roi) = self.calibration.target_hp_bar
-            .map(|r| self.tracker.adjust_roi(r))
-        {
-            // Fuente 1: target_hp_bar ROI calibrada.
-            match self.target_detector.read(frame, roi) {
-                Some(r) => (Some(r.active), r.hits),
-                None    => (None, 0),
+        let (target_active, target_hits) = timed_reader!(self, crate::instrumentation::ReaderId::Target, {
+            if let Some(roi) = self.calibration.target_hp_bar
+                .map(|r| self.tracker.adjust_roi(r))
+            {
+                // Fuente 1: target_hp_bar ROI calibrada.
+                match self.target_detector.read(frame, roi) {
+                    Some(r) => (Some(r.active), r.hits),
+                    None    => (None, 0),
+                }
+            } else if battle.has_enemies() {
+                // Fuente 2: derivar del battle list — zero calibration required.
+                (Some(battle.has_attacked_entry()), 0)
+            } else {
+                (None, 0)
             }
-        } else if battle.has_enemies() {
-            // Fuente 2: derivar del battle list — zero calibration required.
-            (Some(battle.has_attacked_entry()), 0)
-        } else {
-            (None, 0)
-        };
+        });
 
         // Detectar elementos de UI genéricos (depot chest, stow menu, etc).
         // tick() es no-bloqueante: envía parches al background thread y drena
         // resultados. last_matches() retorna el resultado del último job completado
         // (puede ser hasta ~500ms antiguo, aceptable para cambios de UI lentos).
-        self.ui_detector.tick(frame);
-        let mut ui_matches = self.ui_detector.last_matches();
-        // Snapshot de match infos (nombre → (cx, cy, w, h)) para consumo del
-        // cavebot (OpenNpcTrade bag_button_template).
-        let mut ui_match_infos: std::collections::HashMap<String, (u32, u32, u32, u32)> =
-            self.ui_detector.last_matches_map().into_iter()
-                .map(|(name, info)| (
-                    name,
-                    (info.center_x, info.center_y, info.template_w, info.template_h)
-                ))
-                .collect();
-        // ── SYNC match override para templates CRÍTICOS ───────────────────────
-        //
-        // 2026-04-18: el async cache puede tener datos stale (hasta STICKY_TTL)
-        // cuando el main loop bloquea por MinimapMatcher full search (4s). Para
-        // templates chicos (ROI <200x200, template <50x50) donde match_now cuesta
-        // <5ms, corremos SYNC y overrideamos el cache. Asegura coord fresca
-        // cuando el cavebot llega a OpenNpcTrade y necesita clickear el bag.
-        //
-        // Solo templates explícitamente listados — no aplicar a templates caros
-        // (npc_trade, stow_menu) que sumarían 2-5s/tick.
-        const SYNC_PRIORITY_TEMPLATES: &[&str] = &["npc_trade_bag"];
-        for name in SYNC_PRIORITY_TEMPLATES {
-            if let Some(m) = self.ui_detector.match_now(frame, name) {
-                ui_match_infos.insert(
-                    name.to_string(),
-                    (m.x + m.w / 2, m.y + m.h / 2, m.w, m.h),
-                );
-                if !ui_matches.iter().any(|n| n == name) {
-                    ui_matches.push(name.to_string());
+        let (ui_matches, ui_match_infos) = timed_reader!(self, crate::instrumentation::ReaderId::UiMatch, {
+            self.ui_detector.tick(frame);
+            let mut ui_matches = self.ui_detector.last_matches();
+            let mut ui_match_infos: std::collections::HashMap<String, (u32, u32, u32, u32)> =
+                self.ui_detector.last_matches_map().into_iter()
+                    .map(|(name, info)| (
+                        name,
+                        (info.center_x, info.center_y, info.template_w, info.template_h)
+                    ))
+                    .collect();
+            // ── SYNC match override para templates CRÍTICOS ──────────────────
+            // 2026-04-18: el async cache puede tener datos stale (hasta STICKY_TTL)
+            // cuando el main loop bloquea por MinimapMatcher full search (4s). Para
+            // templates chicos (ROI <200x200, template <50x50) donde match_now cuesta
+            // <5ms, corremos SYNC y overrideamos el cache.
+            const SYNC_PRIORITY_TEMPLATES: &[&str] = &["npc_trade_bag"];
+            for name in SYNC_PRIORITY_TEMPLATES {
+                if let Some(m) = self.ui_detector.match_now(frame, name) {
+                    ui_match_infos.insert(
+                        name.to_string(),
+                        (m.x + m.w / 2, m.y + m.h / 2, m.w, m.h),
+                    );
+                    if !ui_matches.iter().any(|n| n == name) {
+                        ui_matches.push(name.to_string());
+                    }
+                } else {
+                    ui_match_infos.remove(*name);
+                    ui_matches.retain(|n| n != name);
                 }
-            } else {
-                // Sin match en el frame actual → remover stale del cache.
-                ui_match_infos.remove(*name);
-                ui_matches.retain(|n| n != name);
             }
-        }
+            (ui_matches, ui_match_infos)
+        });
 
         // Tile-hashing: detectar coordenadas absolutas cada N frames.
         //
@@ -677,6 +724,7 @@ impl Vision {
         // Cuando llega un template match fresh, trusteamos absolutamente el
         // nuevo coord (ground truth) y reseteamos el acumulador.
 
+        let game_coords = timed_reader!(self, crate::instrumentation::ReaderId::GameCoords, {
         // PASO 1: actualizar coord incrementalmente con displacement (cada frame).
         if let (Some(last_coord), Some(disp_px)) =
             (self.last_game_coords, minimap_displacement)
@@ -753,7 +801,8 @@ impl Vision {
                 }
             }
         }
-        let game_coords = self.last_game_coords;
+        self.last_game_coords
+        }); // end timed_reader GameCoords
 
         // ── Stuck detection: game_coords stale + char intentando caminar ─
         //
@@ -801,16 +850,17 @@ impl Vision {
         }
 
         // Inventory: contar items + leer stack counts via OCR cada N frames.
-        // Fase 2.5 wire: si ml_reader está ready, delega a ML con fallback SSE.
-        // Split borrow: &self.inventory_reader + &mut self.ml_reader (campos
-        // distintos) — Rust lo permite.
-        if let Some(ref reader) = self.inventory_reader {
-            if self.frame_count % self.inventory_detect_interval as u64 == 0 {
-                let reading = reader.read_with_stacks_ml(frame, self.ml_reader.as_mut());
-                self.last_inventory_counts = reading.slot_counts;
-                self.last_inventory_stacks = reading.stack_totals;
+        // Si la cadencia no aplica este tick, el reader queda en 0 µs y se
+        // skipea el costo de read (cache `last_inventory_*` se reusa).
+        timed_reader!(self, crate::instrumentation::ReaderId::Inventory, {
+            if let Some(ref reader) = self.inventory_reader {
+                if self.frame_count % self.inventory_detect_interval as u64 == 0 {
+                    let reading = reader.read_with_stacks_ml(frame, self.ml_reader.as_mut());
+                    self.last_inventory_counts = reading.slot_counts;
+                    self.last_inventory_stacks = reading.stack_totals;
+                }
             }
-        }
+        });
         let inventory_counts = self.last_inventory_counts.clone();
         let inventory_stacks = self.last_inventory_stacks.clone();
 
