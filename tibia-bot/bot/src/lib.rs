@@ -4,6 +4,7 @@ pub mod act;
 pub mod cavebot;
 pub mod config;
 pub mod core;
+pub mod instrumentation;
 pub mod pathfinding;
 pub mod remote;
 pub mod safety;
