@@ -36,6 +36,24 @@
 
 use std::collections::VecDeque;
 
+// ── Consts migradas desde `vision/mod.rs` ────────────────────────────────
+//
+// Hasta 2026-04 estas vivían inline en `Vision::tick`. Se consolidan acá
+// porque el debouncing de vitales + la hysteresis de movimiento son
+// comportamiento temporal, no visión per se. Vision ahora emite el raw
+// y el filter aplica la semántica temporal.
+
+/// Frames consecutivos de "bad read" (HP ratio ≈ 0 o None) antes de
+/// propagar el valor real. Absorbe transient de overlays/animaciones.
+/// 5 ticks ≈ 150 ms @ 30 Hz.
+pub const VITALS_PANIC_FRAMES: u32 = 5;
+
+/// Frames consecutivos con minimap_diff bajo el umbral antes de declarar
+/// "no me muevo" (desactivar is_moving). Asimétrico: activar es inmediato,
+/// desactivar requiere N frames calm. Evita que un frame de pausa visual
+/// corte walk steps en el cavebot.
+pub const MOVEMENT_CALM_FRAMES: u32 = 10;
+
 // ── Primitivas ────────────────────────────────────────────────────────────
 
 /// Exponential Moving Average para señales continuas f32.
@@ -207,23 +225,81 @@ impl StreakCounter {
     pub fn current(&self) -> u32 { self.count }
 }
 
-// ── PerceptionFilter ──────────────────────────────────────────────────────
+// ── VitalsDebouncer ──────────────────────────────────────────────────────
 
 use super::perception::{Perception, VitalBar};
+
+/// Filtro de "bad read" para barras vitales (HP / mana). Mantiene el último
+/// `VitalBar` estable y propaga el raw recién después de N frames consecutivos
+/// de bad. Equivalente al debouncing inline que vivía en `Vision::tick`.
+///
+/// `is_bad` se determina externamente (HP usa `ratio < 0.001`, mana usa
+/// `raw.is_none()`). El debouncer no impone política — recibe `(raw, bad_flag)`.
+#[derive(Debug, Clone)]
+pub struct VitalsDebouncer {
+    last_stable: Option<VitalBar>,
+    bad_frames:  u32,
+    panic_thr:   u32,
+}
+
+impl VitalsDebouncer {
+    pub fn new(panic_threshold: u32) -> Self {
+        Self { last_stable: None, bad_frames: 0, panic_thr: panic_threshold.max(1) }
+    }
+
+    /// Procesa un nuevo raw. Si `is_bad`, retorna el último stable hasta
+    /// que se acumulan `panic_thr` bads consecutivos — entonces propaga el
+    /// raw (que probablemente sea None o vacío). Si no es bad, resetea
+    /// el contador y actualiza last_stable.
+    pub fn update(&mut self, raw: Option<VitalBar>, is_bad: bool) -> Option<VitalBar> {
+        if is_bad {
+            self.bad_frames += 1;
+            if self.bad_frames >= self.panic_thr {
+                // Persistente → confiar en el raw (puede indicar muerte / cambio
+                // de pantalla / disconnect — el FSM debe ver eso de verdad).
+                raw
+            } else {
+                // Transient → mantener último stable.
+                self.last_stable.clone()
+            }
+        } else {
+            self.bad_frames = 0;
+            self.last_stable = raw.clone();
+            raw
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.last_stable = None;
+        self.bad_frames  = 0;
+    }
+}
+
+// ── PerceptionFilter ──────────────────────────────────────────────────────
 
 /// Aplica smoothing temporal a un `Perception` crudo. Ver módulo docstring
 /// para diseño.
 pub struct PerceptionFilter {
-    // Continuas — α=0.85: smoothing muy ligero, <5% desviación vs raw.
-    // Los VITALS_PANIC_FRAMES=5 de Vision ya manejan transients severos;
-    // el EMA aquí suaviza micro-ruido entre frames válidos.
-    hp_ema:            EmaState,
-    mana_ema:          EmaState,
+    // Vitales: debouncer de bad reads + EMA ligera sobre el ratio estable.
+    // VITALS_PANIC_FRAMES=5 absorbe transients (overlay, animación, UI flash)
+    // antes de propagar el bad read genuino. EMA α=0.85 después suaviza
+    // micro-ruido entre lecturas válidas.
+    hp_debouncer:  VitalsDebouncer,
+    hp_ema:        EmaState,
+    mana_debouncer: VitalsDebouncer,
+    mana_ema:      EmaState,
 
     // Binarias sin filtro upstream.
     // target_active: 2 frames consecutivos false para desactivar.
     // A 30 Hz ≈ 66 ms de "hold" post-target-lost.
     target_hysteresis: HysteresisState,
+
+    // is_moving: hysteresis asimétrica (activa inmediato, desactiva tras
+    // MOVEMENT_CALM_FRAMES). Replica la lógica que vivía en Vision.
+    moving_hysteresis: HysteresisState,
+    /// Último is_moving filtrado — se conserva para que la transición
+    /// triggear logs/diagnostics. Solo Some cuando el minimap está calibrado.
+    prev_is_moving: Option<bool>,
 
     // Contadores discretos.
     // enemy_count: median de 3. Absorbe 1 frame spúreo.
@@ -244,9 +320,13 @@ pub struct PerceptionFilter {
 impl Default for PerceptionFilter {
     fn default() -> Self {
         Self {
+            hp_debouncer:       VitalsDebouncer::new(VITALS_PANIC_FRAMES),
             hp_ema:             EmaState::new(0.85),
+            mana_debouncer:     VitalsDebouncer::new(VITALS_PANIC_FRAMES),
             mana_ema:           EmaState::new(0.85),
             target_hysteresis:  HysteresisState::new(2),
+            moving_hysteresis:  HysteresisState::new(MOVEMENT_CALM_FRAMES),
+            prev_is_moving:     None,
             enemy_count_median: MedianWindow::new(3),
             coords_vote:        MajorityVote::new(5),
             last_coords_hold:   None,
@@ -263,24 +343,45 @@ impl PerceptionFilter {
     pub fn apply(&mut self, raw: &Perception) -> Perception {
         let mut out = raw.clone();
 
-        // ── HP / mana: EMA ligera sobre el ratio. Preservamos filled/total
-        //    crudos (útiles para diagnóstico); solo el ratio se suaviza.
-        if let Some(hp) = raw.vitals.hp {
+        // ── HP: debouncer (5-frame panic) seguido de EMA ligera sobre el
+        //    ratio del valor estable. is_bad cuando ratio < 0.001 (overlay
+        //    pinta encima de la barra y devuelve cero filled).
+        let hp_is_bad = raw.vitals.hp.as_ref().map(|b| b.ratio < 0.001).unwrap_or(true);
+        let stable_hp = self.hp_debouncer.update(raw.vitals.hp, hp_is_bad);
+        out.vitals.hp = stable_hp.map(|hp| {
             let smoothed = self.hp_ema.update(Some(hp.ratio)).unwrap_or(hp.ratio);
-            out.vitals.hp = Some(VitalBar { ratio: smoothed, ..hp });
-        } else {
-            // Raw sin HP — no aplicamos update (preserva último smoothed
-            // internamente pero no lo sobreescribimos al output, para
-            // reflejar la ausencia de signal al FSM).
-        }
-        if let Some(mana) = raw.vitals.mana {
+            VitalBar { ratio: smoothed, ..hp }
+        });
+
+        // ── Mana: same patrón. is_bad = raw.is_none() (mana reader devuelve
+        //    None si no encuentra la barra; ratio=0 sí es estado válido).
+        let mana_is_bad = raw.vitals.mana.is_none();
+        let stable_mana = self.mana_debouncer.update(raw.vitals.mana, mana_is_bad);
+        out.vitals.mana = stable_mana.map(|mana| {
             let smoothed = self.mana_ema.update(Some(mana.ratio)).unwrap_or(mana.ratio);
-            out.vitals.mana = Some(VitalBar { ratio: smoothed, ..mana });
-        }
+            VitalBar { ratio: smoothed, ..mana }
+        });
 
         // ── target_active: hysteresis. None se preserva (no hay signal).
         if let Some(raw_target) = raw.target_active {
             out.target_active = Some(self.target_hysteresis.update(raw_target));
+        }
+
+        // ── is_moving: hysteresis asimétrica activa-rápido / desactiva-lento.
+        //    None se preserva (minimap no calibrado → no hay signal).
+        match raw.is_moving {
+            Some(raw_moving) => {
+                let filtered = self.moving_hysteresis.update(raw_moving);
+                out.is_moving = Some(filtered);
+                self.prev_is_moving = Some(filtered);
+            }
+            None => {
+                // Sin minimap → reseteamos hysteresis para evitar que
+                // arrastre estado entre fases con/sin minimap.
+                self.moving_hysteresis.reset();
+                self.prev_is_moving = None;
+                out.is_moving = None;
+            }
         }
 
         // ── enemy_count: median 3 sobre el count derivado de la BattleList.
@@ -319,14 +420,22 @@ impl PerceptionFilter {
     }
 
     pub fn reset(&mut self) {
+        self.hp_debouncer.reset();
         self.hp_ema.reset();
+        self.mana_debouncer.reset();
         self.mana_ema.reset();
         self.target_hysteresis.reset();
+        self.moving_hysteresis.reset();
+        self.prev_is_moving = None;
         self.enemy_count_median.reset();
         self.coords_vote.reset();
         self.last_coords_hold = None;
         self.last_enemy_count_filtered = 0;
     }
+
+    /// Diagnóstico: estado is_moving del último apply (None si no se llamó
+    /// o si raw venía sin minimap calibrado).
+    pub fn current_is_moving(&self) -> Option<bool> { self.prev_is_moving }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -617,18 +726,149 @@ mod tests {
         assert_eq!(f.filtered_enemy_count(), 2);
     }
 
+    // ── VitalsDebouncer (semantic equivalence con Vision pre-refactor) ─
+
+    fn vbar(ratio: f32) -> VitalBar {
+        VitalBar { ratio, filled_px: (ratio * 100.0) as u32, total_px: 100 }
+    }
+
+    #[test]
+    fn vitals_debouncer_holds_through_panic_window() {
+        let mut d = VitalsDebouncer::new(5);
+        // Raw bueno establece last_stable.
+        let r = d.update(Some(vbar(0.9)), false);
+        assert_eq!(r.unwrap().ratio, 0.9);
+        // 4 bads consecutivos → mantiene 0.9 (panic_thr=5 no alcanzado aún).
+        for _ in 0..4 {
+            let r = d.update(None, true);
+            assert_eq!(r.unwrap().ratio, 0.9, "bad <5: debe mantener last_stable");
+        }
+        // 5to bad → propaga el raw (None aquí).
+        let r = d.update(None, true);
+        assert!(r.is_none(), "bad >=5: debe propagar el raw");
+    }
+
+    #[test]
+    fn vitals_debouncer_resets_on_good_read() {
+        let mut d = VitalsDebouncer::new(5);
+        d.update(Some(vbar(0.9)), false);
+        d.update(None, true); // 1 bad
+        d.update(None, true); // 2 bad
+        // Raw bueno resetea contador y actualiza stable.
+        let r = d.update(Some(vbar(0.5)), false);
+        assert_eq!(r.unwrap().ratio, 0.5);
+        // Otro bad: cuenta desde 1 (no acumula los previos).
+        let r = d.update(None, true);
+        assert_eq!(r.unwrap().ratio, 0.5);
+    }
+
+    #[test]
+    fn vitals_debouncer_reset_clears() {
+        let mut d = VitalsDebouncer::new(5);
+        d.update(Some(vbar(0.5)), false);
+        d.reset();
+        // Tras reset, raw bad → no hay last_stable → propaga None.
+        assert!(d.update(None, true).is_none());
+    }
+
+    // ── PerceptionFilter integración con VitalsDebouncer ─────────────
+
+    #[test]
+    fn filter_hp_holds_through_4_bad_then_propagates_at_5() {
+        let mut f = PerceptionFilter::new();
+        // Establecer baseline 0.9.
+        f.apply(&perc_with_hp(0.9));
+        // 4 frames con ratio 0.0 (bad) → output debe mantenerse cerca de 0.9.
+        for _ in 0..4 {
+            let out = f.apply(&perc_with_hp(0.0));
+            let r = out.vitals.hp.unwrap().ratio;
+            assert!(r > 0.5, "frame bad <5 debe mantener stable; got {}", r);
+        }
+        // 5to bad → propaga ratio 0.0 (atravesando el EMA).
+        // EMA con stable_hp=Some(0.0) y previous smoothed≈0.9: 0.85*0 + 0.15*0.9 = 0.135
+        let out = f.apply(&perc_with_hp(0.0));
+        let r = out.vitals.hp.unwrap().ratio;
+        assert!(r < 0.2, "frame bad >=5 debe propagar (ema todavía decae); got {}", r);
+    }
+
+    #[test]
+    fn filter_hp_none_input_treated_as_bad() {
+        let mut f = PerceptionFilter::new();
+        f.apply(&perc_with_hp(0.7));
+        // 4 frames con HP=None → mantiene last_stable.
+        let p_no_hp = Perception::default();
+        for _ in 0..4 {
+            let out = f.apply(&p_no_hp);
+            assert!(out.vitals.hp.is_some(), "None bad <5 debe propagar last_stable");
+        }
+        // 5to None → output también None.
+        let out = f.apply(&p_no_hp);
+        assert!(out.vitals.hp.is_none());
+    }
+
+    // ── moving_hysteresis (semantic equivalence con Vision pre-refactor) ─
+
+    #[test]
+    fn filter_is_moving_activates_immediately() {
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+        p.is_moving = Some(true);
+        assert_eq!(f.apply(&p).is_moving, Some(true));
+    }
+
+    #[test]
+    fn filter_is_moving_deactivates_after_calm_frames() {
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+        p.is_moving = Some(true);
+        f.apply(&p);
+        // false sostenido por MOVEMENT_CALM_FRAMES-1 sigue dando true.
+        p.is_moving = Some(false);
+        for _ in 0..(MOVEMENT_CALM_FRAMES - 1) {
+            assert_eq!(f.apply(&p).is_moving, Some(true));
+        }
+        // El N-ésimo false desactiva.
+        assert_eq!(f.apply(&p).is_moving, Some(false));
+    }
+
+    #[test]
+    fn filter_is_moving_none_when_minimap_uncalibrated() {
+        let mut f = PerceptionFilter::new();
+        let p = Perception::default(); // is_moving = None
+        assert_eq!(f.apply(&p).is_moving, None);
+    }
+
+    #[test]
+    fn filter_is_moving_none_resets_hysteresis() {
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+        // Primero activamos.
+        p.is_moving = Some(true);
+        f.apply(&p);
+        // Minimap se descalibra (None) — hysteresis debe resetear.
+        p.is_moving = None;
+        assert_eq!(f.apply(&p).is_moving, None);
+        // Vuelve un raw=false: como hysteresis está reseteada, output false.
+        p.is_moving = Some(false);
+        assert_eq!(f.apply(&p).is_moving, Some(false));
+    }
+
     #[test]
     fn filter_reset_clears_all_state() {
         let mut f = PerceptionFilter::new();
         let mut p = Perception::default();
         p.target_active = Some(true);
         p.game_coords   = Some((1,1,1));
+        p.is_moving     = Some(true);
+        p.vitals.hp     = Some(vbar(0.5));
         f.apply(&p);
         f.reset();
-        // Tras reset: None input → None output, hysteresis en false.
+        // Tras reset: None input → None output, hysteresis/debouncer reseteados.
         let p_empty = Perception::default();
         let out = f.apply(&p_empty);
         assert!(out.target_active.is_none());
         assert!(out.game_coords.is_none());
+        assert!(out.is_moving.is_none());
+        assert!(out.vitals.hp.is_none(), "vitals_debouncer reset → no last_stable a propagar");
     }
 }

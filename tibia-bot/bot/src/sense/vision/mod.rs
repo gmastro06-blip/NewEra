@@ -47,15 +47,10 @@ use self::ui_detector::UiDetector;
 /// 0.025 está en el centro del gap con buen margen a ambos lados.
 const MOVEMENT_DIFF_THRESHOLD: f32 = 0.025;
 
-/// Frames consecutivos con diff <= threshold para desactivar is_moving (histéresis).
-/// Durante auto-walk, el minimap se desplaza en pasos discretos por tile (~350ms/tile).
-/// Entre shifts, frames consecutivos son iguales (diff≈0). Los frames de alto diff
-/// vienen cada 3-5 frames a 30Hz, así que con calm=5 la histéresis se rompe en los gaps.
-/// 10 frames (~333ms a 30Hz). Con threshold=0.025, el ruido idle nunca cruza,
-/// así que 10 frames de calm se alcanzan solo cuando el char realmente se detiene.
-/// Durante auto-walk, los shifts de tile (diff=0.07+) vienen cada ~350ms,
-/// así que al menos un shift reinicia el calm counter antes de llegar a 10.
-const MOVEMENT_CALM_FRAMES: u32 = 10;
+// MOVEMENT_CALM_FRAMES y VITALS_PANIC_FRAMES se movieron a `sense::filter`.
+// El debouncing temporal vive ahora en `PerceptionFilter` aplicado por
+// `BotLoop` entre Vision::tick y FSM. Esto deja Vision emitiendo señales
+// raw verdaderas y centraliza la política temporal en un solo módulo.
 
 /// Sistema de visión completo.
 pub struct Vision {
@@ -71,13 +66,6 @@ pub struct Vision {
     ui_detector: UiDetector,
     /// Snapshot del minimapa del frame anterior — para calcular diff de movimiento.
     prev_minimap: Option<crate::sense::perception::MinimapSnapshot>,
-    /// Último estado reportado de is_moving — para loguear transiciones a nivel INFO.
-    prev_is_moving: Option<bool>,
-    /// Estado actual de la histéresis de movimiento (true = en movimiento).
-    moving_hysteresis: bool,
-    /// Frames consecutivos con diff <= threshold. Cuando alcanza MOVEMENT_CALM_FRAMES,
-    /// la histéresis se desactiva (is_moving → false).
-    calm_frame_count: u32,
     /// Número de frame procesado.
     frame_count:     u64,
     /// Template matcher (SSDNormalized) para posicionamiento absoluto.
@@ -112,17 +100,6 @@ pub struct Vision {
     ndi_tile_scale: u32,
     /// Último resultado de detección de coords (cacheado entre intervalos).
     last_game_coords: Option<(i32, i32, i32)>,
-    /// Última HP confirmada (no transitoria). Usada como fallback cuando
-    /// el reader retorna None o un valor que parece transient noise.
-    last_hp_stable: Option<crate::sense::perception::VitalBar>,
-    /// Última mana confirmada (mismo concepto que last_hp_stable).
-    last_mana_stable: Option<crate::sense::perception::VitalBar>,
-    /// Contador de frames consecutivos con HP=None o ratio=0.0. Cuando
-    /// excede `vitals_panic_frames`, se considera el valor como real
-    /// (probablemente char muerto o pantalla cambió).
-    bad_hp_frames: u32,
-    /// Contador análogo para mana.
-    bad_mana_frames: u32,
     /// Reader de inventario (opcional).
     inventory_reader: Option<inventory::InventoryReader>,
     /// Último conteo de items por template (cacheado entre intervalos).
@@ -290,9 +267,6 @@ impl Vision {
             target_detector: TargetDetector::new(),
             ui_detector,
             prev_minimap: None,
-            prev_is_moving: None,
-            moving_hysteresis: false,
-            calm_frame_count: 0,
             frame_count: 0,
             minimap_matcher: game_coords::MinimapMatcher::new(),
             coords_detects_since_full_search: 0,
@@ -303,10 +277,6 @@ impl Vision {
             coords_detect_interval: 15,
             ndi_tile_scale: 5,
             last_game_coords: None,
-            last_hp_stable: None,
-            last_mana_stable: None,
-            bad_hp_frames: 0,
-            bad_mana_frames: 0,
             inventory_reader,
             last_inventory_counts: std::collections::HashMap::new(),
             last_inventory_stacks: std::collections::HashMap::new(),
@@ -493,47 +463,15 @@ impl Vision {
         let hp_roi   = self.calibration.hp_bar.map(|r| self.tracker.adjust_roi(r));
         let mana_roi = self.calibration.mana_bar.map(|r| self.tracker.adjust_roi(r));
 
-        // Leer vitales con debouncing F1.2: filtra transitorios (frames
-        // donde el reader retorna None o ratio=0 momentáneamente por
-        // overlay/animación/UI flash). Solo propaga el "bad read" después
-        // de N frames consecutivos.
-        const VITALS_PANIC_FRAMES: u32 = 5; // ~150ms a 30Hz
-
-        let raw_hp = hp_roi.and_then(|r| read_hp_by_edge(frame, r));
-        let hp_is_bad = raw_hp.as_ref().map(|b| b.ratio < 0.001).unwrap_or(true);
-        let hp_final = if hp_is_bad {
-            self.bad_hp_frames += 1;
-            if self.bad_hp_frames >= VITALS_PANIC_FRAMES {
-                // Persistent bad read → confiar en el valor real (dead/screen change)
-                raw_hp
-            } else {
-                // Transient noise → usar el último valor estable
-                self.last_hp_stable.clone()
-            }
-        } else {
-            self.bad_hp_frames = 0;
-            self.last_hp_stable = raw_hp.clone();
-            raw_hp
-        };
-
+        // Leer vitales RAW. El debouncing temporal (panic frames + EMA) lo
+        // aplica `PerceptionFilter` aguas abajo en el game loop. Vision aquí
+        // solo lee la barra y emite lo que vio; cualquier overlay transient
+        // se refleja en el raw — el filter decide si suavizarlo.
+        let raw_hp   = hp_roi.and_then(|r| read_hp_by_edge(frame, r));
         let raw_mana = mana_roi.and_then(|r| read_mana_by_edge(frame, r));
-        let mana_is_bad = raw_mana.is_none();
-        let mana_final = if mana_is_bad {
-            self.bad_mana_frames += 1;
-            if self.bad_mana_frames >= VITALS_PANIC_FRAMES {
-                raw_mana
-            } else {
-                self.last_mana_stable.clone()
-            }
-        } else {
-            self.bad_mana_frames = 0;
-            self.last_mana_stable = raw_mana.clone();
-            raw_mana
-        };
-
         let vitals = CharVitals {
-            hp:   hp_final,
-            mana: mana_final,
+            hp:   raw_hp,
+            mana: raw_mana,
         };
 
         // Leer battle list (stateful con histéresis).
@@ -574,38 +512,17 @@ impl Vision {
             (Some(prev), Some(curr)) => self::minimap::diff_l1(prev, curr),
             _ => 0.0,
         };
-        // Histéresis de movimiento: activar inmediato, desactivar tras N frames calm.
-        // None si no hay minimap calibrado — el stuck detector del cavebot
-        // debe ignorar este campo cuando es None para no cortar walk steps.
+        // is_moving RAW: el filter aplica la hysteresis asimétrica
+        // (MOVEMENT_CALM_FRAMES). None si no hay minimap calibrado.
         let is_moving: Option<bool> = if self.calibration.minimap.is_some() {
-            let raw_moving = minimap_diff > MOVEMENT_DIFF_THRESHOLD;
-            if raw_moving {
-                self.moving_hysteresis = true;
-                self.calm_frame_count = 0;
-            } else if self.moving_hysteresis {
-                self.calm_frame_count += 1;
-                if self.calm_frame_count >= MOVEMENT_CALM_FRAMES {
-                    self.moving_hysteresis = false;
-                    self.calm_frame_count = 0;
-                }
-            }
-            Some(self.moving_hysteresis)
+            Some(minimap_diff > MOVEMENT_DIFF_THRESHOLD)
         } else {
             None
         };
-        // Log de transiciones a nivel INFO para diagnóstico sin RUST_LOG=debug.
-        if is_moving != self.prev_is_moving && is_moving.is_some() {
-            info!(
-                "minimap: is_moving {:?} → {:?} (diff={:.6}, threshold={}, calm={})",
-                self.prev_is_moving, is_moving, minimap_diff,
-                MOVEMENT_DIFF_THRESHOLD, self.calm_frame_count
-            );
-        }
-        self.prev_is_moving = is_moving;
         // Log periódico del diff a DEBUG para calibración fina.
         if self.frame_count % 30 == 0 && minimap_diff > 0.0 {
             debug!(
-                "minimap_diff={:.6}, is_moving={:?}, threshold={}",
+                "minimap_diff={:.6}, is_moving_raw={:?}, threshold={}",
                 minimap_diff, is_moving, MOVEMENT_DIFF_THRESHOLD
             );
         }
