@@ -99,6 +99,10 @@ path = "src/bin/extract_inventory_slots.rs"
 name = "generate_cavebot"
 path = "src/bin/generate_cavebot.rs"
 
+[[bin]]
+name = "label_dataset"
+path = "src/bin/label_dataset.rs"
+
 [dependencies]
 # ── Runtime async ────────────────────────────────────────────────────────────
 tokio              = { workspace = true }
