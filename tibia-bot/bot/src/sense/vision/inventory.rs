@@ -98,6 +98,29 @@ const NMS_SCORE_GAP: f32 = 0.08;
 /// usa el slot completo sin stripping.
 pub const STACK_COUNT_HEIGHT_PX: u32 = 8;
 
+/// Densidad mínima aceptable de un template (ratio de pixels con luma > 40).
+/// Templates por debajo de este valor son "sparse" — el sprite tiene mucho
+/// fondo negro/transparente y tiende a matchear cualquier slot oscuro
+/// produciendo false positives.
+///
+/// **Evidencia empírica (sesión 2026-04-20)**:
+/// - `white_pearl.png` wiki: density ~0.08, matcheó 13/16 slots falsos
+/// - `magic_ring.png`: density ~0.12, matcheó 5/16 falsos
+/// - `npc_trade_bag.png` UI: density ~0.15, matcheó false positive bloqueando
+///   battle_list scan (bug crítico)
+///
+/// Threshold 0.20 (20% pixels densos) filtra esos sprites.
+/// Template con density baja NO se rechaza — se carga con threshold
+/// auto-boosted a 0.95 (match casi idéntico) para prevenir FPs.
+/// User puede overridear via thresholds.toml si sabe lo que hace.
+pub const TEMPLATE_DENSITY_MIN: f32 = 0.20;
+
+/// Luma threshold para considerar un pixel "denso" (no-background).
+const DENSITY_LUMA_THRESHOLD: u8 = 40;
+
+/// Threshold auto-boosted para templates sparse sin override en TOML.
+const SPARSE_AUTO_THRESHOLD: f32 = 0.95;
+
 /// Padding en píxeles que añadimos al slot ROI para permitir matching
 /// shift-tolerant (Fase 1.4).
 ///
@@ -209,16 +232,33 @@ impl InventoryReader {
                     continue;
                 }
             };
-            // Usar threshold per-template si está en el TOML, else default.
-            let threshold = thresholds.get(&name).copied().unwrap_or(MATCH_THRESHOLD);
+            // Validator (Fase auditoría): density check previene FPs sistémicos
+            // de templates sparse. Log WARN si < TEMPLATE_DENSITY_MIN y no hay
+            // override en TOML → auto-boost threshold a 0.95.
+            let density = template_density(&template);
+            let user_override = thresholds.get(&name).copied();
+            let threshold = match user_override {
+                Some(t) => t,  // user override siempre gana (asume que sabe)
+                None if density < TEMPLATE_DENSITY_MIN => {
+                    warn!(
+                        "InventoryReader: template '{}' density={:.2} < {:.2} (sparse — \
+                         riesgo de false positives). Auto-boost threshold → {:.2}. \
+                         Override en thresholds.toml si es intencional.",
+                        name, density, TEMPLATE_DENSITY_MIN, SPARSE_AUTO_THRESHOLD
+                    );
+                    SPARSE_AUTO_THRESHOLD
+                }
+                None => MATCH_THRESHOLD,
+            };
             let threshold_note = if (threshold - MATCH_THRESHOLD).abs() > f32::EPSILON {
-                format!(" threshold={:.3}", threshold)
+                let source = if user_override.is_some() { "user" } else { "auto-sparse" };
+                format!(" threshold={:.3} ({})", threshold, source)
             } else {
                 String::new()
             };
             tracing::info!(
-                "InventoryReader: template '{}' cargado ({}×{}){}",
-                name, template.width(), template.height(), threshold_note
+                "InventoryReader: template '{}' cargado ({}×{}) density={:.2}{}",
+                name, template.width(), template.height(), density, threshold_note
             );
             self.templates.push(ItemTemplate { name, template, threshold });
         }
@@ -578,6 +618,18 @@ fn apply_nms(scores_per_template: HashMap<String, Vec<f32>>) -> HashMap<String, 
     out
 }
 
+/// Computa la densidad del template: ratio de pixels con luma > DENSITY_LUMA_THRESHOLD.
+/// Templates sparse (mayormente fondo negro/transparente) dan density baja y son
+/// prone a false positives — ver `TEMPLATE_DENSITY_MIN` para contexto.
+pub fn template_density(img: &GrayImage) -> f32 {
+    let total = (img.width() * img.height()) as f32;
+    if total == 0.0 {
+        return 0.0;
+    }
+    let dense = img.pixels().filter(|p| p.0[0] > DENSITY_LUMA_THRESHOLD).count() as f32;
+    dense / total
+}
+
 /// Convierte BGRA a luma (Y = 0.299R + 0.587G + 0.114B).
 fn bgra_to_luma(data: &[u8], width: u32, height: u32) -> Vec<u8> {
     let n = (width * height) as usize;
@@ -792,6 +844,60 @@ mod tests {
         let img_smaller = GrayImage::new(32, 5);
         let stripped_smaller = strip_stack_count_corner(&img_smaller);
         assert_eq!(stripped_smaller.height(), 5);
+    }
+
+    // ── Template density validator (auditoría) ────────────────────────
+
+    #[test]
+    fn template_density_all_black_returns_zero() {
+        let img = GrayImage::new(32, 32);  // all pixels = 0
+        assert_eq!(template_density(&img), 0.0);
+    }
+
+    #[test]
+    fn template_density_all_white_returns_one() {
+        let mut img = GrayImage::new(32, 32);
+        for p in img.pixels_mut() { p.0[0] = 255; }
+        assert!((template_density(&img) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn template_density_sparse_sprite_below_threshold() {
+        // Simula sprite sparse tipo white_pearl: solo 10% pixels densos.
+        let mut img = GrayImage::new(32, 32);
+        let total = 32 * 32;
+        let dense_count = total / 10;  // 10%
+        for (i, p) in img.pixels_mut().enumerate() {
+            p.0[0] = if i < dense_count as usize { 255 } else { 0 };
+        }
+        let d = template_density(&img);
+        assert!(d < TEMPLATE_DENSITY_MIN, "expected sparse, got density={}", d);
+    }
+
+    #[test]
+    fn template_density_dense_sprite_above_threshold() {
+        // Simula sprite denso tipo gold_coin strip: 80% pixels densos.
+        let mut img = GrayImage::new(32, 32);
+        let total = 32 * 32;
+        let dense_count = (total * 8) / 10;
+        for (i, p) in img.pixels_mut().enumerate() {
+            p.0[0] = if i < dense_count as usize { 200 } else { 0 };
+        }
+        let d = template_density(&img);
+        assert!(d >= TEMPLATE_DENSITY_MIN, "expected dense, got density={}", d);
+    }
+
+    #[test]
+    fn template_density_boundary_luma_40() {
+        // Pixels con luma == 40 NO cuentan (threshold es >40 strict).
+        let mut img = GrayImage::new(10, 10);
+        for p in img.pixels_mut() { p.0[0] = 40; }
+        assert_eq!(template_density(&img), 0.0);
+
+        // Luma 41 sí cuenta.
+        let mut img2 = GrayImage::new(10, 10);
+        for p in img2.pixels_mut() { p.0[0] = 41; }
+        assert!((template_density(&img2) - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
