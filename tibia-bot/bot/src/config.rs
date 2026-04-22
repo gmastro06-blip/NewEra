@@ -30,9 +30,32 @@ pub struct Config {
     pub recording:   RecordingConfig,
     #[serde(default)]
     pub ml:          MlConfig,
+    #[serde(default)]
+    pub health:      HealthConfig,
     /// Tabla de spells con prioridades. Si vacía, se genera desde `[actions]`.
     #[serde(default, rename = "spell")]
     pub spells:      Vec<SpellConfig>,
+}
+
+/// Configuración del HealthSystem (degradación adaptativa runtime).
+///
+/// El HealthSystem siempre corre y publica diagnósticos via
+/// `/health/detailed`. Este flag controla **si las decisiones de
+/// degradación se aplican efectivamente al bot**:
+///
+/// - `apply_degradation=false` (default): solo diagnostico, sin behavior change.
+///   Operador puede observar score + issues pero el bot opera normalmente.
+/// - `apply_degradation=true`: cuando el HealthSystem alcanza
+///   `DegradationLevel::SafeMode`, BotLoop emite safety pause con reason
+///   `health:safe_mode`. Light/Heavy aún sin acción (FSM gate pendiente).
+///
+/// Default conservador: false. Habilitar solo después de validar
+/// thresholds con sesión live + tunear el HealthConfig por defecto.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HealthConfig {
+    /// Si `true`, BotLoop traduce DegradationLevel::SafeMode en safety pause.
+    #[serde(default)]
+    pub apply_degradation: bool,
 }
 
 /// Configuración del runtime ML (Fase 2.5).

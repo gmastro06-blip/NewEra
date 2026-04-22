@@ -1544,7 +1544,35 @@ impl BotLoop {
                     anchor_drift_streak,
                     bridge_rtt_ms: None, // TODO: wire bridge ack hook
                 };
-                let _health_status = self.health.evaluate_tick(&m, &self.metrics, extras);
+                let health_status = self.health.evaluate_tick(&m, &self.metrics, extras);
+
+                // Apply degradation: opt-in via [health].apply_degradation.
+                // Por ahora solo SafeMode trigger safety pause (igual al
+                // patrón anchor_drift). Light/Heavy quedan diagnostic-only
+                // hasta que el FSM tenga HealthGate integrado.
+                if self.config.health.apply_degradation {
+                    if matches!(health_status.degraded, Some(crate::health::DegradationLevel::SafeMode)) {
+                        let reason = format!("health:safe_mode score={}", health_status.score);
+                        if current_pause_reason.as_deref() != Some(reason.as_str()) {
+                            warn!("HealthSystem SafeMode → safety pause: {}", health_status.summary);
+                            current_pause_reason = Some(reason.clone());
+                            let mut g = self.state.write();
+                            g.is_paused = true;
+                            g.safety_pause_reason = Some(reason);
+                        }
+                    } else if let Some(ref r) = current_pause_reason {
+                        // Si volvimos a sano y el pause vigente es del health → liberar.
+                        if r.starts_with("health:") {
+                            info!("Health recovered, clearing safety pause reason={}", r);
+                            current_pause_reason = None;
+                            let mut g = self.state.write();
+                            if g.safety_pause_reason.as_deref().map(|s| s.starts_with("health:")).unwrap_or(false) {
+                                g.safety_pause_reason = None;
+                                g.is_paused = false;
+                            }
+                        }
+                    }
+                }
             }
 
             // ── SLEEP hasta el próximo deadline ───────────────────────────────
