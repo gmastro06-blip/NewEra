@@ -28,6 +28,10 @@ pub struct PerceptionSnapshot {
     pub conditions:           Vec<String>,
     pub inventory_counts:     std::collections::HashMap<String, u32>,
     pub inventory_stacks:     std::collections::HashMap<String, u32>,
+    /// Veredicto del AnchorTracker en este tick.
+    /// `#[serde(default)]` → JSONL antiguos sin el campo cargan como `Ok`.
+    #[serde(default)]
+    pub anchor_drift:         super::vision::anchors::DriftStatus,
 }
 
 /// Snapshot completo de lo que el sistema de visión leyó en un frame.
@@ -98,6 +102,11 @@ pub struct Perception {
     /// Si los digit templates no están cargados, suele coincidir con
     /// inventory_counts (1 unit per slot).
     pub inventory_stacks: std::collections::HashMap<String, u32>,
+    /// Veredicto del AnchorTracker sobre consistencia geométrica de anchors.
+    /// `Ok` → ROIs confiables. `Inconsistent` → anchors divergen, offset no
+    /// fiable. `AllLost` → ningún anchor matcheó, bot ciego al shift de ventana.
+    /// El game loop usa este valor (con histéresis) para safety-pausar.
+    pub anchor_drift: super::vision::anchors::DriftStatus,
 }
 
 impl Perception {
@@ -128,6 +137,7 @@ impl Perception {
             conditions:           self.conditions.active.iter().map(|c| format!("{:?}", c)).collect(),
             inventory_counts:     self.inventory_counts.clone(),
             inventory_stacks:     self.inventory_stacks.clone(),
+            anchor_drift:         self.anchor_drift,
         }
     }
 }

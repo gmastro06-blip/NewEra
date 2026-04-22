@@ -14,6 +14,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use image::{GrayImage, Luma};
 use imageproc::template_matching::{match_template, MatchTemplateMethod};
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,53 @@ use crate::sense::frame_buffer::Frame;
 use crate::sense::vision::calibration::{AnchorDef, RoiDef};
 
 // ── Tipos públicos ─────────────────────────────────────────────────────────────
+
+/// Resultado del check de consistencia de anchors tras cada tick.
+/// Expuesto al FSM para decidir si pausar el bot cuando la ventana deriva
+/// inconsistentemente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftStatus {
+    /// Hay ≥ 1 anchor válido y (si ≥ 2) forman cluster coherente.
+    /// Bot puede operar con confianza sobre el offset calculado.
+    #[default]
+    Ok,
+    /// ≥ 2 anchors válidos pero offsets divergen más allá de
+    /// GEOMETRIC_TOLERANCE_PX. Ningún cluster dominante → offset (0,0) se
+    /// aplica por fallback pero las ROIs apuntan a coords no confiables.
+    /// El FSM debería pausar el bot con reason `anchors:drift_inconsistent`.
+    Inconsistent,
+    /// Ningún anchor válido (todos en estado lost o sin config). El tracker
+    /// retorna (0, 0) porque no tiene info. Bot no sabe dónde está la
+    /// ventana — pausar antes de emitir acciones.
+    AllLost,
+}
+
+impl DriftStatus {
+    fn as_u8(self) -> u8 {
+        match self {
+            DriftStatus::Ok           => 0,
+            DriftStatus::Inconsistent => 1,
+            DriftStatus::AllLost      => 2,
+        }
+    }
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => DriftStatus::Inconsistent,
+            2 => DriftStatus::AllLost,
+            _ => DriftStatus::Ok,
+        }
+    }
+    pub fn is_ok(self) -> bool { matches!(self, DriftStatus::Ok) }
+    /// Etiqueta corta para logs/reasons de safety pause.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DriftStatus::Ok           => "ok",
+            DriftStatus::Inconsistent => "inconsistent",
+            DriftStatus::AllLost      => "all_lost",
+        }
+    }
+}
 
 /// Resultado de localizar un ancla en el frame actual.
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +158,11 @@ pub struct AnchorTracker {
     shared:     Arc<RwLock<AnchorShared>>,
     job_tx:     Sender<MatchJob>,
     outcome_rx: Receiver<MatchOutcome>,
+    /// Último veredicto de consistencia computado por `window_offset`.
+    /// Expuesto vía `drift_status()` para que el game loop + FSM decidan
+    /// safety pauses. `AtomicU8` para permitir escritura desde `&self`
+    /// (contrato de `window_offset(&self) -> (i32, i32)`).
+    last_drift: AtomicU8,
 }
 
 impl AnchorTracker {
@@ -144,6 +197,7 @@ impl AnchorTracker {
             shared:     Arc::new(RwLock::new(AnchorShared::default())),
             job_tx,
             outcome_rx,
+            last_drift: AtomicU8::new(DriftStatus::Ok.as_u8()),
         }
     }
 
@@ -308,18 +362,51 @@ impl AnchorTracker {
             .collect();
         drop(s);
 
-        Self::cluster_offset(&valid)
+        // AllLost: anchors configurados pero ninguno con valid ni last_good.
+        // Distinto de "sin anchors" (total_anchor_count==0 → no hay concepto
+        // de drift, se reporta Ok). Con anchors configurados y cero valid,
+        // el offset (0,0) no es confiable → DriftStatus::AllLost para que
+        // el FSM decida pausar.
+        let (offset, status) = if valid.is_empty() && !self.anchors.is_empty() {
+            ((0, 0), DriftStatus::AllLost)
+        } else {
+            Self::cluster_offset(&valid)
+        };
+        self.last_drift.store(status.as_u8(), Ordering::Relaxed);
+        offset
+    }
+
+    /// Veredicto de consistencia del último `window_offset`. Expuesto al game
+    /// loop para decidir safety pause cuando el tracker no puede confiar en
+    /// la ventana (drift divergente o anchors todos lost).
+    ///
+    /// IMPORTANTE: `window_offset()` debe haberse llamado al menos una vez
+    /// en el tick actual para que este valor esté fresco. El game loop típico
+    /// llama `adjust_roi()` (que internamente llama `window_offset()`) antes
+    /// de leer el status.
+    pub fn drift_status(&self) -> DriftStatus {
+        DriftStatus::from_u8(self.last_drift.load(Ordering::Relaxed))
     }
 
     /// Aplica geometric consistency filtering al set de matches y devuelve
-    /// el offset promedio del cluster dominante. Expuesto como método
-    /// asociado para testabilidad.
-    fn cluster_offset(valid: &[AnchorMatch]) -> (i32, i32) {
+    /// el offset promedio del cluster dominante junto con un `DriftStatus`
+    /// que indica si la geometría es coherente o divergente.
+    ///
+    /// - `valid.is_empty()` → `((0, 0), Ok)` — el caller decide si esto
+    ///   representa `AllLost` (hay anchors configurados) o simplemente no
+    ///   hay anchors (status Ok genuino).
+    /// - `valid.len() == 1` → `(offset, Ok)` — sin punto de comparación,
+    ///   se confía en el single match (filtrado upstream por `max_score`).
+    /// - `valid.len() ≥ 2` con cluster dominante → `(avg, Ok)`.
+    /// - `valid.len() ≥ 2` sin cluster (todos divergen) → `((0, 0), Inconsistent)`.
+    ///
+    /// Expuesto como método asociado para testabilidad.
+    fn cluster_offset(valid: &[AnchorMatch]) -> ((i32, i32), DriftStatus) {
         if valid.is_empty() {
-            return (0, 0);
+            return ((0, 0), DriftStatus::Ok);
         }
         if valid.len() == 1 {
-            return (valid[0].offset_x, valid[0].offset_y);
+            return ((valid[0].offset_x, valid[0].offset_y), DriftStatus::Ok);
         }
         const GEOMETRIC_TOLERANCE_PX: i32 = 15;
 
@@ -342,7 +429,7 @@ impl AnchorTracker {
         }
 
         // Sin cluster de ≥2 → todos los matches divergen entre sí. Ningún
-        // anchor confiable → (0, 0) + warning.
+        // anchor confiable → (0, 0) + Inconsistent para que el FSM pause.
         if best_count < 2 {
             tracing::warn!(
                 "AnchorTracker: {} anchors inconsistentes (offsets: {:?}), \
@@ -351,7 +438,7 @@ impl AnchorTracker {
                 valid.iter().map(|m| (m.offset_x, m.offset_y)).collect::<Vec<_>>(),
                 GEOMETRIC_TOLERANCE_PX
             );
-            return (0, 0);
+            return ((0, 0), DriftStatus::Inconsistent);
         }
 
         let pivot = &valid[best_pivot];
@@ -376,7 +463,7 @@ impl AnchorTracker {
         let n  = cluster.len() as i32;
         let ox = cluster.iter().map(|m| m.offset_x).sum::<i32>() / n;
         let oy = cluster.iter().map(|m| m.offset_y).sum::<i32>() / n;
-        (ox, oy)
+        ((ox, oy), DriftStatus::Ok)
     }
 
     /// Ajusta un ROI aplicando el offset calculado.
@@ -567,25 +654,28 @@ mod tests {
     // ── Geometric consistency check (2+ anchors) ──────────────────────────
 
     /// Con 2 anchors coherentes (offsets dentro de tolerance), el promedio
-    /// los combina como antes.
+    /// los combina y el status es Ok.
     #[test]
     fn geometric_check_averages_consistent_pair() {
         let matches = vec![test_match(5, 2), test_match(6, 1)];
-        assert_eq!(AnchorTracker::cluster_offset(&matches), (5, 1));
+        let (offset, status) = AnchorTracker::cluster_offset(&matches);
+        assert_eq!(offset, (5, 1));
+        assert_eq!(status, DriftStatus::Ok);
     }
 
-    /// Con 2 anchors de offsets divergentes, NINGUNO forma cluster → (0, 0).
-    /// Este es el caso real: un anchor tiene false-positive de -1568px,
-    /// otro tiene offset correcto de 0. Sin cluster consistent → descartar ambos.
+    /// Con 2 anchors de offsets divergentes, NINGUNO forma cluster → (0, 0)
+    /// + status Inconsistent. Este es el caso real: un anchor tiene
+    /// false-positive de -1568px, otro tiene offset correcto de 0.
     #[test]
     fn geometric_check_rejects_divergent_pair() {
         let matches = vec![test_match(-1568, 0), test_match(0, 0)];
-        assert_eq!(AnchorTracker::cluster_offset(&matches), (0, 0));
+        let (offset, status) = AnchorTracker::cluster_offset(&matches);
+        assert_eq!(offset, (0, 0));
+        assert_eq!(status, DriftStatus::Inconsistent);
     }
 
     /// Con 3 anchors donde 2 coinciden y 1 es outlier, el outlier se
-    /// descarta y los 2 consistentes se promedian. Protege contra un
-    /// false-positive individual sin sacrificar el offset sano.
+    /// descarta y los 2 consistentes se promedian. Status = Ok.
     #[test]
     fn geometric_check_drops_outlier_keeps_cluster() {
         let matches = vec![
@@ -593,23 +683,126 @@ mod tests {
             test_match(6, 2),
             test_match(-1568, 0), // outlier
         ];
-        let (ox, oy) = AnchorTracker::cluster_offset(&matches);
+        let ((ox, oy), status) = AnchorTracker::cluster_offset(&matches);
         assert_eq!(ox, 5); // avg(4, 6)
         assert_eq!(oy, 1); // avg(0, 2)
+        assert_eq!(status, DriftStatus::Ok);
     }
 
-    /// Un solo anchor sigue funcionando como antes (sin punto de comparación).
-    /// Esto preserva compat si el usuario no ha configurado el segundo anchor.
+    /// Un solo anchor sigue funcionando — status Ok (sin punto de comparación).
     #[test]
     fn geometric_check_single_anchor_passes_through() {
         let matches = vec![test_match(7, -3)];
-        assert_eq!(AnchorTracker::cluster_offset(&matches), (7, -3));
+        let (offset, status) = AnchorTracker::cluster_offset(&matches);
+        assert_eq!(offset, (7, -3));
+        assert_eq!(status, DriftStatus::Ok);
     }
 
-    /// Lista vacía → (0, 0).
+    /// Lista vacía → (0, 0), status Ok (el caller decide si es AllLost).
     #[test]
     fn geometric_check_empty_returns_zero() {
-        assert_eq!(AnchorTracker::cluster_offset(&[]), (0, 0));
+        let (offset, status) = AnchorTracker::cluster_offset(&[]);
+        assert_eq!(offset, (0, 0));
+        assert_eq!(status, DriftStatus::Ok);
+    }
+
+    // ── DriftStatus integration via window_offset ─────────────────────────
+
+    /// Sin anchors configurados → drift_status = Ok (no hay drift concept).
+    #[test]
+    fn drift_status_no_anchors_is_ok() {
+        let t = make_tracker();
+        let _ = t.window_offset();
+        assert_eq!(t.drift_status(), DriftStatus::Ok);
+    }
+
+    /// Anchor configurado pero sin match ni last_good → AllLost.
+    #[test]
+    fn drift_status_all_lost_when_configured_but_no_matches() {
+        let mut t = make_tracker();
+        add_dummy_anchor(&mut t);
+        // estado por default: matches=None, last_good=None, fail_counts=0.
+        // fail_counts=0 ≤ max_fails, pero matches es None → filtermap devuelve None.
+        let _ = t.window_offset();
+        assert_eq!(t.drift_status(), DriftStatus::AllLost);
+    }
+
+    /// Un match válido → Ok.
+    #[test]
+    fn drift_status_single_valid_match_is_ok() {
+        let mut t = make_tracker();
+        add_dummy_anchor(&mut t);
+        {
+            let mut s = t.shared.write();
+            s.matches[0] = Some(test_match(5, 2));
+            s.last_good[0] = Some(test_match(5, 2));
+        }
+        let _ = t.window_offset();
+        assert_eq!(t.drift_status(), DriftStatus::Ok);
+    }
+
+    /// 2 anchors divergentes → Inconsistent propagado desde cluster_offset.
+    #[test]
+    fn drift_status_inconsistent_pair_propagates() {
+        let mut t = make_tracker();
+        add_dummy_anchor(&mut t);
+        add_dummy_anchor(&mut t);
+        {
+            let mut s = t.shared.write();
+            s.matches[0] = Some(test_match(-1568, 0));
+            s.last_good[0] = Some(test_match(-1568, 0));
+            s.matches[1] = Some(test_match(0, 0));
+            s.last_good[1] = Some(test_match(0, 0));
+        }
+        let _ = t.window_offset();
+        assert_eq!(t.drift_status(), DriftStatus::Inconsistent);
+    }
+
+    /// Anchor degradado a last_good (match actual es None) sigue contando
+    /// como "válido" para DriftStatus — el offset no es fresco pero es
+    /// aplicable. Status = Ok (sólo hay un "valid" via fallback).
+    #[test]
+    fn drift_status_last_good_fallback_counts_as_valid() {
+        let mut t = make_tracker();
+        add_dummy_anchor(&mut t);
+        {
+            let mut s = t.shared.write();
+            s.matches[0] = None;
+            s.last_good[0] = Some(test_match(3, 3));
+            s.fail_counts[0] = t.config.max_fails + 2; // lost
+        }
+        let _ = t.window_offset();
+        assert_eq!(t.drift_status(), DriftStatus::Ok);
+    }
+
+    /// Transición Ok → Inconsistent → Ok se refleja en status cada tick.
+    #[test]
+    fn drift_status_updates_on_each_call() {
+        let mut t = make_tracker();
+        add_dummy_anchor(&mut t);
+        add_dummy_anchor(&mut t);
+
+        // Estado 1: divergentes → Inconsistent.
+        {
+            let mut s = t.shared.write();
+            s.matches[0] = Some(test_match(-100, 0));
+            s.last_good[0] = Some(test_match(-100, 0));
+            s.matches[1] = Some(test_match(100, 0));
+            s.last_good[1] = Some(test_match(100, 0));
+        }
+        let _ = t.window_offset();
+        assert_eq!(t.drift_status(), DriftStatus::Inconsistent);
+
+        // Estado 2: ambos coherentes → Ok.
+        {
+            let mut s = t.shared.write();
+            s.matches[0] = Some(test_match(5, 0));
+            s.last_good[0] = Some(test_match(5, 0));
+            s.matches[1] = Some(test_match(6, 0));
+            s.last_good[1] = Some(test_match(6, 0));
+        }
+        let _ = t.window_offset();
+        assert_eq!(t.drift_status(), DriftStatus::Ok);
     }
 
     /// Tras recovery (match nuevo tras ser lost), last_good se actualiza.

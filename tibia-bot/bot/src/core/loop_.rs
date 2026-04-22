@@ -374,6 +374,15 @@ impl BotLoop {
         let mut prev_was_interrupting = false;
         let mut current_pause_reason: Option<String> = None;
 
+        // ── AnchorTracker drift histéresis ─────────────────────────────────
+        // `perception.anchor_drift` puede flapping-ear entre ticks cuando el
+        // tracker está procesando jobs asíncronos. Pausamos solo si el
+        // drift es sostenido N ticks para filtrar transientes. Reset on Ok.
+        // 5 ticks @ 30Hz ≈ 165ms — suficiente para filtrar ruido del
+        // background thread sin retrasar respuesta a un drift real.
+        let mut anchor_drift_streak: u32 = 0;
+        const ANCHOR_DRIFT_PAUSE_TICKS: u32 = 5;
+
         // ── Phase C.1: FSM state change tracking ────────────────────────────
         // Usados para disparar `on_fsm_state_change(new_state, reason)` a los
         // scripts Lua cuando el FSM transiciona o la safety pause cambia.
@@ -586,6 +595,46 @@ impl BotLoop {
                 }
             };
             let vision_cost_ms = vision_start.elapsed().as_secs_f32() * 1000.0;
+
+            // ── ANCHOR DRIFT HYSTERESIS → SAFETY PAUSE ────────────────────────
+            // Si el AnchorTracker reporta drift inconsistente (>=2 anchors
+            // divergen) o allLost (todos los anchors configurados en estado
+            // lost) durante N ticks consecutivos, pausamos el bot. Previene
+            // que emita clicks sobre coords no confiables cuando la ventana
+            // deriva detectable pero no corregible (p.ej. Tibia redibujó UI
+            // y los templates quedaron obsoletos — operador debe regenerar).
+            use crate::sense::vision::anchors::DriftStatus;
+            match perception.anchor_drift {
+                DriftStatus::Ok => {
+                    anchor_drift_streak = 0;
+                    // Si estábamos pausados por drift y ya se recuperó, liberar.
+                    if let Some(ref r) = current_pause_reason {
+                        if r.starts_with("anchors:") {
+                            info!("Anchor drift recovered, clearing safety pause reason={}", r);
+                            current_pause_reason = None;
+                            let mut g = self.state.write();
+                            if g.safety_pause_reason.as_deref().map(|s| s.starts_with("anchors:")).unwrap_or(false) {
+                                g.safety_pause_reason = None;
+                                g.is_paused = false;
+                            }
+                        }
+                    }
+                }
+                bad @ (DriftStatus::Inconsistent | DriftStatus::AllLost) => {
+                    anchor_drift_streak = anchor_drift_streak.saturating_add(1);
+                    if anchor_drift_streak == ANCHOR_DRIFT_PAUSE_TICKS {
+                        let reason = format!("anchors:drift_{}", bad.as_str());
+                        warn!(
+                            "AnchorTracker drift sostenido {} ticks ({}) — safety pause",
+                            anchor_drift_streak, bad.as_str()
+                        );
+                        current_pause_reason = Some(reason.clone());
+                        let mut g = self.state.write();
+                        g.is_paused = true;
+                        g.safety_pause_reason = Some(reason);
+                    }
+                }
+            }
 
             // ── BATTLE DEBUG (cada 100 ticks al nivel DEBUG) ──────────────────
             if tick_num.is_multiple_of(100) {

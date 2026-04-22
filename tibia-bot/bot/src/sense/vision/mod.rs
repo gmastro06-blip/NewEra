@@ -892,6 +892,14 @@ impl Vision {
         let inventory_counts = self.last_inventory_counts.clone();
         let inventory_stacks = self.last_inventory_stacks.clone();
 
+        // Drift status del tracker — poblado por `adjust_roi()` calls previos
+        // en este tick (HP, mana, battle, status, etc. todos pasan por
+        // `self.tracker.adjust_roi` que invoca `window_offset`). Si ningún
+        // `adjust_roi` corrió (p.ej. todas las ROIs son None en esta config),
+        // `drift_status()` devuelve el valor del último tick — aceptable
+        // como fallback degradado.
+        let anchor_drift = self.tracker.drift_status();
+
         Perception {
             vitals,
             battle,
@@ -910,6 +918,7 @@ impl Vision {
             game_coords,
             inventory_counts,
             inventory_stacks,
+            anchor_drift,
         }
     }
 
