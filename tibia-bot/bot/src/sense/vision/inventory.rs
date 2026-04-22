@@ -82,6 +82,22 @@ pub const MATCH_THRESHOLD: f32 = 0.80;
 /// hay "grupo" que filtrar.
 const NMS_SCORE_GAP: f32 = 0.08;
 
+/// Altura en píxeles del área del stack count en el bottom-right del slot.
+/// Usada por `strip_stack_count_corner()` para excluir esa zona del template
+/// matching y evitar que el número de unidades distorsione la correlación.
+///
+/// Tibia renderiza el stack count en bottom-right ~16×8 px (ver
+/// `inventory_ocr::OCR_AREA_W=16` y `OCR_AREA_H=8`). Stripping las últimas
+/// 8 rows del slot completo excluye el stack count Y la mitad inferior-izq
+/// del icon — pequeña pérdida de discriminación pero gran ganancia en
+/// robustness ante variación de stack count (ej. template extraído de
+/// slot con "3" no debe fallar al matchear slot con "21").
+///
+/// **Wired al matcher (Fase 1.3)**: `best_match_for_slot()` aplica el strip
+/// tanto al template como al slot antes de match. El OCR (`read_with_stacks`)
+/// usa el slot completo sin stripping.
+pub const STACK_COUNT_HEIGHT_PX: u32 = 8;
+
 struct ItemTemplate {
     name:      String,
     template:  GrayImage,
@@ -332,9 +348,35 @@ fn load_thresholds(path: &Path) -> HashMap<String, f32> {
     out
 }
 
+/// Strippea las últimas `STACK_COUNT_HEIGHT_PX` rows del bottom del slot/template.
+/// El resultado es una nueva GrayImage de width × (height - STACK_COUNT_HEIGHT_PX).
+/// Si la altura es menor o igual a STACK_COUNT_HEIGHT_PX, devuelve el slot
+/// original sin modificar (no hay nada que strippear).
+fn strip_stack_count_corner(img: &GrayImage) -> GrayImage {
+    let w = img.width();
+    let h = img.height();
+    if h <= STACK_COUNT_HEIGHT_PX {
+        return img.clone();
+    }
+    let new_h = h - STACK_COUNT_HEIGHT_PX;
+    let mut stripped = GrayImage::new(w, new_h);
+    for y in 0..new_h {
+        for x in 0..w {
+            stripped.put_pixel(x, y, *img.get_pixel(x, y));
+        }
+    }
+    stripped
+}
+
 /// Encuentra el template con mayor score para un slot dado, aplicando el
 /// threshold per-template del ganador. Devuelve `Some((score, name))` sólo
 /// si el score pasa el threshold del template ganador, o `None` si no.
+///
+/// **Stack count stripping (Fase 1.3)**: tanto el slot como cada template son
+/// strippeados de las últimas STACK_COUNT_HEIGHT_PX rows ANTES del matching.
+/// Esto evita que el número de unidades del stack distorsione la correlación
+/// (un template extraído de slot con "3" debe poder matchear un slot con "21").
+/// El OCR del stack count se hace separadamente sobre el slot completo.
 ///
 /// Nota importante: el threshold se compara contra el ganador, no contra
 /// cada candidato. Si el best_match es `dragon_ham` con threshold 0.88 y
@@ -345,16 +387,19 @@ fn best_match_for_slot(
     slot_img: &GrayImage,
     templates: &[ItemTemplate],
 ) -> Option<(f32, String)> {
+    // Strip stack count corner del slot UNA sola vez (no por template).
+    let slot_stripped = strip_stack_count_corner(slot_img);
     let mut best: Option<(f32, &str, f32)> = None;
     for tpl in templates {
-        if slot_img.width() < tpl.template.width()
-            || slot_img.height() < tpl.template.height()
+        let tpl_stripped = strip_stack_count_corner(&tpl.template);
+        if slot_stripped.width() < tpl_stripped.width()
+            || slot_stripped.height() < tpl_stripped.height()
         {
             continue;
         }
         let result = match_template(
-            slot_img,
-            &tpl.template,
+            &slot_stripped,
+            &tpl_stripped,
             MatchTemplateMethod::CrossCorrelationNormalized,
         );
         let score = result.iter().cloned().fold(f32::MIN, f32::max);
@@ -518,6 +563,45 @@ mod tests {
     fn apply_nms_empty_input_returns_empty() {
         let out = apply_nms(HashMap::new());
         assert!(out.is_empty());
+    }
+
+    // ── Stack count stripping (Fase 1.3) ──────────────────────────────
+
+    #[test]
+    fn strip_stack_count_removes_bottom_rows() {
+        // Slot 32×32 → debería quedar 32×24
+        let img = GrayImage::new(32, 32);
+        let stripped = strip_stack_count_corner(&img);
+        assert_eq!(stripped.width(), 32);
+        assert_eq!(stripped.height(), 32 - STACK_COUNT_HEIGHT_PX);
+    }
+
+    #[test]
+    fn strip_stack_count_preserves_top_pixels() {
+        // Llenar top 24 rows con valor 100, bottom 8 con 200.
+        let mut img = GrayImage::new(32, 32);
+        for y in 0..32 {
+            let v = if y < 24 { 100u8 } else { 200u8 };
+            for x in 0..32 {
+                img.put_pixel(x, y, image::Luma([v]));
+            }
+        }
+        let stripped = strip_stack_count_corner(&img);
+        // Top pixel preservado.
+        assert_eq!(stripped.get_pixel(0, 0).0[0], 100);
+        // Bottom pixel del stripped (era y=23 del original) preservado.
+        assert_eq!(stripped.get_pixel(0, 23).0[0], 100);
+    }
+
+    #[test]
+    fn strip_stack_count_too_small_returns_clone() {
+        // Si height ≤ STACK_COUNT_HEIGHT_PX (8), no se strippea.
+        let img = GrayImage::new(32, 8);
+        let stripped = strip_stack_count_corner(&img);
+        assert_eq!(stripped.height(), 8); // sin cambio
+        let img_smaller = GrayImage::new(32, 5);
+        let stripped_smaller = strip_stack_count_corner(&img_smaller);
+        assert_eq!(stripped_smaller.height(), 5);
     }
 
     #[test]
