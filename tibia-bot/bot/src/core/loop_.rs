@@ -116,6 +116,12 @@ pub struct BotLoop {
     /// Métricas runtime (histogramas + windows + ArcSwap last_tick).
     /// Compartido con HTTP server para reads lock-free.
     metrics: std::sync::Arc<crate::instrumentation::MetricsRegistry>,
+    /// HealthSystem — consume TickMetrics + MetricsRegistry, emite
+    /// HealthStatus por tick. **Sin behavior change activo todavía**:
+    /// el game loop solo publica el snapshot. La aplicación de la
+    /// degradación al FSM/Action llega en commit posterior con flag de
+    /// config (opt-in para no romper sesiones existentes).
+    health: crate::health::HealthSystem,
 }
 
 /// Umbral de ticks consecutivos sin frame NDI antes de pausar por seguridad.
@@ -219,6 +225,7 @@ impl BotLoop {
             no_frame_ticks: 0,
             perception_filter: crate::sense::filter::PerceptionFilter::new(),
             metrics: std::sync::Arc::new(crate::instrumentation::MetricsRegistry::new()),
+            health:  crate::health::HealthSystem::new(crate::health::HealthConfig::default()),
         }
     }
 
@@ -226,6 +233,12 @@ impl BotLoop {
     /// llamar a `spawn()` para pasarlo al AppState del HTTP server.
     pub fn metrics_handle(&self) -> std::sync::Arc<crate::instrumentation::MetricsRegistry> {
         std::sync::Arc::clone(&self.metrics)
+    }
+
+    /// Handle al HealthSystem output (ArcSwap<HealthStatus>). HTTP read
+    /// lock-free. main.rs lo agarra antes de spawn() para AppState.
+    pub fn health_handle(&self) -> std::sync::Arc<arc_swap::ArcSwap<crate::health::HealthStatus>> {
+        self.health.output_handle()
     }
 
     /// Lanza el game loop en un thread dedicado. No retorna.
@@ -1516,6 +1529,22 @@ impl BotLoop {
                     flags,
                 };
                 self.metrics.record_tick(m);
+
+                // ── HealthSystem evaluate ─────────────────────────────────
+                // Consume el TickMetrics que acabamos de publicar +
+                // MetricsRegistry (windows, action_success_rate) + extras
+                // que viven en el game loop (anchor_drift_streak).
+                // Publica HealthStatus via ArcSwap para HTTP/FSM reads
+                // lock-free.
+                //
+                // **NO afecta behavior todavia** — solo publica diagnóstico.
+                // Wire de degradation al FSM/Action gate llega en commit
+                // siguiente con flag config opt-in.
+                let extras = crate::health::system::ExtraInputs {
+                    anchor_drift_streak,
+                    bridge_rtt_ms: None, // TODO: wire bridge ack hook
+                };
+                let _health_status = self.health.evaluate_tick(&m, &self.metrics, extras);
             }
 
             // ── SLEEP hasta el próximo deadline ───────────────────────────────

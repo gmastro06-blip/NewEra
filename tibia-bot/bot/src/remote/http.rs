@@ -52,6 +52,8 @@ pub struct AppState {
     pub loop_tx:     Sender<LoopCommand>,
     /// Métricas runtime (histogramas + ArcSwap last_tick). Lectura lock-free.
     pub metrics:     Arc<crate::instrumentation::MetricsRegistry>,
+    /// HealthSystem snapshot (ArcSwap<HealthStatus>). Lectura lock-free.
+    pub health:      Arc<arc_swap::ArcSwap<crate::health::HealthStatus>>,
 }
 
 /// Construye el Router de axum con todos los endpoints registrados.
@@ -115,6 +117,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/instrumentation/start_recording",  post(handle_instr_start_recording))
         .route("/instrumentation/stop_recording",   post(handle_instr_stop_recording))
         .route("/instrumentation/recording_status", get(handle_instr_recording_status))
+        .route("/health/detailed",                  get(handle_health_detailed))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         // V-007 mitigation: stealth_mode hide debug endpoints.
         .layer(axum::middleware::from_fn_with_state(state.clone(), stealth_middleware))
@@ -2361,6 +2364,17 @@ async fn handle_instr_recording_status(State(s): State<AppState>)
     Json(s.metrics.recording_status())
 }
 
+/// GET /health/detailed
+/// HealthStatus completo del último tick — overall severity, score,
+/// degradation level (sticky), issues activos con contexto numérico.
+/// Lock-free vía ArcSwap. Distinto de `/health` (legacy liveness check
+/// 200/503 + HealthDetails) que se preserva para compat con uptime tools.
+async fn handle_health_detailed(State(s): State<AppState>)
+    -> Json<crate::health::HealthStatus>
+{
+    Json((*s.health.load_full()).clone())
+}
+
 async fn handle_instr_windows(State(s): State<AppState>) -> Json<WindowsResponse> {
     use std::sync::atomic::Ordering;
     let r = &s.metrics;
@@ -2684,6 +2698,9 @@ mod tests {
             calibration,
             loop_tx,
             metrics: Arc::new(crate::instrumentation::MetricsRegistry::new()),
+            health: Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::health::HealthStatus::default()
+            )),
         }
     }
 
@@ -2952,6 +2969,53 @@ mod tests {
         // FPS measured ≈ 1e6 / 33000 ≈ 30
         let fps = v["measured_fps"].as_f64().unwrap();
         assert!(fps > 29.0 && fps < 31.0, "fps={}", fps);
+    }
+
+    #[tokio::test]
+    async fn get_health_detailed_returns_default_when_no_evaluation() {
+        let state = test_state().await;
+        let app = build_router(state);
+        let (status, body) = get(app, "/health/detailed").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        // Default HealthStatus → ok severity, no degraded, empty issues.
+        assert_eq!(v["overall"], "ok");
+        assert_eq!(v["score"], 0);
+        assert!(v["degraded"].is_null());
+        assert!(v["issues"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_health_detailed_reflects_published_state() {
+        let state = test_state().await;
+        // Simular publicación de un HealthStatus distinto.
+        let new_status = crate::health::HealthStatus {
+            overall: crate::health::Severity::Warning,
+            score: 3,
+            degraded: Some(crate::health::DegradationLevel::Light),
+            issues: vec![crate::health::HealthIssue::TickOverrun {
+                tick_ms: 50, budget_ms: 33,
+                severity: crate::health::Severity::Warning,
+            }],
+            summary: "warning (score=3, degraded=light, issues=[tick_overrun])".to_string(),
+            tick: 1234,
+            frame_seq: 1234,
+            generated_at_ms: 1745347291000,
+        };
+        state.health.store(Arc::new(new_status));
+
+        let app = build_router(state);
+        let (status, body) = get(app, "/health/detailed").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(v["overall"], "warning");
+        assert_eq!(v["score"], 3);
+        assert_eq!(v["degraded"], "light");
+        assert_eq!(v["tick"], 1234);
+        let issues = v["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0]["kind"], "tick_overrun");
+        assert_eq!(issues[0]["tick_ms"], 50);
     }
 
     #[tokio::test]

@@ -231,6 +231,7 @@ async fn main() -> Result<()> {
         loop_rx,
     );
     let metrics_handle = bot_loop.metrics_handle();
+    let health_handle  = bot_loop.health_handle();
 
     // ── 10. HTTP server ─────────────────────────────────────────────────────
     let app_state = AppState {
@@ -241,6 +242,7 @@ async fn main() -> Result<()> {
         calibration: Arc::clone(&calibration),
         loop_tx:     loop_tx.clone(),
         metrics:     metrics_handle,
+        health:      health_handle,
     };
 
     tokio::spawn(async move {
