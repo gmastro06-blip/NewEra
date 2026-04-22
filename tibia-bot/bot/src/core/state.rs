@@ -237,6 +237,23 @@ pub struct GameState {
     pub dataset_crops_total: u64,
     /// Path del directorio donde se está escribiendo el dataset (vacío si inactive).
     pub dataset_dir:         String,
+
+    // ── Region monitor diagnostics (Fase 1.5 wire) ──────────────────────
+    /// Último resultado de `RegionMonitor::tick()` publicado por el game loop.
+    /// Cada entry es un snapshot del cambio detectado en una región registrada.
+    /// Vacío si region monitor no está inicializado o no ha corrido aún.
+    /// Visible vía `GET /vision/region_monitor`.
+    pub region_monitor_diffs: Vec<RegionMonitorEntry>,
+}
+
+/// Snapshot serializable de `RegionDiff` para publicar en SharedState.
+/// Equivalente al struct interno pero sin lifetimes y con Default + Serialize.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RegionMonitorEntry {
+    pub name:            String,
+    pub change_ratio:    f32,
+    pub above_threshold: bool,
+    pub first_tick:      bool,
 }
 
 /// Alias conveniente — todo el código usa este tipo.

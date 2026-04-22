@@ -105,6 +105,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/dataset/start",         post(handle_dataset_start))
         .route("/dataset/stop",          post(handle_dataset_stop))
         .route("/dataset/status",        get(handle_dataset_status))
+        .route("/vision/region_monitor", get(handle_region_monitor))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         // V-007 mitigation: stealth_mode hide debug endpoints.
         .layer(axum::middleware::from_fn_with_state(state.clone(), stealth_middleware))
@@ -2093,6 +2094,25 @@ async fn handle_dataset_status(State(s): State<AppState>) -> Json<DatasetStatus>
         crops_total: g.dataset_crops_total,
         dir:         g.dataset_dir.clone(),
     })
+}
+
+// ── /vision/region_monitor (Fase 1.5 wire) ───────────────────────────────────
+//
+// Devuelve los últimos diffs por región monitoreada. Útil para diagnosticar
+// "cuánto cambió la battle list/minimap/viewport entre frames consecutivos".
+// Las regiones se inicializan en BotLoop::new() con los ROIs del calibration:
+// battle_list, minimap, viewport (si están definidos).
+//
+//   curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/vision/region_monitor
+//   → [{"name":"battle_list","change_ratio":0.012,"above_threshold":false,"first_tick":false},
+//      {"name":"minimap","change_ratio":0.003,"above_threshold":false,"first_tick":false},
+//      {"name":"viewport","change_ratio":0.087,"above_threshold":false,"first_tick":false}]
+
+async fn handle_region_monitor(State(s): State<AppState>)
+    -> Json<Vec<crate::core::state::RegionMonitorEntry>>
+{
+    let g = s.game_state.read();
+    Json(g.region_monitor_diffs.clone())
 }
 
 fn send_cmd(s: &AppState, cmd: LoopCommand, name: &str) -> Json<CommandAck> {

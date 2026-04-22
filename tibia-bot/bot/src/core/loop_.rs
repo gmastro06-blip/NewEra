@@ -100,6 +100,9 @@ pub struct BotLoop {
     recorder: Option<crate::sense::recorder::PerceptionRecorder>,
     /// Capture opcional de crops de inventory para training ML (Fase 2.2).
     dataset_recorder: Option<crate::sense::dataset_recorder::DatasetRecorder>,
+    /// Monitor de cambios per-región (Fase 1.5 wire). Inicializado en `new()`
+    /// con regiones del calibration. Tick cada frame, publica diffs en state.
+    region_monitor: crate::sense::vision::region_monitor::RegionMonitor,
     /// Contador consecutivo de ticks sin frame NDI (watchdog de visión).
     /// Se resetea a 0 cuando llega un frame. Cuando supera
     /// `NO_FRAME_PAUSE_TICKS` se dispara una safety pause y se vuelve a 0
@@ -183,6 +186,20 @@ impl BotLoop {
             None
         };
 
+        // ── Region monitor (Fase 1.5 wire) ──────────────────────────────
+        // Inicializa con 3 regiones útiles: battle_list, minimap, viewport.
+        // Threshold conservador (0.05) — captura cambios visibles sin spam.
+        let mut region_monitor = crate::sense::vision::region_monitor::RegionMonitor::new();
+        if let Some(roi) = vision.calibration.battle_list {
+            region_monitor.add_region("battle_list", roi, 0.05);
+        }
+        if let Some(roi) = vision.calibration.minimap {
+            region_monitor.add_region("minimap", roi, 0.05);
+        }
+        if let Some(roi) = vision.calibration.game_viewport {
+            region_monitor.add_region("viewport", roi, 0.10);
+        }
+
         Self {
             config, hotkeys, state, buffer, actuator, rt_handle, vision,
             commands, waypoints, waypoints_enabled, script_dir,
@@ -190,6 +207,7 @@ impl BotLoop {
             cavebot_enabled,
             recorder,
             dataset_recorder: None,
+            region_monitor,
             no_frame_ticks: 0,
         }
     }
@@ -1285,6 +1303,19 @@ impl BotLoop {
                             g.dataset_crops_total += written as u64;
                         }
                     }
+                }
+                // Fase 1.5 wire: region monitor diagnóstico genérico.
+                // Captura snapshot por región registrada y publica diffs.
+                if let Some(frame) = (*frame_arc).as_ref() {
+                    let diffs = self.region_monitor.tick(frame, tick_num);
+                    g.region_monitor_diffs = diffs.into_iter()
+                        .map(|d| crate::core::state::RegionMonitorEntry {
+                            name:            d.name,
+                            change_ratio:    d.change_ratio,
+                            above_threshold: d.above_threshold,
+                            first_tick:      d.first_tick,
+                        })
+                        .collect();
                 }
                 g.last_perception = Some(perception);
 
