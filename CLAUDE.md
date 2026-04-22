@@ -824,7 +824,74 @@ See `assets/waypoints/example.toml` for a working example. Steps are loaded at s
 - **Party invites / player trade requests**: dismissable popups, resolved with ESC.
 - **Market window**: modal but only relevant if the bot uses Market features (not in MVP).
 
-When a prompt is detected the FSM force-pauses with `safety_pause_reason = "prompt:<kind>"`. The bot **never auto-responds** to prompts — that would be detectable. The operator must resolve manually.
+When a prompt is detected the FSM force-pauses with `safety_pause_reason = "prompt:<kind>"`. The bot **never auto-responds** to prompts — que sería detectable. El operador resuelve manual.
 
 Templates live in `assets/templates/prompts/` (login.png, char_select.png, npc_trade.png) and are user-provided. Without templates the detector is no-op.
+
+## Tareas pendientes — backlog priorizado
+
+Actualizado 2026-04-22. Aplicar regla del **tercer ojo** al cerrar cualquier item:
+separar mecánico verificado vs no testeado. Marcar explícitamente qué pide
+sesión live (restricción actual: no live hasta recuperar confianza — ver
+`feedback_no_live_until_trust.md`).
+
+### Top-3 audit profesional — LANDED (commits verificables)
+
+| # | Commit | Tests | Validación live |
+|---|--------|-------|-----------------|
+| #3 Template density validator | `2c2afb7` | 5/5 `template_density_*` | ❌ no testeado live |
+| #2 Dataset bg writer thread | `8ac9d1d` | 9/9 `dataset_recorder::*` (incl. backpressure) | ❌ no testeado live |
+| #1 Anchors consenso + DriftStatus → FSM | `6cbbaa0` | 16/16 `anchors::*` | ❌ flanco Ok→Inconsistent→Ok no validado con Tibia redibujando UI |
+
+### Deuda técnica priorizada (sin live)
+
+1. **bincode → postcard migration** (advertencia `bincode` unmaintained).
+   - `assets/map_index.bin` y `assets/walkability.bin` se generan con bincode.
+   - Postcard es no-std friendly + mantenido. Migración: cambiar derive macros,
+     actualizar `build_map_index` para escribir formato nuevo, cargar ambos
+     formatos temporalmente para compat.
+   - Riesgo: reconstruir index (~5s) + walkability (~230 MB). Bajo.
+
+2. **HPA* / waypoints intermedios** para 4 hunts con pathfinding fallando:
+   - `orcs_thais`, `minos_plains`, `water_elementals`, `asura_palace`.
+   - A* actual sobre walkability grid diverge o tarda >10s en estos mapas.
+   - Opciones: HPA* (hierarchical), waypoints explícitos en el cavebot que
+     corten el path en segmentos <200 tiles, o heurística mejorada.
+
+3. **Tests flakeys pre-existentes** (no bloqueantes, no introducidos por audit):
+   - `sense::vision::inventory::tests::read_with_realistic_load_under_budget` —
+     overflow aritmético en `bot/src/sense/vision/inventory.rs:928`.
+     Confirmado presente en HEAD limpio vía `git stash`.
+   - `sense::vision::minimap::tests::displacement_107x110_under_5ms` —
+     budget 5ms machine-dependent (mi máquina: 7ms debug). Subir a 10ms o
+     marcar `#[ignore]` con label `perf`.
+
+4. **Co-Authored-By trailer backfill** (destructivo, necesita permiso explícito).
+   - Commits viejos sin trailer. Requiere `git rebase -i` → riesgo de rewrite
+     del history público. Solo si el usuario pide expresamente.
+
+### Bloqueado por sesión live (no avanzar offline)
+
+- **Validación Anchor drift en runtime real** (#1 del audit):
+  - Histéresis 5 ticks ≈165ms empíricamente apropiada? Solo medible con Tibia
+    redibujando UI (ej. resize window, minimize/restore).
+  - Los unit tests cubren la lógica del tracker, NO el comportamiento
+    end-to-end del FSM cuando recibe `anchors:drift_inconsistent`.
+
+- **Validación Dataset bg writer backpressure**:
+  - Canal `CHANNEL_CAPACITY=256` es suficiente @ 30 Hz? Unit test prueba
+    try_send con canal lleno; no prueba el comportamiento bajo disk I/O
+    lento real (SSD congestionado, HDD mecánico, red SMB, etc.).
+
+- **Validación ML inventory classifier** (Fase 2.5):
+  - `feature = "ml-runtime"` compila, pero el modelo ONNX no existe.
+    Necesita workflow dataset → label → train completo con sesión live
+    hunt de 30+ min para crops diversos.
+
+### Reglas al agregar entries
+
+- Cada item lleva label `mecánico verificado` / `requiere live` / `inventado`.
+- No prometer ETAs (proyecto hobbyista, cadencia no garantizada).
+- Commits referenciados por hash corto — si no hay commit todavía, no afirmar
+  que "está implementado".
 
