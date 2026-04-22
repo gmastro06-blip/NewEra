@@ -24,19 +24,30 @@
 //!    cada crop al usuario, agrega columna `label` con la clase asignada.
 //! 5. Entrenar: dataset etiquetado → YOLOv8-cls → ONNX export.
 //!
-//! ## Diseño
+//! ## Diseño (post-auditoría 2026-04-20)
 //!
-//! - **Sincrónico**: corre en game loop thread, escribe directamente a disco.
-//!   PNG encoding ~1-3ms por crop 32×32. 16 slots × ~2ms = 32ms — por eso
-//!   el `interval_ticks` default es 15 (cada ~500ms a 30 Hz).
-//! - **Append-safe**: si `dir/manifest.csv` existe, append. Resuma sesión
-//!   anterior en vez de pisar.
-//! - **Errores silenciosos**: si disco lleno o IO falla, loggea warn y
-//!   se desactiva. No mata el tick loop.
+//! **Background writer thread** (Fase auditoría #2):
+//! - `capture()` en el game loop thread extrae los BGRA bytes (cheap, ~0.5 ms
+//!   por crop 32×32) y envía un `CropJob` al channel.
+//! - `writer_thread` consume del channel: PNG encode (~1-3 ms) + escritura
+//!   a disco (depende del FS cache). Estas operaciones ya no bloquean el tick.
+//! - Channel bounded (`CHANNEL_CAPACITY=256`): si el writer se atrasa (disco
+//!   lento, flush OS), el main thread incrementa `dropped_crops` counter con
+//!   `try_send` en vez de bloquear. Safer: preferimos perder algunos crops
+//!   (dataset aún large) a overrun del tick loop.
+//! - Manifest CSV se escribe también desde el writer thread para mantener
+//!   atomicidad filename-en-manifest ↔ filename-en-disco.
+//! - `Drop` del `DatasetRecorder`: dropea el Sender, lo que cierra el
+//!   channel. El writer thread termina su loop naturalmente (recv → Err) y
+//!   flushea manifest antes de exit. `join()` esperado por el caller.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use image::{ImageBuffer, Luma, Rgb};
@@ -45,7 +56,26 @@ use crate::sense::frame_buffer::Frame;
 use crate::sense::vision::calibration::RoiDef;
 use crate::sense::vision::crop::{crop_bgra, Roi};
 
-/// Recorder de crops de inventory slots para dataset ML.
+/// Capacidad del channel game_loop → writer_thread. Si el writer se queda
+/// atrás, `try_send` falla con Full y se incrementa `dropped_crops`.
+/// 256 ≈ 16 slots × 16 ticks de buffer, cubre un spike corto del disco.
+const CHANNEL_CAPACITY: usize = 256;
+
+/// Job enviado al writer thread con los BGRA bytes + metadata para
+/// escribir un crop PNG + una fila del manifest.
+struct CropJob {
+    filename:    String,
+    bgra:        Vec<u8>,
+    width:       u32,
+    height:      u32,
+    tick:        u64,
+    slot_index:  u32,
+    frame_id:    u64,
+    captured_ms: u64,
+    tag:         String,
+}
+
+/// Recorder de crops de inventory slots para dataset ML (background writer).
 pub struct DatasetRecorder {
     /// Directorio raíz del dataset (contendrá manifest.csv + crops/).
     output_dir:     PathBuf,
@@ -55,20 +85,25 @@ pub struct DatasetRecorder {
     interval_ticks: u32,
     /// Etiqueta opcional para el manifest (ej. "abdendriel_wasps_session").
     tag:            String,
-    /// Manifest CSV writer (BufWriter sobre File).
-    manifest:       Option<BufWriter<File>>,
+    /// Channel tx hacia writer_thread. `None` si recorder inhábil.
+    tx:             Option<SyncSender<CropJob>>,
+    /// Handle del writer thread para join en Drop.
+    worker:         Option<JoinHandle<()>>,
+    /// Contador atómico de crops escritos (actualizado por writer thread,
+    /// leído por main via `total_crops()`).
+    written_counter: Arc<AtomicU64>,
+    /// Contador de jobs que no cupieron en el channel (disco lento).
+    dropped_counter: Arc<AtomicU64>,
     /// Contador secuencial de ticks capturados (para nombre del PNG).
     seq:            u64,
-    /// Total crops escritos.
-    total_crops:    u64,
     /// Último tick procesado (para respetar interval).
     last_tick:      Option<u64>,
 }
 
 impl DatasetRecorder {
-    /// Crea un recorder. Genera `output_dir/crops/` si no existe.
-    /// El manifest se abre en append mode. Si falla creación de dirs o file,
-    /// el recorder queda inhábil (`is_enabled() = false`).
+    /// Crea un recorder. Genera `output_dir/crops/` + spawnea writer thread.
+    /// Si falla creación de dirs o file, el recorder queda inhábil
+    /// (`is_enabled() = false`) y el thread no se spawnea.
     pub fn new(
         output_dir:     PathBuf,
         slots:          Vec<RoiDef>,
@@ -76,14 +111,18 @@ impl DatasetRecorder {
         tag:            String,
     ) -> Self {
         let interval = interval_ticks.max(1);
+        let written_counter = Arc::new(AtomicU64::new(0));
+        let dropped_counter = Arc::new(AtomicU64::new(0));
         let mut recorder = Self {
             output_dir: output_dir.clone(),
             slots,
             interval_ticks: interval,
-            tag,
-            manifest: None,
+            tag: tag.clone(),
+            tx: None,
+            worker: None,
+            written_counter: Arc::clone(&written_counter),
+            dropped_counter: Arc::clone(&dropped_counter),
             seq: 0,
-            total_crops: 0,
             last_tick: None,
         };
         if let Err(e) = std::fs::create_dir_all(output_dir.join("crops")) {
@@ -95,7 +134,7 @@ impl DatasetRecorder {
         }
         let manifest_path = output_dir.join("manifest.csv");
         let was_new = !manifest_path.exists();
-        match OpenOptions::new()
+        let manifest = match OpenOptions::new()
             .create(true)
             .append(true)
             .open(&manifest_path)
@@ -107,36 +146,86 @@ impl DatasetRecorder {
                     let _ = writeln!(w,
                         "filename,tick,slot_index,frame_id,captured_at_unix_ms,tag,label");
                 }
-                tracing::info!(
-                    "DatasetRecorder: capturando a '{}' (interval={} ticks, tag='{}', {} slots)",
-                    output_dir.display(), interval, recorder.tag, recorder.slots.len()
-                );
-                recorder.manifest = Some(w);
+                w
             }
             Err(e) => {
                 tracing::warn!(
                     "DatasetRecorder: no se pudo abrir manifest.csv '{}': {}",
                     manifest_path.display(), e
                 );
+                return recorder;
             }
-        }
+        };
+
+        // Spawn writer thread. Posee el manifest BufWriter y el output_dir.
+        let (tx, rx) = sync_channel::<CropJob>(CHANNEL_CAPACITY);
+        let crops_dir = output_dir.join("crops");
+        let written = Arc::clone(&written_counter);
+        let worker = std::thread::Builder::new()
+            .name("dataset-writer".into())
+            .spawn(move || {
+                let mut manifest = manifest;
+                let mut jobs_since_flush = 0u32;
+                while let Ok(job) = rx.recv() {
+                    let path = crops_dir.join(&job.filename);
+                    if let Err(e) = save_bgra_as_png(&job.bgra, job.width, job.height, &path) {
+                        tracing::warn!(
+                            "dataset-writer: falló guardar {}: {}", job.filename, e
+                        );
+                        continue;
+                    }
+                    let _ = writeln!(
+                        manifest,
+                        "{},{},{},{},{},{},",
+                        job.filename, job.tick, job.slot_index, job.frame_id,
+                        job.captured_ms, job.tag,
+                    );
+                    written.fetch_add(1, Ordering::Relaxed);
+                    jobs_since_flush += 1;
+                    if jobs_since_flush >= 30 {
+                        let _ = manifest.flush();
+                        jobs_since_flush = 0;
+                    }
+                }
+                // Channel closed: flush final.
+                let _ = manifest.flush();
+                tracing::info!("dataset-writer: exit limpio, manifest flusheado");
+            })
+            .expect("spawn dataset-writer thread");
+
+        tracing::info!(
+            "DatasetRecorder: capturando a '{}' (interval={} ticks, tag='{}', \
+             {} slots, channel cap={}, background writer)",
+            output_dir.display(), interval, tag, recorder.slots.len(), CHANNEL_CAPACITY
+        );
+        recorder.tx = Some(tx);
+        recorder.worker = Some(worker);
         recorder
     }
 
     /// `true` si el recorder está activo y puede grabar.
     pub fn is_enabled(&self) -> bool {
-        self.manifest.is_some() && !self.slots.is_empty()
+        self.tx.is_some() && !self.slots.is_empty()
     }
 
-    /// Total de crops escritos hasta ahora.
+    /// Total de crops escritos a disco hasta ahora (actualizado por writer).
     #[allow(dead_code)]
     pub fn total_crops(&self) -> u64 {
-        self.total_crops
+        self.written_counter.load(Ordering::Relaxed)
     }
 
-    /// Procesa un frame en el tick dado. Captura cada slot como PNG y agrega
-    /// entrada al manifest. Respeta `interval_ticks`.
-    /// Devuelve número de crops escritos en este tick.
+    /// Total de jobs droppeados por channel full (disco lento / overrun).
+    /// Útil para observar backpressure: si sube, el disco no da abasto.
+    #[allow(dead_code)]
+    pub fn dropped_crops(&self) -> u64 {
+        self.dropped_counter.load(Ordering::Relaxed)
+    }
+
+    /// Procesa un frame en el tick dado. Extrae los BGRA de cada slot en el
+    /// thread actual (cheap) y envía jobs al writer thread.
+    /// Respeta `interval_ticks`.
+    /// Devuelve número de jobs enqueued en este tick (no el # escritos, que
+    /// se cuenta asíncronamente via `total_crops()`).
     pub fn capture(&mut self, frame: &Frame, tick: u64, frame_id: u64) -> u32 {
         if !self.is_enabled() {
             return 0;
@@ -147,58 +236,66 @@ impl DatasetRecorder {
                 return 0;
             }
         }
-        let mut written = 0u32;
+        let Some(tx) = self.tx.as_ref() else { return 0; };
+        let mut enqueued = 0u32;
         let captured_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let crops_dir = self.output_dir.join("crops");
         for (slot_idx, slot) in self.slots.iter().enumerate() {
             let Some(bgra) = crop_bgra(frame, Roi::new(slot.x, slot.y, slot.w, slot.h)) else {
                 continue;
             };
             let filename = format!("{:04}_t{:06}_s{:02}.png", self.seq, tick, slot_idx);
-            let path = crops_dir.join(&filename);
-            if let Err(e) = save_bgra_as_png(&bgra, slot.w, slot.h, &path) {
-                tracing::warn!(
-                    "DatasetRecorder: falló guardar {}: {}", filename, e
-                );
-                continue;
-            }
-            // Manifest entry: label vacío inicialmente, lo agrega tool de etiquetado.
-            if let Some(w) = self.manifest.as_mut() {
-                let _ = writeln!(w,
-                    "{},{},{},{},{},{},",
-                    filename, tick, slot_idx, frame_id, captured_ms, self.tag
-                );
-            }
-            written += 1;
-        }
-        if written > 0 {
-            self.total_crops += written as u64;
-            self.seq += 1;
-            // Flush periódicamente (cada 30 capturas).
-            if self.seq % 30 == 0 {
-                if let Some(w) = self.manifest.as_mut() {
-                    let _ = w.flush();
+            let job = CropJob {
+                filename,
+                bgra,
+                width:       slot.w,
+                height:      slot.h,
+                tick,
+                slot_index:  slot_idx as u32,
+                frame_id,
+                captured_ms,
+                tag:         self.tag.clone(),
+            };
+            match tx.try_send(job) {
+                Ok(()) => { enqueued += 1; }
+                Err(TrySendError::Full(_)) => {
+                    // Backpressure: disco o writer no da abasto. Drop silent
+                    // pero contamos para observabilidad. No bloqueamos tick.
+                    self.dropped_counter.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    // Writer thread crasheó. Desactivar recorder.
+                    tracing::warn!("DatasetRecorder: writer thread disconnected");
+                    self.tx = None;
+                    break;
                 }
             }
         }
+        if enqueued > 0 {
+            self.seq += 1;
+        }
         self.last_tick = Some(tick);
-        written
+        enqueued
     }
 
-    /// Flushea el manifest writer. Llamar antes de stop o al cerrar.
+    /// Flushea el writer thread. NO-OP externally — el flush periódico
+    /// sucede en el worker cada 30 jobs + en Drop. Mantener función por
+    /// compat con callers que la esperan.
+    #[allow(dead_code)]
     pub fn flush(&mut self) {
-        if let Some(w) = self.manifest.as_mut() {
-            let _ = w.flush();
-        }
+        // Best-effort: worker hace flush cada 30 jobs + on disconnect/drop.
     }
 }
 
 impl Drop for DatasetRecorder {
     fn drop(&mut self) {
-        self.flush();
+        // Cerrar channel: tx dropped → writer sale del recv loop y flushea manifest.
+        self.tx.take();
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -252,6 +349,19 @@ mod tests {
         std::env::temp_dir().join(format!("dataset_test_{}_{}", suffix, n))
     }
 
+    /// Espera hasta N ms a que el writer thread haya persistido >= expected
+    /// jobs (counter atómico). Permite tests deterministas sin sleep fijo.
+    fn wait_for_writes(recorder: &DatasetRecorder, expected: u64, timeout_ms: u64) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(timeout_ms) {
+            if recorder.total_crops() >= expected {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
     #[test]
     fn recorder_creates_directories_and_manifest() {
         let dir = unique_test_dir("creates_dirs");
@@ -260,6 +370,7 @@ mod tests {
         assert!(r.is_enabled());
         assert!(dir.join("crops").exists());
         assert!(dir.join("manifest.csv").exists());
+        drop(r);  // espera writer thread
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -275,6 +386,7 @@ mod tests {
             assert_eq!(r.capture(&frame, t, t), 0, "tick {} debe skip", t);
         }
         assert_eq!(r.capture(&frame, 5, 5), 1);
+        drop(r);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -288,12 +400,15 @@ mod tests {
         ];
         let mut r = DatasetRecorder::new(dir.clone(), slots, 1, "multi".into());
         let frame = make_test_frame(20, 20, 200);
-        let written = r.capture(&frame, 100, 50);
-        assert_eq!(written, 3);
+        let enqueued = r.capture(&frame, 100, 50);
+        assert_eq!(enqueued, 3);
+        // Esperar que el writer thread persista.
+        assert!(wait_for_writes(&r, 3, 500), "writer thread no persistió 3 crops en 500ms");
         // Verificar que existen los 3 PNGs.
         let crops_dir = dir.join("crops");
         let entries: Vec<_> = std::fs::read_dir(&crops_dir).unwrap().collect();
         assert_eq!(entries.len(), 3);
+        drop(r);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -306,9 +421,10 @@ mod tests {
         ];
         let mut r = DatasetRecorder::new(dir.clone(), slots, 1, "oob".into());
         let frame = make_test_frame(20, 20, 100);
-        let written = r.capture(&frame, 1, 1);
-        // Solo el primer slot fits → 1 crop escrito.
-        assert_eq!(written, 1);
+        let enqueued = r.capture(&frame, 1, 1);
+        // Solo el primer slot fits → 1 job enqueued.
+        assert_eq!(enqueued, 1);
+        drop(r);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -321,6 +437,7 @@ mod tests {
             let mut r = DatasetRecorder::new(dir.clone(), slots.clone(), 1, "s1".into());
             let frame = make_test_frame(20, 20, 100);
             r.capture(&frame, 1, 1);
+            // drop dispara join + flush
         }
         // Sesión 2: append, no overwrite
         {
@@ -370,7 +487,9 @@ mod tests {
         let mut r = DatasetRecorder::new(dir.clone(), slots, 1, "test_tag".into());
         let frame = make_test_frame(20, 20, 100);
         r.capture(&frame, 42, 7);
-        r.flush();
+        // Esperar writer.
+        assert!(wait_for_writes(&r, 1, 500));
+        drop(r);  // force flush via join
         let content = std::fs::read_to_string(dir.join("manifest.csv")).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines[0], "filename,tick,slot_index,frame_id,captured_at_unix_ms,tag,label");
@@ -384,6 +503,28 @@ mod tests {
         assert!(cols[4].parse::<u64>().is_ok());    // captured_ms
         assert_eq!(cols[5], "test_tag");            // tag
         assert_eq!(cols[6], "");                    // label vacío
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn capture_does_not_block_on_channel_full() {
+        // Sanity check: 16 slots × 20 ticks = 320 jobs > CHANNEL_CAPACITY (256).
+        // capture() debe retornar inmediato, jobs en exceso se cuentan como
+        // droppeados sin bloquear el tick.
+        let dir = unique_test_dir("backpressure");
+        let slots: Vec<RoiDef> = (0..16).map(|i| RoiDef::new(i * 10, 0, 8, 8)).collect();
+        let mut r = DatasetRecorder::new(dir.clone(), slots, 1, "bp".into());
+        let frame = make_test_frame(200, 20, 128);
+        let start = std::time::Instant::now();
+        for t in 0..20 {
+            r.capture(&frame, t, t);
+        }
+        let elapsed = start.elapsed();
+        // 20 ticks × 16 slots = 320 iteraciones. Cada try_send + crop_bgra debería
+        // ser <500µs → total <100ms (generoso). Sin bloqueo, idealmente <20ms.
+        assert!(elapsed < std::time::Duration::from_millis(500),
+            "capture bloqueó por {}ms — esperado <500ms", elapsed.as_millis());
+        drop(r);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
