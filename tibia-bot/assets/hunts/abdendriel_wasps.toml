@@ -23,16 +23,15 @@ vocation       = "druid"  # druid | knight | paladin | sorcerer
 # Loot (corregido 2026-04-17 con datos del usuario)
 # ─────────────────────────────────────────────────────────────────────
 [loot]
-# Main drop: honeycomb (confirmado por user).
-# Gold coins siempre se stashean.
-# Mana potions quedan del refill si sobran.
+# Drops wiki-validated 2026-04-20: Wasp dropea SOLO Honeycomb (rare ~1.5%).
+# NO dropea gold_coin ni mana_potion. mana_potion era supply (refill), no loot
+# — movido fuera de [loot]. Si hay otros mobs en spawn (Bug, etc.) sus drops
+# adicionales se acumulan automáticamente.
 stackables = [
-    "gold_coin",
-    "honeycomb",           # drop principal de wasps
-    "mana_potion",         # compradas en refill, si sobra se stashea
+    "honeycomb",           # único drop de Wasp según wiki
 ]
 
-# Non-stackables: quedan en el bag o depot chest. Raros.
+# Non-stackables: Wasp no tiene non-stackable drops según wiki.
 non_stackables = []
 
 # Items que el bot SIEMPRE descarta (trash sin espacio).

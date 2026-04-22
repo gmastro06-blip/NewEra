@@ -7,17 +7,43 @@ level_range = [12, 22]
 vocation    = "any"
 
 [loot]
+# Drops wiki-validated 2026-04-20 (Minotaur + Mage + Archer + Guard).
+# Removidos: bread (no drop), arrow (no drop — archer dropea bolt/piercing_bolt),
+# brass_armor (no drop — el real es brass_helmet del Minotaur), chain_helmet
+# (no drop — chain_armor sí), short_sword (no drop).
 stackables = [
     "gold_coin",
-    "minotaur_leather",
     "meat",
-    "bread",
-    "arrow",   # drop de minotaur_archer
+    "minotaur_leather",     # all minotaurs (template ✓)
+    "carrot",               # Minotaur Mage — no template
+    "mana_potion",          # Minotaur Mage (template ✓)
+    "health_potion",        # Minotaur Guard (template ✓)
+    "bolt",                 # Minotaur Archer — no template
+    "piercing_bolt",        # Minotaur Archer — no template (rare)
 ]
 non_stackables = [
-    "brass_armor",
-    "chain_helmet",
-    "short_sword",
+    "axe",                  # Minotaur — no template
+    "mace",                 # Minotaur — no template
+    "sword",                # Minotaur — no template
+    "shovel",               # Minotaur (template ✓)
+    "brass_helmet",         # Minotaur — no template
+    "chain_armor",          # Minotaur + Guard — no template
+    "plate_shield",         # Minotaur — no template
+    "bronze_amulet",        # Minotaur — no template
+    "leather_helmet",       # Minotaur Mage — no template
+    "leather_legs",         # Minotaur Mage — no template
+    "purple_robe",          # Minotaur Mage — no template
+    "taurus_mace",          # Minotaur Mage — no template (raro)
+    "wand_of_cosmic_energy",# Minotaur Mage — no template
+    "torch",                # Minotaur Mage — no template
+    "brass_armor",          # Minotaur Archer — no template (NOT minotaur normal)
+    "scale_armor",          # Minotaur Archer — no template
+    "crossbow",             # Minotaur Archer — no template
+    "broken_crossbow",      # Minotaur Archer — no template (raro)
+    "battle_shield",        # Minotaur Guard — no template
+    "double_axe",           # Minotaur Guard — no template
+    "minotaur_horn",        # all minotaurs — no template (trophy)
+    "minotaur_trophy",      # Minotaur Guard — no template (raro)
 ]
 drop = []
 

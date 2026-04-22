@@ -7,18 +7,39 @@ level_range = [40, 55]
 vocation    = "any"
 
 [loot]
+# Drops wiki-validated 2026-04-20 (Hero + Valkyrie + Dwarf Geomancer + Dwarf Guard).
+# Removidos platinum_coin (NO drop), knight_armor/knight_legs/warrior_helmet
+# (eran inventos — Hero dropea CROWN line, no Knight line).
 stackables = [
     "gold_coin",
-    "platinum_coin",
     "meat",
+    "great_health_potion",   # Hero
+    "health_potion",         # Valkyrie + Dwarf Guard
+    "small_diamond",         # Valkyrie + Dwarf Guard
+    "small_sapphire",        # Dwarf Geomancer
+    "arrow",                 # Hero (template ✓)
+    # sin template: blank_rune, sniper_arrow, iron_ore, white_mushroom,
+    #               red_piece_of_cloth, scroll, scroll_of_heroic_deeds
 ]
 non_stackables = [
-    "two_handed_sword",    # lootable raro pero significativo (weapon, non-stackable)
-    "crown_armor",
-    "crown_helmet",
-    "knight_armor",
-    "knight_legs",
-    "warrior_helmet",
+    "two_handed_sword",      # Hero — template ✓
+    "crown_armor",           # Hero — no template
+    "crown_helmet",          # Hero — no template
+    "crown_legs",            # Hero — no template
+    "crown_shield",          # Hero — no template
+    "fire_sword",            # Hero — no template (raro alto valor)
+    "war_hammer",            # Hero — no template
+    "might_ring",            # Hero — no template
+    "piggy_bank",            # Hero — template ✓
+    "wedding_ring",          # Hero — no template (raro)
+    "magic_light_wand",      # Dwarf Geomancer — no template
+    "spellbook",             # Dwarf Geomancer — no template
+    "geomancers_robe",       # Dwarf Geomancer — no template
+    "geomancers_staff",      # Dwarf Geomancer — no template
+    "terra_boots",           # Dwarf Geomancer — no template
+    "dwarven_ring",          # Dwarf Geomancer — no template
+    "battle_hammer",         # Dwarf Guard — no template
+    "scroll_of_heroic_deeds",# Hero — no template (quest item)
 ]
 drop = []
 

@@ -7,17 +7,21 @@ level_range = [35, 50]
 vocation    = "any"
 
 [loot]
+# Drops wiki-validated 2026-04-20 (Mutated Tiger):
+# Removidos platinum_coin (no drop), mutated_flesh (era confusión con Mutated Rat),
+# tiger_eye (no drop), twin_hooks/strange_helmet/brutetamer_staff (eran inventos).
 stackables = [
     "gold_coin",
-    "platinum_coin",
-    "mutated_flesh",
-    "tiger_eye",
     "meat",
+    "strong_health_potion",  # wiki-validated 2026-04-20
+    # sin template: striped_fur, sabretooth (drops reales)
 ]
 non_stackables = [
-    "twin_hooks",        # loot raro high value
-    "strange_helmet",
-    "brutetamer_staff",
+    "angelic_axe",           # wiki — no template (raro alto valor)
+    "glorious_axe",          # wiki — no template (raro alto valor)
+    "guardian_shield",       # wiki — no template
+    "life_ring",             # wiki — no template
+    "silky_tapestry",        # wiki — no template (decorativo raro)
 ]
 drop = []
 

@@ -7,18 +7,41 @@ level_range = [12, 25]
 vocation    = "any"
 
 [loot]
+# Drops wiki-validated 2026-04-20 (Orc + Warrior + Berserker + Leader).
+# Removido platinum_coin: NO drop según wiki (solo gold_coin de orcs).
 stackables = [
     "gold_coin",
-    "platinum_coin",
-    "orc_tooth",
-    "orc_leather",
     "meat",
+    "orc_tooth",            # Orc + Warrior + Berserker + Leader (template ✓)
+    "orc_leather",          # all orcs (template ✓)
+    "ham",                  # Orc Berserker — no template
+    "fish",                 # Orc Leader (template ✓)
+    "brown_mushroom",       # Orc Leader (template ✓)
+    "health_potion",        # Orc Leader (template ✓)
+    "royal_spear",          # Orc Leader (template ✓ stackable thrown)
+    "throwing_knife",       # Orc Leader (stackable thrown) — no template
 ]
 non_stackables = [
-    "studded_armor",
-    "chain_armor",
-    "mace",
-    "axe",
+    "axe",                  # Orc — no template
+    "sabre",                # Orc — no template
+    "studded_armor",        # Orc — no template
+    "studded_helmet",       # Orc — no template
+    "studded_shield",       # Orc — no template
+    "chain_armor",          # Orc Warrior + Berserker — no template
+    "copper_shield",        # Orc Warrior — no template
+    "battle_axe",           # Orc Berserker — no template
+    "halberd",              # Orc Berserker — no template
+    "broadsword",           # Orc Leader — no template
+    "longsword",            # Orc Leader — no template
+    "scimitar",             # Orc Leader — no template
+    "warrior_helmet",       # Orc Leader — no template
+    "plate_armor",          # Orc Leader — no template
+    "plate_legs",           # Orc Leader — no template
+    "plate_shield",         # Orc Leader — no template
+    "brass_legs",           # Orc Leader — no template
+    "skull_belt",           # Orc Warrior + Leader — no template
+    "sword_ring",           # Orc Leader — no template (ring stackable)
+    # NOTA: 'mace' del profile previo NO es drop según wiki — removido.
 ]
 drop = []
 

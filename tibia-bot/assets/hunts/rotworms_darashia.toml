@@ -8,12 +8,19 @@ level_range = [10, 20]
 vocation    = "any"
 
 [loot]
+# Drops wiki-validated 2026-04-20 (Rotworm + Carrion Worm).
+# Adicionados drops faltantes vs profile previo (que solo tenía gold/worm/meat).
 stackables = [
     "gold_coin",
     "worm",
     "meat",
+    # sin template: ham, lump_of_dirt (Rotworm); coal, carrion_worm_fang (Carrion Worm)
 ]
-non_stackables = []
+non_stackables = [
+    "mace",                  # Rotworm — no template
+    "sword",                 # Rotworm — no template
+    # NOTA: carrion_worm_fang es stackable (no listado arriba por falta de template)
+]
 drop = []
 
 [supplies]

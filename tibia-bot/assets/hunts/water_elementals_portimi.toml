@@ -10,16 +10,20 @@ vocation    = "any"
 stackables = [
     "gold_coin",
     "platinum_coin",
-    "small_sapphire",
-    "small_topaz",
-    "small_emerald",
-    "white_pearl",
+    "small_diamond",         # wiki-validated 2026-04-20
+    "small_emerald",         # wiki-validated 2026-04-20
+    "strong_health_potion",
+    "strong_mana_potion",
+    # NOTA 2026-04-20: removidos small_sapphire, small_topaz, white_pearl —
+    # Water_Elemental NO los dropea según wiki (eran inventos previos).
+    # sin template: green_perch, rainbow_trout (food fish drops)
 ]
 non_stackables = [
-    "glacier_shoes",
-    "glacier_amulet",
-    "star_amulet",
-    "focus_cape",
+    "energy_ring",           # wiki — no template
+    "life_ring",             # wiki — no template
+    "might_ring",            # wiki — no template (jewelry, no stackable)
+    # NOTA: glacier_shoes/amulet/star_amulet/focus_cape eran inventos —
+    # Water_Elemental NO los dropea. Removidos.
 ]
 drop = []
 

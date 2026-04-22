@@ -7,16 +7,32 @@ level_range = [15, 28]
 vocation    = "any"
 
 [loot]
+# Drops wiki-validated 2026-04-20 (Cyclops + Drone + Smith).
+# Removidos: dragon_ham (NO drop — confusión común), cape (no drop),
+# studded_helmet (no drop). Cyclops_toe es non-stackable — movido.
 stackables = [
     "gold_coin",
     "meat",
-    "dragon_ham",
+    "health_potion",         # Cyclops (template ✓)
+    "strong_health_potion",  # Drone + Smith (template ✓)
 ]
 non_stackables = [
-    "piggy_bank",           # raro, alto valor
-    "cyclops_toe",
-    "cape",
-    "studded_helmet",
+    "cyclops_toe",           # all cyclops (template ✓ pero non-stackable)
+    "piggy_bank",            # Cyclops (raro alto valor) — template ✓
+    "battle_shield",         # all cyclops — no template
+    "plate_shield",          # all cyclops — no template
+    "halberd",               # Cyclops + Drone — no template
+    "short_sword",           # Cyclops + Drone — no template
+    "dark_helmet",           # all cyclops — no template (raro)
+    "club_ring",             # all cyclops — no template
+    "wolf_tooth_chain",      # Cyclops — no template
+    "cyclops_trophy",        # all cyclops — no template (raro)
+    "battle_axe",            # Smith — no template
+    "battle_hammer",         # Smith — no template
+    "double_axe",            # Smith — no template
+    "heavy_machete",         # Smith — no template
+    "spiked_squelcher",      # Smith — no template (raro)
+    "heavy_old_tome",        # Cyclops — no template
 ]
 drop = []
 
