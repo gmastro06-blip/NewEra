@@ -13,6 +13,7 @@ pub mod hp_mana;
 pub mod loot;
 pub mod game_coords;
 pub mod inventory;
+pub mod inventory_ml;
 pub mod inventory_ocr;
 pub mod minimap;
 pub mod prompts;

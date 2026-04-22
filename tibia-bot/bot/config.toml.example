@@ -259,3 +259,20 @@ human_noise_interval_std_s   = 60.0
 # Detecta pantallas del juego que requieren intervención humana y pausa
 # el bot inmediatamente. NUNCA intenta auto-responder — eso es detectable.
 prompt_detection_enabled = true
+
+# ── ML inventory classifier (Fase 2 — opt-in) ────────────────────────────
+# Reemplaza el matcher SSE pixel-by-pixel del inventory por un classifier
+# CNN entrenado con ml/train_inventory_classifier.py y exportado a ONNX.
+#
+# Pre-requisitos: dataset capturado (POST /dataset/start), etiquetado
+# (cargo run --bin label_dataset), y modelo entrenado (Python script).
+# Ver tibia-bot/ml/README.md para el workflow completo.
+#
+# **Estado actual**: scaffold sin runtime ort. use_ml=true loggea WARN
+# y cae a fallback SSE matcher hasta que la integración ort esté wired.
+
+[ml]
+use_ml               = false                                    # default off
+model_path           = "ml/models/inventory_v1.onnx"            # vacío = ML off
+classes_path         = "ml/models/inventory_v1.classes.json"
+confidence_threshold = 0.80                                     # softmax max ≥ esto

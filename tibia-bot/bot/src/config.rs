@@ -28,10 +28,46 @@ pub struct Config {
     pub game_coords: GameCoordsConfig,
     #[serde(default)]
     pub recording:   RecordingConfig,
+    #[serde(default)]
+    pub ml:          MlConfig,
     /// Tabla de spells con prioridades. Si vacía, se genera desde `[actions]`.
     #[serde(default, rename = "spell")]
     pub spells:      Vec<SpellConfig>,
 }
+
+/// Configuración del runtime ML (Fase 2.5).
+///
+/// Reemplaza el matcher SSE de inventory por un classifier ONNX entrenado
+/// con el pipeline de `ml/train_inventory_classifier.py`.
+///
+/// **Estado actual**: scaffold de configuración. La integración ort runtime
+/// real (carga de ONNX + inferencia) se hará en commit posterior cuando
+/// haya un modelo entrenado disponible para validar end-to-end.
+///
+/// Por ahora `use_ml=true` con `model_path` apuntando a archivo válido
+/// loggea WARN y cae al fallback SSE matcher.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MlConfig {
+    /// Si `true`, intenta cargar el modelo ONNX en `model_path` y usarlo
+    /// para clasificar inventory slots. Si false (default), usa SSE matcher.
+    #[serde(default)]
+    pub use_ml: bool,
+    /// Path al modelo ONNX (ej. `ml/models/inventory_v1.onnx`).
+    /// Vacío deshabilita ML aunque `use_ml=true`.
+    #[serde(default)]
+    pub model_path: String,
+    /// Path al JSON con classes (ej. `ml/models/inventory_v1.classes.json`).
+    /// Generado automáticamente por el script de training.
+    #[serde(default)]
+    pub classes_path: String,
+    /// Confidence threshold mínimo para aceptar una predicción.
+    /// Predicciones con softmax max < threshold se descartan (slot empty).
+    /// Default 0.80.
+    #[serde(default = "default_ml_confidence")]
+    pub confidence_threshold: f32,
+}
+
+fn default_ml_confidence() -> f32 { 0.80 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NdiConfig {
