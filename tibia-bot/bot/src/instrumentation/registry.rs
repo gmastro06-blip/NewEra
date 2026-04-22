@@ -16,9 +16,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use super::histogram::LatencyHistogram;
+use super::recorder::MetricsRecorder;
 use super::tick::{ActionKindTag, ReaderId, TickMetrics, TickFlags};
 use super::window::CircularU32;
 
@@ -66,6 +67,13 @@ pub struct MetricsRegistry {
 
     // ── Frame seq tracking ───────────────────────────────────────────────
     last_frame_seq:       AtomicU64,
+
+    // ── Recorder JSONL opcional ──────────────────────────────────────────
+    /// `None` = recorder inactivo (zero cost en record_tick).
+    /// `Some` = activo, cada record_tick escribe una línea.
+    /// RwLock para permitir start/stop dinámico desde HTTP. El game loop
+    /// hace read() para chequear si está activo (~30 ns sin contención).
+    recorder:             RwLock<Option<MetricsRecorder>>,
 }
 
 struct Windows {
@@ -75,6 +83,13 @@ struct Windows {
     tick_long:      CircularU32<FPS_WINDOW_TICKS>,
     /// vision_total_us — para detección de degradation trend.
     vision_jitter:  CircularU32<JITTER_WINDOW_TICKS>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecordingStatus {
+    pub active:        bool,
+    pub path:          Option<String>,
+    pub written_lines: u64,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -124,6 +139,46 @@ impl MetricsRegistry {
                 vision_jitter: CircularU32::new(),
             }),
             last_frame_seq:   AtomicU64::new(0),
+            recorder:         RwLock::new(None),
+        }
+    }
+
+    /// Activa el recorder JSONL. Sustituye cualquier sesión previa
+    /// (drop del MetricsRecorder anterior dispara flush + close).
+    /// Devuelve error si no se puede crear el archivo.
+    pub fn start_recording(
+        &self,
+        path: std::path::PathBuf,
+        flush_every: u32,
+    ) -> std::io::Result<()> {
+        let rec = MetricsRecorder::start(path, flush_every)?;
+        *self.recorder.write() = Some(rec);
+        Ok(())
+    }
+
+    /// Para la grabación, drop del recorder dispara flush + close.
+    /// Devuelve líneas escritas en la sesión que se cierra.
+    pub fn stop_recording(&self) -> u64 {
+        let mut guard = self.recorder.write();
+        let n = guard.as_ref().map(|r| r.written_lines()).unwrap_or(0);
+        *guard = None;
+        n
+    }
+
+    /// Estado del recorder para HTTP `/instrumentation/recording_status`.
+    pub fn recording_status(&self) -> RecordingStatus {
+        let guard = self.recorder.read();
+        match guard.as_ref() {
+            Some(r) => RecordingStatus {
+                active:        true,
+                path:          Some(r.path().display().to_string()),
+                written_lines: r.written_lines(),
+            },
+            None => RecordingStatus {
+                active:        false,
+                path:          None,
+                written_lines: 0,
+            },
         }
     }
 
@@ -178,6 +233,16 @@ impl MetricsRegistry {
 
         // ── ArcSwap publish — lock-free para readers HTTP ─────────────────
         self.last_tick.store(Arc::new(m));
+
+        // ── Recorder JSONL si activo ──────────────────────────────────────
+        // Cuando inactivo (None): RwLock read es ~30 ns sin contención.
+        // Cuando activo: write lock + serialize + I/O ~5 µs (escrito como
+        // mut porque write_line es &mut self). Game loop es el único writer
+        // del recorder, así que el contention es solo con start/stop HTTP.
+        let mut guard = self.recorder.write();
+        if let Some(rec) = guard.as_mut() {
+            rec.write_line(&m);
+        }
     }
 
     /// Llamado desde el bridge thread cuando llega ACK del Arduino. Mide

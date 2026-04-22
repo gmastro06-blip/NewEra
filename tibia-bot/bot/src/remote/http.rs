@@ -108,10 +108,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/dataset/stop",          post(handle_dataset_stop))
         .route("/dataset/status",        get(handle_dataset_status))
         .route("/vision/region_monitor", get(handle_region_monitor))
-        .route("/instrumentation/last_tick",   get(handle_instr_last_tick))
-        .route("/instrumentation/percentiles", get(handle_instr_percentiles))
-        .route("/instrumentation/histograms",  get(handle_instr_histograms))
-        .route("/instrumentation/windows",     get(handle_instr_windows))
+        .route("/instrumentation/last_tick",        get(handle_instr_last_tick))
+        .route("/instrumentation/percentiles",      get(handle_instr_percentiles))
+        .route("/instrumentation/histograms",       get(handle_instr_histograms))
+        .route("/instrumentation/windows",          get(handle_instr_windows))
+        .route("/instrumentation/start_recording",  post(handle_instr_start_recording))
+        .route("/instrumentation/stop_recording",   post(handle_instr_stop_recording))
+        .route("/instrumentation/recording_status", get(handle_instr_recording_status))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         // V-007 mitigation: stealth_mode hide debug endpoints.
         .layer(axum::middleware::from_fn_with_state(state.clone(), stealth_middleware))
@@ -2273,6 +2276,91 @@ struct CountersSummary {
     actions_failed_total:  u64,
 }
 
+/// POST /instrumentation/start_recording?path=session.metrics.jsonl[&flush_every=30]
+/// Activa el JSONL recorder. Sustituye sesión previa.
+#[derive(serde::Deserialize)]
+struct StartRecordingQuery {
+    path: Option<String>,
+    flush_every: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct StartRecordingResponse {
+    ok: bool,
+    path: String,
+    flush_every: u32,
+    error: Option<String>,
+}
+
+async fn handle_instr_start_recording(
+    State(s): State<AppState>,
+    Query(q): Query<StartRecordingQuery>,
+) -> (StatusCode, Json<StartRecordingResponse>) {
+    let path_str = q.path.unwrap_or_else(|| "session.metrics.jsonl".to_string());
+    let flush_every = q.flush_every.unwrap_or(30).max(1);
+
+    // V-008-style: validar caracteres seguros en path. No permitir
+    // newlines, control chars, etc. para evitar log injection si el path
+    // se loguea downstream.
+    if !is_safe_recording_path(&path_str) {
+        return (StatusCode::BAD_REQUEST, Json(StartRecordingResponse {
+            ok: false,
+            path: path_str,
+            flush_every,
+            error: Some("path contiene caracteres no permitidos".to_string()),
+        }));
+    }
+
+    let path = std::path::PathBuf::from(&path_str);
+    match s.metrics.start_recording(path, flush_every) {
+        Ok(()) => (StatusCode::OK, Json(StartRecordingResponse {
+            ok: true,
+            path: path_str,
+            flush_every,
+            error: None,
+        })),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(StartRecordingResponse {
+            ok: false,
+            path: path_str,
+            flush_every,
+            error: Some(e.to_string()),
+        })),
+    }
+}
+
+fn is_safe_recording_path(p: &str) -> bool {
+    // Whitelist conservadora: alfanumérico + `._-/\:` (drive letters Windows).
+    // Sin espacios, sin newlines, sin control chars.
+    !p.is_empty()
+        && p.len() <= 256
+        && p.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '-' | '/' | '\\' | ':')
+        })
+}
+
+/// POST /instrumentation/stop_recording
+/// Cierra la sesión, devuelve total de líneas escritas.
+#[derive(serde::Serialize)]
+struct StopRecordingResponse {
+    ok: bool,
+    written_lines: u64,
+}
+
+async fn handle_instr_stop_recording(State(s): State<AppState>)
+    -> Json<StopRecordingResponse>
+{
+    let n = s.metrics.stop_recording();
+    Json(StopRecordingResponse { ok: true, written_lines: n })
+}
+
+/// GET /instrumentation/recording_status
+async fn handle_instr_recording_status(State(s): State<AppState>)
+    -> Json<crate::instrumentation::registry::RecordingStatus>
+{
+    Json(s.metrics.recording_status())
+}
+
 async fn handle_instr_windows(State(s): State<AppState>) -> Json<WindowsResponse> {
     use std::sync::atomic::Ordering;
     let r = &s.metrics;
@@ -2864,6 +2952,41 @@ mod tests {
         // FPS measured ≈ 1e6 / 33000 ≈ 30
         let fps = v["measured_fps"].as_f64().unwrap();
         assert!(fps > 29.0 && fps < 31.0, "fps={}", fps);
+    }
+
+    #[tokio::test]
+    async fn instr_recording_status_inactive_by_default() {
+        let state = test_state().await;
+        let app = build_router(state);
+        let (status, body) = get(app, "/instrumentation/recording_status").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(v["active"], false);
+        assert_eq!(v["written_lines"], 0);
+    }
+
+    #[tokio::test]
+    async fn instr_start_recording_rejects_unsafe_path() {
+        let state = test_state().await;
+        let app = build_router(state);
+        // Path con espacio = rechazado por whitelist.
+        let resp = app.oneshot(
+            Request::builder().method("POST")
+                .uri("/instrumentation/start_recording?path=session%20with%20space.jsonl")
+                .body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn is_safe_recording_path_rules() {
+        assert!(is_safe_recording_path("session.jsonl"));
+        assert!(is_safe_recording_path("data/metrics_v1.jsonl"));
+        assert!(is_safe_recording_path("C:\\tmp\\m.jsonl"));
+        assert!(!is_safe_recording_path(""));
+        assert!(!is_safe_recording_path("with space.jsonl"));
+        assert!(!is_safe_recording_path("inject\nnewline"));
+        assert!(!is_safe_recording_path("a;rm -rf /;"));
     }
 
     #[tokio::test]

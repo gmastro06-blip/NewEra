@@ -27,8 +27,10 @@ pub mod histogram;
 pub mod window;
 pub mod tick;
 pub mod registry;
+pub mod recorder;
 
 pub use histogram::{LatencyHistogram, HistogramSnapshot, Percentiles};
 pub use window::CircularU32;
 pub use tick::{TickMetrics, TickFlags, ReaderId, ActionKindTag};
 pub use registry::MetricsRegistry;
+pub use recorder::MetricsRecorder;
