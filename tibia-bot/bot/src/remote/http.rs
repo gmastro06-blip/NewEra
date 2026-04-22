@@ -2639,6 +2639,52 @@ async fn handle_prometheus_metrics(State(s): State<AppState>) -> Response {
 
     drop(g);
 
+    // ── HealthSystem gauges ─────────────────────────────────────────────
+    // Exponer severity + score + degradation level + issue flags para
+    // que Grafana graphe evolución a lo largo de la sesión.
+    let health_snap = s.health.load_full();
+    let overall_num: u8 = match health_snap.overall {
+        crate::health::Severity::Ok       => 0,
+        crate::health::Severity::Warning  => 1,
+        crate::health::Severity::Critical => 2,
+    };
+    writeln!(out, "# HELP tibia_health_overall 0=ok 1=warning 2=critical").ok();
+    writeln!(out, "# TYPE tibia_health_overall gauge").ok();
+    writeln!(out, "tibia_health_overall {}", overall_num).ok();
+
+    writeln!(out, "# HELP tibia_health_score Aggregate issue weight (ok=0, warning=1, critical=4)").ok();
+    writeln!(out, "# TYPE tibia_health_score gauge").ok();
+    writeln!(out, "tibia_health_score {}", health_snap.score).ok();
+
+    let deg_num: u8 = match health_snap.degraded {
+        None                                                    => 0,
+        Some(crate::health::DegradationLevel::Light)            => 1,
+        Some(crate::health::DegradationLevel::Heavy)            => 2,
+        Some(crate::health::DegradationLevel::SafeMode)         => 3,
+    };
+    writeln!(out, "# HELP tibia_health_degradation 0=none 1=light 2=heavy 3=safe_mode").ok();
+    writeln!(out, "# TYPE tibia_health_degradation gauge").ok();
+    writeln!(out, "tibia_health_degradation {}", deg_num).ok();
+
+    // Issue activo por kind — 1 si emitido este tick, 0 si no.
+    // Permite alert rules tipo `tibia_health_issue_active{kind="frame_stale"} == 1 for 30s`.
+    let mut active_kinds: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for i in &health_snap.issues {
+        active_kinds.insert(i.label());
+    }
+    let all_kinds = [
+        "frame_stale", "tick_overrun", "vision_slow", "anchor_drift",
+        "low_detection_confidence", "bridge_rtt_high", "action_failure_rate",
+        "high_jitter", "frame_seq_gap",
+        "blind_mode", "compute_saturation", "io_unreliable",
+    ];
+    writeln!(out, "# HELP tibia_health_issue_active 1 if issue type is currently emitted").ok();
+    writeln!(out, "# TYPE tibia_health_issue_active gauge").ok();
+    for kind in all_kinds {
+        let v = if active_kinds.contains(kind) { 1 } else { 0 };
+        writeln!(out, "tibia_health_issue_active{{kind=\"{}\"}} {}", kind, v).ok();
+    }
+
     (
         [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         out,
@@ -2969,6 +3015,35 @@ mod tests {
         // FPS measured ≈ 1e6 / 33000 ≈ 30
         let fps = v["measured_fps"].as_f64().unwrap();
         assert!(fps > 29.0 && fps < 31.0, "fps={}", fps);
+    }
+
+    #[tokio::test]
+    async fn metrics_includes_health_gauges() {
+        let state = test_state().await;
+        // Publica un HealthStatus con valores claros.
+        state.health.store(Arc::new(crate::health::HealthStatus {
+            overall: crate::health::Severity::Warning,
+            score: 3,
+            degraded: Some(crate::health::DegradationLevel::Light),
+            issues: vec![crate::health::HealthIssue::TickOverrun {
+                tick_ms: 40, budget_ms: 33,
+                severity: crate::health::Severity::Warning,
+            }],
+            summary: String::new(), tick: 0, frame_seq: 0, generated_at_ms: 0,
+        }));
+        let app = build_router(state);
+        let (status, body) = get(app, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        // Core gauges presentes.
+        assert!(text.contains("tibia_health_overall 1"));         // Warning=1
+        assert!(text.contains("tibia_health_score 3"));
+        assert!(text.contains("tibia_health_degradation 1"));     // Light=1
+        // Issue flag kind=tick_overrun active.
+        assert!(text.contains("tibia_health_issue_active{kind=\"tick_overrun\"} 1"));
+        // Issues no emitidos están en 0 (todos los kinds listados).
+        assert!(text.contains("tibia_health_issue_active{kind=\"frame_stale\"} 0"));
+        assert!(text.contains("tibia_health_issue_active{kind=\"blind_mode\"} 0"));
     }
 
     #[tokio::test]
