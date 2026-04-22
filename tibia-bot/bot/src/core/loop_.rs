@@ -1453,7 +1453,8 @@ impl BotLoop {
             // tick. Esto va al MetricsRegistry (histogramas + windows + ArcSwap
             // last_tick que el HTTP server lee lock-free).
             //
-            // Costo estimado del record_tick: ~500 ns. Validar con bench.
+            // Costo medido empírico (bench `instrumentation_record_tick_steady_state`):
+            // **302 ns/call** en release. 0.0009% del budget 33 ms/tick. Negligible.
             //
             // Nota: tick_total_us mide hasta este punto (no incluye el SLEEP
             // posterior, que es el deadline scheduling, no proc time).

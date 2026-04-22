@@ -180,10 +180,86 @@ fn bench_perception_filter_apply(c: &mut Criterion) {
     });
 }
 
+// ── Instrumentation: record_tick + record_action_ack overhead ──────────
+//
+// Mide el costo real del MetricsRegistry hot path. Claim del commit
+// 9d13345: "~500 ns/tick estimado" — esto lo valida empíricamente.
+// Si supera 1 µs, considerar que las actualizaciones tipo histogram
+// son más caras de lo asumido (prob. cache misses por tantos AtomicU64).
+
+fn bench_instrumentation_record_tick(c: &mut Criterion) {
+    use tibia_bot::instrumentation::{
+        ActionKindTag, MetricsRegistry, ReaderId, TickFlags, TickMetrics,
+    };
+
+    let registry = MetricsRegistry::new();
+
+    let mk_tick = |i: u64| {
+        let mut per_reader = [0u16; ReaderId::COUNT];
+        per_reader[ReaderId::HpMana as usize]    = 100;
+        per_reader[ReaderId::Battle as usize]    = 5_000;
+        per_reader[ReaderId::Inventory as usize] = if i % 15 == 0 { 8_000 } else { 0 };
+        TickMetrics {
+            tick: i,
+            frame_seq: i,
+            ts_unix_ms: 1_745_347_291_000 + i,
+            frame_age_us: 80_000 + (i as u32 % 30) * 100,
+            acquire_us: 50,
+            vision_total_us: 12_000 + (i as u32 % 7) * 200,
+            filter_us: 300,
+            fsm_us: 200,
+            dispatch_us: 100,
+            state_write_us: 0,
+            tick_total_us: 18_000 + (i as u32 % 11) * 100,
+            vision_per_reader_us: per_reader,
+            last_action_kind: if i % 10 == 0 { ActionKindTag::Heal } else { ActionKindTag::Key },
+            last_action_rtt_us: 0,
+            valid_anchors: 2,
+            total_anchors: 2,
+            anchor_confidence_bp: 10_000,
+            vitals_confidence_bp: 9_500,
+            target_confidence_bp: 8_000,
+            enemies_visible: 3,
+            inventory_items: 5,
+            flags: if i % 100 == 0 { TickFlags::TICK_OVERRUN } else { TickFlags::NONE },
+        }
+    };
+
+    // Pre-warm con 100 ticks para que las CircularU32 windows estén pobladas.
+    for i in 0..100 { registry.record_tick(mk_tick(i)); }
+
+    c.bench_function("instrumentation_record_tick_steady_state", |b| {
+        let mut i = 100u64;
+        b.iter(|| {
+            let m = mk_tick(i);
+            registry.record_tick(black_box(m));
+            i += 1;
+        });
+    });
+}
+
+fn bench_instrumentation_record_action_ack(c: &mut Criterion) {
+    use tibia_bot::instrumentation::{ActionKindTag, MetricsRegistry};
+    let registry = MetricsRegistry::new();
+    c.bench_function("instrumentation_record_action_ack", |b| {
+        let mut rtt = 1_000u32;
+        b.iter(|| {
+            registry.record_action_ack(
+                black_box(ActionKindTag::Heal),
+                black_box(rtt),
+                true,
+            );
+            rtt = rtt.wrapping_add(13);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_inventory_exact_vs_shift,
     bench_region_monitor_tick,
     bench_perception_filter_apply,
+    bench_instrumentation_record_tick,
+    bench_instrumentation_record_action_ack,
 );
 criterion_main!(benches);

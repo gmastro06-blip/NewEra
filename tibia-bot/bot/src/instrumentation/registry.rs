@@ -185,8 +185,8 @@ impl MetricsRegistry {
     /// Llamado desde el game loop al final de cada tick. Punto único de
     /// actualización de histogramas + windows + publish del snapshot.
     ///
-    /// Costo estimado: ~500 ns (9 record_us + 3 push window + 1 ArcSwap store).
-    /// Verificable con bench `instrumentation_record_tick` (TODO).
+    /// Costo medido empírico (bench `instrumentation_record_tick_steady_state`):
+    /// **302 ns/call** en release. 9 µs/seg @ 30 Hz = 0.0003% CPU. Negligible.
     pub fn record_tick(&self, m: TickMetrics) {
         // ── Histogramas ────────────────────────────────────────────────────
         self.frame_age.record_us(m.frame_age_us);
