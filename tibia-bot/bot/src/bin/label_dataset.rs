@@ -256,12 +256,40 @@ fn parse_class_input(input: &str, classes: &[String]) -> Option<String> {
     classes.iter().find(|c| c.eq_ignore_ascii_case(input)).cloned()
 }
 
+/// Abre un PNG en el viewer del OS.
+///
+/// **Command injection hardening**: en Windows, `cmd /C start` expandía
+/// caracteres especiales del filename (`&`, `|`, `"`) permitiendo injection
+/// si el manifest.csv fue modificado por tercero. Fix:
+/// 1. Verificar el path existe + es archivo + ends with .png.
+/// 2. Reject paths con caracteres fuera del whitelist alfanumérico +
+///    separadores básicos (`._-/\` + `:`  drive letter).
+/// 3. En Windows, usar explorer.exe directamente (acepta path como único
+///    argumento sin shell expansion) en vez de cmd /C start.
 fn open_png(path: &Path) -> io::Result<()> {
+    // Validación path.
+    if !path.exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "path no existe"));
+    }
+    if !path.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path no es archivo"));
+    }
+    let path_str = path.to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path no UTF-8"))?;
+    if !path_str.ends_with(".png") && !path_str.ends_with(".PNG") {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path no es .png"));
+    }
+    if !is_safe_path_chars(path_str) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path tiene caracteres no seguros — posible command injection"
+        ));
+    }
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd")
-            .args(["/C", "start", "", path.to_str().unwrap_or("")])
-            .spawn()?;
+        // explorer.exe acepta el path como argumento único, sin shell parsing
+        // vs `cmd /C start "" ...` que hacía expansion de caracteres especiales.
+        Command::new("explorer.exe").arg(path).spawn()?;
     }
     #[cfg(target_os = "linux")]
     {
@@ -272,6 +300,16 @@ fn open_png(path: &Path) -> io::Result<()> {
         Command::new("open").arg(path).spawn()?;
     }
     Ok(())
+}
+
+/// Whitelist de caracteres seguros para paths en command-line args.
+/// Rechaza: `"`, `&`, `|`, `<`, `>`, `;`, `` ` ``, `$`, `\n`, `\r`, null
+/// y otros caracteres que shells interpretan.
+fn is_safe_path_chars(s: &str) -> bool {
+    s.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '.' | '_' | '-' | '/' | '\\' | ':' | ' ' | '(' | ')')
+    })
 }
 
 fn print_distribution(manifest: &Manifest) {
@@ -394,6 +432,26 @@ mod tests {
         assert_eq!(parse_class_input("vial", &classes), Some("VIAL".into()));
         assert_eq!(parse_class_input("GOLDEN_BACKPACK", &classes), Some("golden_backpack".into()));
         assert_eq!(parse_class_input("unknown", &classes), None);
+    }
+
+    #[test]
+    fn safe_path_accepts_normal_filename() {
+        assert!(is_safe_path_chars("datasets/abdendriel/crops/0001_t00123_s00.png"));
+        assert!(is_safe_path_chars("C:\\Users\\test\\file.png"));
+        assert!(is_safe_path_chars("./relative/path.png"));
+    }
+
+    #[test]
+    fn safe_path_rejects_shell_metachars() {
+        // Characters that shells expand / command-injection vectors.
+        assert!(!is_safe_path_chars("foo & evil"));
+        assert!(!is_safe_path_chars("foo | bar"));
+        assert!(!is_safe_path_chars("foo > out"));
+        assert!(!is_safe_path_chars("foo; rm -rf /"));
+        assert!(!is_safe_path_chars("foo\"bar"));
+        assert!(!is_safe_path_chars("foo`evil`"));
+        assert!(!is_safe_path_chars("foo$evil"));
+        assert!(!is_safe_path_chars("foo\nevil"));
     }
 
     #[test]

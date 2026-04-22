@@ -2056,7 +2056,20 @@ async fn handle_dataset_start(
         }
     };
     let interval = q.interval.unwrap_or(15).max(1);
-    let tag = q.tag.unwrap_or_else(|| "untagged".into());
+    // Sanitize tag: el tag se escribe literal en manifest.csv y va a logs.
+    // Rechazar caracteres que rompen CSV (`,`, `\n`, `\r`, `"`) o permiten
+    // log spoofing (ANSI escapes, newlines). Whitelist alfanumérico + `_-.`.
+    let raw_tag = q.tag.unwrap_or_else(|| "untagged".into());
+    let tag: String = raw_tag.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(64)  // límite defensivo
+        .collect();
+    if tag.is_empty() {
+        return Json(CommandAck {
+            ok:      false,
+            message: "tag rejected: vacío tras sanitización (usar solo [a-zA-Z0-9_.-])".into(),
+        });
+    }
     let cmd = LoopCommand::StartDatasetCapture {
         dir: dir.clone(), interval, tag: tag.clone(),
     };
