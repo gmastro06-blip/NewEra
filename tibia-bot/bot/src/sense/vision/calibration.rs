@@ -260,6 +260,24 @@ impl RoiDef {
     }
 }
 
+/// Rol del anchor en la estrategia de failover.
+/// - `Primary` (default): se usa directamente. Si ≥1 primary matchea, los
+///   fallbacks se ignoran y el cluster se calcula solo sobre primaries.
+/// - `Fallback`: solo se usa cuando CERO primaries están matcheando. Sirve
+///   de red de seguridad cuando un template primary se degrada (template
+///   obsoleto por patch de Tibia, región bajo overlay, etc.).
+///
+/// Calibration típica: 2 primaries cross-geométricos + 1-2 fallbacks en
+/// regiones independientes. Mientras primaries sanos, fallbacks están
+/// "dormidos" (no impactan el offset, pero se siguen trackeando).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnchorRole {
+    #[default]
+    Primary,
+    Fallback,
+}
+
 /// Ancla: región de la pantalla con textura estable que sirve de referencia.
 /// El AnchorTracker la busca en cada frame para calcular el desplazamiento
 /// de la ventana de Tibia y ajustar todos los ROIs.
@@ -272,6 +290,11 @@ pub struct AnchorDef {
     pub expected_roi:  RoiDef,
     /// Ruta al archivo de template (PNG) relativa a assets/anchors/.
     pub template_path: String,
+    /// Rol en la estrategia failover. Default `Primary` para compat con
+    /// calibration.toml existentes — los anchors actuales son todos primary.
+    /// Marcar `role = "fallback"` solo para anchors de reserva.
+    #[serde(default)]
+    pub role:          AnchorRole,
 }
 
 impl Calibration {
@@ -319,6 +342,7 @@ mod tests {
             name:          "hp_frame".into(),
             expected_roi:  RoiDef::new(5, 15, 20, 20),
             template_path: "hp_frame.png".into(),
+            role:          AnchorRole::Primary,
         });
 
         let serialized = toml::to_string_pretty(&cal).unwrap();

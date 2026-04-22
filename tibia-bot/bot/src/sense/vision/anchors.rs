@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::sense::frame_buffer::Frame;
-use crate::sense::vision::calibration::{AnchorDef, RoiDef};
+use crate::sense::vision::calibration::{AnchorDef, AnchorRole, RoiDef};
 
 // ── Tipos públicos ─────────────────────────────────────────────────────────────
 
@@ -363,28 +363,64 @@ impl AnchorTracker {
     /// `last_good_at` está dentro de `LAST_GOOD_TTL`. Last_good viejo se
     /// descarta — preferimos AllLost (pausa) que aplicar offset stale a las
     /// ROIs (puede dar coords fuera del frame y crashear lectores).
+    ///
+    /// **Failover primary/fallback**: si ≥1 primary está matcheando,
+    /// los fallback anchors se IGNORAN (cluster solo sobre primaries).
+    /// Si CERO primaries matchean pero ≥1 fallback sí → usa fallbacks
+    /// con log INFO. Esto da tolerancia a degradación de templates sin
+    /// sacrificar precisión en operación normal.
     pub fn window_offset(&self) -> (i32, i32) {
         let now = Instant::now();
         let s = self.shared.read();
-        let valid: Vec<AnchorMatch> = s.matches.iter()
+        // Recolectar valid matches con su role (indexado por slot).
+        let valid_by_role: Vec<(usize, AnchorMatch)> = s.matches.iter()
             .zip(s.last_good.iter())
             .zip(s.last_good_at.iter())
             .zip(s.fail_counts.iter())
-            .filter_map(|(((m, lg), lg_at), &f)| {
-                if f <= self.config.max_fails {
+            .enumerate()
+            .filter_map(|(idx, (((m, lg), lg_at), &f))| {
+                let matched = if f <= self.config.max_fails {
                     *m
                 } else {
-                    // Lost: usar last_good si NO está stale (TTL).
                     Self::filter_stale_fallback(*lg, *lg_at, now)
-                }
+                };
+                matched.map(|m| (idx, m))
             })
             .collect();
         drop(s);
 
-        // AllLost: anchors configurados pero ninguno con valid ni last_good
-        // fresco. Distinto de "sin anchors" (total_anchor_count==0 → no hay
-        // concepto de drift, se reporta Ok). Con anchors configurados y cero
-        // valid, el offset (0,0) no es confiable → DriftStatus::AllLost.
+        // Separar por role via self.anchors[idx].def.role.
+        let (primaries, fallbacks): (Vec<AnchorMatch>, Vec<AnchorMatch>) =
+            valid_by_role.into_iter().fold(
+                (Vec::new(), Vec::new()),
+                |(mut p, mut f), (idx, m)| {
+                    match self.anchors.get(idx).map(|a| a.def.role) {
+                        Some(AnchorRole::Primary) | None => p.push(m),
+                        Some(AnchorRole::Fallback)       => f.push(m),
+                    }
+                    (p, f)
+                },
+            );
+
+        // Prefer primaries. Usa fallbacks solo si CERO primaries matchean.
+        let (valid, used_fallback) = if !primaries.is_empty() {
+            (primaries, false)
+        } else if !fallbacks.is_empty() {
+            (fallbacks, true)
+        } else {
+            (Vec::new(), false)
+        };
+
+        if used_fallback {
+            // Log throttled por AtomicBool/counter — por ahora uno por call.
+            // En producción el log se queda en WARN porque es degraded state.
+            tracing::warn!(
+                "AnchorTracker: primaries all lost, using {} fallback anchor(s)",
+                valid.len()
+            );
+        }
+
+        // AllLost: anchors configurados pero ninguno válido en ningún role.
         let (offset, status) = if valid.is_empty() && !self.anchors.is_empty() {
             ((0, 0), DriftStatus::AllLost)
         } else {
@@ -645,12 +681,20 @@ mod tests {
     }
 
     fn add_dummy_anchor(t: &mut AnchorTracker) {
+        add_anchor_with_role(t, AnchorRole::Primary);
+    }
+
+    fn add_anchor_with_role(t: &mut AnchorTracker, role: AnchorRole) {
         let def = AnchorDef {
-            name: "test".into(),
+            name: format!("test_{}", match role {
+                AnchorRole::Primary  => "primary",
+                AnchorRole::Fallback => "fallback",
+            }),
             template_path: "test.png".into(),
             expected_roi: RoiDef { x: 10, y: 10, w: 50, h: 50 },
+            role,
         };
-        t.add(def, None); // template=None: no jobs will be submitted
+        t.add(def, None);
     }
 
     /// Sanity: tracker vacío reporta (0,0) y 0 anchors.
@@ -937,6 +981,115 @@ mod tests {
         }
         let _ = t.window_offset();
         assert_eq!(t.drift_status(), DriftStatus::Ok);
+    }
+
+    // ── Failover primary/fallback ─────────────────────────────────────
+
+    #[test]
+    fn failover_uses_primary_when_available() {
+        let mut t = make_tracker();
+        add_anchor_with_role(&mut t, AnchorRole::Primary);
+        add_anchor_with_role(&mut t, AnchorRole::Fallback);
+        {
+            let mut s = t.shared.write();
+            s.matches[0] = Some(test_match(5, 5));
+            s.last_good[0] = Some(test_match(5, 5));
+            s.last_good_at[0] = Some(Instant::now());
+            // Fallback también matchea pero en posición distinta → debería ignorarse.
+            s.matches[1] = Some(test_match(100, 100));
+            s.last_good[1] = Some(test_match(100, 100));
+            s.last_good_at[1] = Some(Instant::now());
+        }
+        // Solo el primary (5,5) cuenta.
+        assert_eq!(t.window_offset(), (5, 5));
+    }
+
+    #[test]
+    fn failover_uses_fallback_when_primaries_lost() {
+        let mut t = make_tracker();
+        add_anchor_with_role(&mut t, AnchorRole::Primary);
+        add_anchor_with_role(&mut t, AnchorRole::Fallback);
+        {
+            let mut s = t.shared.write();
+            // Primary lost, sin last_good.
+            s.matches[0] = None;
+            s.last_good[0] = None;
+            s.last_good_at[0] = None;
+            s.fail_counts[0] = t.config.max_fails + 5;
+            // Fallback matchea fresco.
+            s.matches[1] = Some(test_match(7, 9));
+            s.last_good[1] = Some(test_match(7, 9));
+            s.last_good_at[1] = Some(Instant::now());
+        }
+        assert_eq!(t.window_offset(), (7, 9));
+        // Status debe ser Ok — el fallback es valid.
+        assert_eq!(t.drift_status(), DriftStatus::Ok);
+    }
+
+    #[test]
+    fn failover_all_lost_both_roles_returns_zero() {
+        let mut t = make_tracker();
+        add_anchor_with_role(&mut t, AnchorRole::Primary);
+        add_anchor_with_role(&mut t, AnchorRole::Fallback);
+        {
+            let mut s = t.shared.write();
+            // Ninguno matchea ni tiene last_good.
+            for i in 0..2 {
+                s.matches[i] = None;
+                s.last_good[i] = None;
+                s.last_good_at[i] = None;
+                s.fail_counts[i] = t.config.max_fails + 1;
+            }
+        }
+        assert_eq!(t.window_offset(), (0, 0));
+        assert_eq!(t.drift_status(), DriftStatus::AllLost);
+    }
+
+    #[test]
+    fn failover_fallback_only_ignored_when_primary_has_last_good() {
+        // Primary lost pero con last_good fresco dentro de TTL → cuenta como
+        // primary valid, fallback se ignora.
+        let mut t = make_tracker();
+        add_anchor_with_role(&mut t, AnchorRole::Primary);
+        add_anchor_with_role(&mut t, AnchorRole::Fallback);
+        {
+            let mut s = t.shared.write();
+            s.matches[0] = None; // lost
+            s.last_good[0] = Some(test_match(3, 3));
+            s.last_good_at[0] = Some(Instant::now());
+            s.fail_counts[0] = t.config.max_fails + 2;
+            // Fallback fresco en otra posición.
+            s.matches[1] = Some(test_match(50, 50));
+            s.last_good[1] = Some(test_match(50, 50));
+            s.last_good_at[1] = Some(Instant::now());
+        }
+        // Usa el last_good del primary (3,3), ignora fallback.
+        assert_eq!(t.window_offset(), (3, 3));
+    }
+
+    #[test]
+    fn failover_two_fallbacks_cluster_when_primaries_lost() {
+        // Config realista: 1 primary muerto + 2 fallbacks coherentes.
+        let mut t = make_tracker();
+        add_anchor_with_role(&mut t, AnchorRole::Primary);
+        add_anchor_with_role(&mut t, AnchorRole::Fallback);
+        add_anchor_with_role(&mut t, AnchorRole::Fallback);
+        {
+            let mut s = t.shared.write();
+            s.matches[0] = None;
+            s.last_good[0] = None;
+            s.last_good_at[0] = None;
+            s.fail_counts[0] = t.config.max_fails + 10;
+            // 2 fallbacks coherentes → cluster interno.
+            s.matches[1] = Some(test_match(4, 0));
+            s.last_good[1] = Some(test_match(4, 0));
+            s.last_good_at[1] = Some(Instant::now());
+            s.matches[2] = Some(test_match(6, 2));
+            s.last_good[2] = Some(test_match(6, 2));
+            s.last_good_at[2] = Some(Instant::now());
+        }
+        // Avg weighted (scores iguales) = (5, 1).
+        assert_eq!(t.window_offset(), (5, 1));
     }
 
     /// Tras recovery (match nuevo tras ser lost), last_good se actualiza.
