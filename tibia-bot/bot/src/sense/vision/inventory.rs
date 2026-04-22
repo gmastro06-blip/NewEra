@@ -39,7 +39,7 @@ use crate::sense::frame_buffer::Frame;
 use crate::sense::vision::calibration::RoiDef;
 use crate::sense::vision::crop::{crop_bgra, Roi};
 
-/// Threshold de match para CrossCorrelationNormalized: **mayor = mejor match**.
+/// Threshold DEFAULT de match para CrossCorrelationNormalized: **mayor = mejor match**.
 /// Rango [0.0, 1.0] donde 1.0 es match perfecto.
 ///
 /// CCORR_NORMED es más robusto que SSE a variaciones locales de brightness/overlay
@@ -49,13 +49,26 @@ use crate::sense::vision::crop::{crop_bgra, Roi};
 /// Los templates wiki difieren ligeramente del render real del cliente
 /// (anti-aliasing, paleta), lo que limita la precisión del matching.
 ///
-/// Para matching más preciso, reemplazar los templates wiki con crops
-/// directos del frame del usuario (ver Phase 2.4 del plan).
-const MATCH_THRESHOLD: f32 = 0.80;
+/// **Per-template override**: si `assets/templates/inventory/thresholds.toml`
+/// existe, cada template puede definir su propio threshold. Útil para:
+/// - Templates sparse (sprite con mucho fondo negro) que producen FPs a 0.80
+///   → usar 0.90+ para filtrar
+/// - Templates muy específicos donde queremos tolerancia mayor
+///
+/// Formato del TOML:
+/// ```toml
+/// white_pearl = 0.95
+/// magic_ring  = 0.95
+/// dragon_ham  = 0.88
+/// ```
+pub const MATCH_THRESHOLD: f32 = 0.80;
 
 struct ItemTemplate {
-    name:     String,
-    template: GrayImage,
+    name:      String,
+    template:  GrayImage,
+    /// Threshold específico para este template. Default = MATCH_THRESHOLD.
+    /// Cargado desde `thresholds.toml` en el mismo dir que los PNGs.
+    threshold: f32,
 }
 
 /// Resultado de leer el inventario con OCR de stack count.
@@ -94,6 +107,9 @@ impl InventoryReader {
     }
 
     /// Carga todos los templates PNG del directorio indicado.
+    ///
+    /// Si existe `<dir>/thresholds.toml`, aplica thresholds per-template.
+    /// Templates sin entry en el TOML usan `MATCH_THRESHOLD` como default.
     pub fn load_templates(&mut self, dir: &Path) {
         self.templates.clear();
         if !dir.exists() {
@@ -102,6 +118,15 @@ impl InventoryReader {
                 dir.display()
             );
             return;
+        }
+        // Cargar thresholds per-template (opcional).
+        let thresholds = load_thresholds(&dir.join("thresholds.toml"));
+        if !thresholds.is_empty() {
+            tracing::info!(
+                "InventoryReader: {} thresholds per-template cargados de {}",
+                thresholds.len(),
+                dir.join("thresholds.toml").display()
+            );
         }
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
@@ -126,11 +151,18 @@ impl InventoryReader {
                     continue;
                 }
             };
+            // Usar threshold per-template si está en el TOML, else default.
+            let threshold = thresholds.get(&name).copied().unwrap_or(MATCH_THRESHOLD);
+            let threshold_note = if (threshold - MATCH_THRESHOLD).abs() > f32::EPSILON {
+                format!(" threshold={:.3}", threshold)
+            } else {
+                String::new()
+            };
             tracing::info!(
-                "InventoryReader: template '{}' cargado ({}×{})",
-                name, template.width(), template.height()
+                "InventoryReader: template '{}' cargado ({}×{}){}",
+                name, template.width(), template.height(), threshold_note
             );
-            self.templates.push(ItemTemplate { name, template });
+            self.templates.push(ItemTemplate { name, template, threshold });
         }
     }
 
@@ -166,8 +198,9 @@ impl InventoryReader {
             // Match cada template contra este slot — encontrar el MEJOR
             // (no el primero alfabético). Esto evita que templates parecidos
             // ganen por orden de iteración.
-            let mut best_score: f32 = f32::MIN;
-            let mut best_name: Option<&str> = None;
+            // Guarda (score, name, threshold) del best match para comparar
+            // con su threshold específico — no con el global.
+            let mut best: Option<(f32, &str, f32)> = None;
             for tpl in &self.templates {
                 if slot_img.width() < tpl.template.width()
                     || slot_img.height() < tpl.template.height()
@@ -181,13 +214,13 @@ impl InventoryReader {
                 );
                 // CCORR_NORMED: **mayor = mejor**, buscamos el max.
                 let score = result.iter().cloned().fold(f32::MIN, f32::max);
-                if score > best_score {
-                    best_score = score;
-                    best_name = Some(&tpl.name);
+                let current_best_score = best.map_or(f32::MIN, |(s, _, _)| s);
+                if score > current_best_score {
+                    best = Some((score, tpl.name.as_str(), tpl.threshold));
                 }
             }
-            if best_score >= MATCH_THRESHOLD {
-                if let Some(name) = best_name {
+            if let Some((score, name, threshold)) = best {
+                if score >= threshold {
                     *counts.entry(name.to_string()).or_insert(0) += 1;
                 }
             }
@@ -213,8 +246,8 @@ impl InventoryReader {
             let Some(slot_img) = GrayImage::from_raw(slot.w, slot.h, luma) else { continue };
 
             // Best-match (no first-match) para evitar bias alfabético.
-            let mut best_score: f32 = f32::MIN;
-            let mut best_name: Option<&str> = None;
+            // Guarda threshold per-template del best match.
+            let mut best: Option<(f32, &str, f32)> = None;
             for tpl in &self.templates {
                 if slot_img.width() < tpl.template.width()
                     || slot_img.height() < tpl.template.height()
@@ -226,13 +259,13 @@ impl InventoryReader {
                     MatchTemplateMethod::CrossCorrelationNormalized,
                 );
                 let score = result.iter().cloned().fold(f32::MIN, f32::max);
-                if score > best_score {
-                    best_score = score;
-                    best_name = Some(&tpl.name);
+                let current_best_score = best.map_or(f32::MIN, |(s, _, _)| s);
+                if score > current_best_score {
+                    best = Some((score, tpl.name.as_str(), tpl.threshold));
                 }
             }
-            if best_score >= MATCH_THRESHOLD {
-                if let Some(name) = best_name {
+            if let Some((score, name, threshold)) = best {
+                if score >= threshold {
                     let name_string = name.to_string();
                     *slot_counts.entry(name_string.clone()).or_insert(0) += 1;
                     let stack = if !self.digit_templates.is_empty() {
@@ -251,6 +284,64 @@ impl InventoryReader {
 
 impl Default for InventoryReader {
     fn default() -> Self { Self::new() }
+}
+
+/// Carga thresholds per-template desde un TOML simple clave=valor.
+/// Formato esperado:
+/// ```toml
+/// white_pearl = 0.95
+/// magic_ring  = 0.95
+/// dragon_ham  = 0.88
+/// ```
+/// Claves son nombres de templates (sin .png). Valores son f32 en [0.0, 1.0].
+/// Retorna map vacío si el archivo no existe o falla el parseo.
+fn load_thresholds(path: &Path) -> HashMap<String, f32> {
+    let mut out = HashMap::new();
+    if !path.exists() {
+        return out;
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "InventoryReader: thresholds.toml existe pero no se pudo leer ({}): {}",
+                path.display(), e
+            );
+            return out;
+        }
+    };
+    // Parser muy simple: una clave=valor por línea, comentarios con #, trim.
+    for (line_no, raw) in content.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            warn!("thresholds.toml línea {}: formato inválido (sin '='): '{}'",
+                  line_no + 1, raw);
+            continue;
+        };
+        let key = k.trim().to_string();
+        let val_str = v.trim();
+        match val_str.parse::<f32>() {
+            Ok(val) if (0.0..=1.0).contains(&val) => {
+                out.insert(key, val);
+            }
+            Ok(val) => {
+                warn!(
+                    "thresholds.toml línea {}: valor fuera de rango [0,1] para '{}' = {}",
+                    line_no + 1, key, val
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "thresholds.toml línea {}: valor no-numérico para '{}': '{}' ({})",
+                    line_no + 1, key, val_str, e
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Convierte BGRA a luma (Y = 0.299R + 0.587G + 0.114B).
@@ -288,6 +379,64 @@ mod tests {
         let bgra = vec![100u8, 150, 200, 255, 50, 75, 100, 255];
         let luma = bgra_to_luma(&bgra, 2, 1);
         assert_eq!(luma.len(), 2);
+    }
+
+    // ── Per-template thresholds (Fase 1) ──────────────────────────────
+
+    #[test]
+    fn load_thresholds_nonexistent_returns_empty() {
+        let path = std::path::PathBuf::from("/tmp/doesnotexist-thresholds-xyz.toml");
+        let out = load_thresholds(&path);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn load_thresholds_parses_valid_toml() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_thresholds_valid.toml");
+        std::fs::write(&path,
+            "# comment\nwhite_pearl = 0.95\n\nmagic_ring = 0.9  # inline comment\ndragon_ham=0.85\n"
+        ).unwrap();
+        let out = load_thresholds(&path);
+        assert_eq!(out.get("white_pearl"), Some(&0.95));
+        assert_eq!(out.get("magic_ring"), Some(&0.9));
+        assert_eq!(out.get("dragon_ham"), Some(&0.85));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_thresholds_rejects_out_of_range() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_thresholds_oor.toml");
+        std::fs::write(&path, "bad = 2.5\ngood = 0.5\nneg = -0.1\n").unwrap();
+        let out = load_thresholds(&path);
+        assert_eq!(out.get("good"), Some(&0.5));
+        assert!(out.get("bad").is_none(), "valor >1 debe rechazarse");
+        assert!(out.get("neg").is_none(), "valor <0 debe rechazarse");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_thresholds_rejects_non_numeric() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_thresholds_nan.toml");
+        std::fs::write(&path, "bad = abc\ngood = 0.3\n").unwrap();
+        let out = load_thresholds(&path);
+        assert_eq!(out.get("good"), Some(&0.3));
+        assert!(out.get("bad").is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_thresholds_handles_malformed_lines() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_thresholds_malformed.toml");
+        std::fs::write(&path, "this is not key=value\nvalid = 0.7\n").unwrap();
+        let out = load_thresholds(&path);
+        // "this is not key=value" splitea en key="this is not key", val="value" → reject non-numeric
+        // "valid = 0.7" → OK
+        assert_eq!(out.get("valid"), Some(&0.7));
+        let _ = std::fs::remove_file(&path);
     }
 
     // ── M3: Performance benchmark ────────────────────────────────────────
@@ -337,6 +486,7 @@ mod tests {
             reader.templates.push(ItemTemplate {
                 name: format!("item_{}", i),
                 template: make_template(i * 12),
+                threshold: MATCH_THRESHOLD,
             });
         }
 

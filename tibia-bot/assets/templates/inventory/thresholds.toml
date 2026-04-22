@@ -1,0 +1,24 @@
+# thresholds.toml — Per-template match thresholds para InventoryReader.
+#
+# Formato: <template_name> = <float entre 0.0 y 1.0>
+# - 1.0 = match exacto requerido
+# - 0.8 = default (MATCH_THRESHOLD global)
+# - 0.95+ = estricto, para templates con tendencia a false positives
+# - 0.65-0.75 = permisivo, para templates que toleran variación
+#
+# Templates sin entry aquí usan el default 0.80.
+#
+# Calibrado live 2026-04-20 con char en Abdendriel.
+# Templates con historial de FP masivos (ver commits fea5b10, 3629241):
+#   - dragon_ham detectó 4 slots cuando hay 2 reales (2 FPs)
+#   - white_pearl detectaba 13 slots con 0 reales (13 FPs, template quarantined)
+#   - magic_ring detectaba 5 slots con 0 reales (5 FPs, template quarantined)
+#
+# Strategy: subir threshold a 0.88 en templates que aparecen "verdes/oscuros"
+# donde ruido del JPEG NDI produce correlaciones espurias.
+
+# Dragon ham — verde medio, tiende a matchear otros slots verdes del Bag row.
+dragon_ham = 0.88
+
+# Vial — frasco verde claro, similar shape puede matchear falsamente.
+vial = 0.85
