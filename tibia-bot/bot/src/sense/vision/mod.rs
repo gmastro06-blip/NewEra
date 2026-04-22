@@ -16,6 +16,7 @@ pub mod inventory;
 pub mod inventory_ocr;
 pub mod minimap;
 pub mod prompts;
+pub mod region_monitor;
 pub mod status_icons;
 pub mod target;
 pub mod templates;
