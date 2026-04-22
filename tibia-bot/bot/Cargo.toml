@@ -103,6 +103,19 @@ path = "src/bin/generate_cavebot.rs"
 name = "label_dataset"
 path = "src/bin/label_dataset.rs"
 
+[features]
+default = []
+# ML runtime opt-in (Fase 2.5): habilita ort + ndarray para clasificación
+# de inventory con modelo ONNX. Sin esta feature, MlInventoryReader es scaffold
+# que devuelve None (fallback SSE matcher activo).
+#
+# Build con ML:
+#   cargo build --release --bin NewEra --features ml-runtime
+#
+# Cost: ~10 MB extra al binary (ONNX Runtime native lib), ~30% más compile
+# time. Solo activar cuando hay un modelo entrenado y validado.
+ml-runtime = ["dep:ort", "dep:ndarray"]
+
 [dependencies]
 # ── Runtime async ────────────────────────────────────────────────────────────
 tokio              = { workspace = true }
@@ -168,6 +181,15 @@ clap               = { version = "4", features = ["derive"] }
 # bot vía /test/* endpoints sin tocar PicoLink directamente.
 # `rustls-tls` evita depender de OpenSSL del sistema (Windows cross-build).
 reqwest            = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+
+# ── ML runtime (Fase 2.5 — opt-in via feature `ml-runtime`) ────────────────
+# ort: ONNX Runtime bindings para Rust. Carga modelo ONNX entrenado con
+# ml/train_inventory_classifier.py y hace inferencia en CPU.
+# `download-binaries`: descarga libonnxruntime automáticamente al build
+#   (vs `load-dynamic` que requiere lib en sistema). +10 MB binary.
+ort                = { version = "2.0.0-rc.10", default-features = false, features = ["download-binaries"], optional = true }
+# ndarray: tensor library para construir input al modelo (1×3×32×32).
+ndarray            = { version = "0.16", optional = true }
 
 # ── Windows API — GetCursorPos en /vision/cursor y /vision/extract_template ──
 # Permite workflow de calibración cursor-based sin PowerShell externo.

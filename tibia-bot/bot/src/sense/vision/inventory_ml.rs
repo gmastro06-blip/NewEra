@@ -54,10 +54,14 @@ use serde::Deserialize;
 
 /// Reader ML para clasificación de inventory slots.
 ///
-/// **Estado**: scaffold. `infer_slot()` siempre devuelve None hasta wire de
-/// `ort` runtime. El consumer hace fallback a SSE matcher.
+/// **Estado**: dual mode según feature `ml-runtime`:
+/// - **Sin feature** (default): scaffold. `infer_slot()` devuelve None.
+///   El consumer hace fallback a SSE matcher.
+/// - **Con feature `ml-runtime`**: ort runtime real. `infer_slot()` ejecuta
+///   inferencia ONNX y retorna predicción si confidence ≥ threshold.
 pub struct MlInventoryReader {
     /// Path del modelo ONNX (validado al construir).
+    #[allow(dead_code)] // usado solo con feature ml-runtime
     model_path:           PathBuf,
     /// Clases conocidas (cargadas del classes.json). Idx en este Vec
     /// corresponde al output del modelo.
@@ -66,6 +70,9 @@ pub struct MlInventoryReader {
     confidence_threshold: f32,
     /// `true` si modelo + clases cargaron OK (aunque inference no esté wired).
     ready:                bool,
+    /// ort Session, sólo presente con feature `ml-runtime`.
+    #[cfg(feature = "ml-runtime")]
+    session: Option<ort::session::Session>,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +91,8 @@ impl MlInventoryReader {
             classes:              Vec::new(),
             confidence_threshold: 0.0,
             ready:                false,
+            #[cfg(feature = "ml-runtime")]
+            session: None,
         }
     }
 
@@ -122,12 +131,33 @@ impl MlInventoryReader {
             return Self::new_empty();
         }
 
-        // TODO INTEGRATION: cargar ort::Session aquí.
-        // Por ahora marcamos ready=true para indicar que la config es válida,
-        // pero `infer_slot()` igual devuelve None hasta que ort esté wired.
+        // ort::Session solo se carga con feature `ml-runtime` activa.
+        // Sin feature, scaffold (ready=true pero infer_slot devuelve None).
+        #[cfg(feature = "ml-runtime")]
+        let session = match ort::session::Session::builder()
+            .and_then(|b| b.commit_from_file(model_path))
+        {
+            Ok(s) => {
+                tracing::info!(
+                    "MlInventoryReader[ml-runtime]: ort::Session cargada de '{}' \
+                     ({} clases, threshold={:.2}).",
+                    model_path.display(), classes.len(), confidence_threshold
+                );
+                Some(s)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "MlInventoryReader[ml-runtime]: error cargando ort::Session de '{}': {}. \
+                     Cae a fallback SSE.",
+                    model_path.display(), e
+                );
+                return Self::new_empty();
+            }
+        };
+        #[cfg(not(feature = "ml-runtime"))]
         tracing::info!(
-            "MlInventoryReader: scaffold cargado (modelo='{}', {} clases, threshold={:.2}). \
-             Inference NOT WIRED — fallback SSE activo.",
+            "MlInventoryReader[scaffold]: modelo='{}' validado, {} clases, threshold={:.2}. \
+             Compilar con --features ml-runtime para habilitar inferencia ONNX.",
             model_path.display(), classes.len(), confidence_threshold
         );
         Self {
@@ -135,6 +165,8 @@ impl MlInventoryReader {
             classes,
             confidence_threshold,
             ready: true,
+            #[cfg(feature = "ml-runtime")]
+            session,
         }
     }
 
@@ -160,23 +192,78 @@ impl MlInventoryReader {
     /// Infiere la clase de un slot 32×32. Devuelve `Some((class_name, confidence))`
     /// si confidence ≥ threshold, o `None` si:
     /// - reader inhábil
-    /// - inference no wired aún (estado actual)
+    /// - feature `ml-runtime` no activa (scaffold mode)
     /// - confidence bajo el threshold
     /// - error en runtime
-    #[allow(dead_code)] // wired desde inventory.rs cuando ort esté integrado
-    pub fn infer_slot(&self, _slot: &GrayImage) -> Option<(String, f32)> {
+    /// - dimensiones del slot no son 32×32
+    #[allow(dead_code)] // wired desde inventory.rs cuando MlConfig.use_ml=true
+    pub fn infer_slot(&self, slot: &GrayImage) -> Option<(String, f32)> {
         if !self.ready {
             return None;
         }
-        // TODO INTEGRATION: ort inference aquí.
-        // 1. Convertir slot luma 32×32 → ndarray (1, 3, 32, 32) con
-        //    R=G=B=luma/255.0 (replicar canales).
-        // 2. session.run(inputs![...])
-        // 3. extract logits, softmax, argmax + confidence
-        // 4. Si confidence >= self.confidence_threshold:
-        //      Some((self.classes[argmax].clone(), confidence))
-        //    Else None.
-        None
+        if slot.width() != 32 || slot.height() != 32 {
+            return None;
+        }
+        #[cfg(feature = "ml-runtime")]
+        {
+            self.infer_slot_ort(slot)
+        }
+        #[cfg(not(feature = "ml-runtime"))]
+        {
+            let _ = slot;
+            None
+        }
+    }
+
+    /// Implementación real de inferencia con ort. Solo compilada con feature.
+    #[cfg(feature = "ml-runtime")]
+    fn infer_slot_ort(&self, slot: &GrayImage) -> Option<(String, f32)> {
+        let session = self.session.as_ref()?;
+        // Convertir luma 32×32 a tensor (1, 3, 32, 32) f32 [0, 1].
+        // Replica el canal luma para R, G, B (modelo entrenado en RGB).
+        let mut data = Vec::with_capacity(3 * 32 * 32);
+        // Channel R
+        for y in 0..32 {
+            for x in 0..32 {
+                data.push(slot.get_pixel(x, y).0[0] as f32 / 255.0);
+            }
+        }
+        // Channel G (replica)
+        for y in 0..32 {
+            for x in 0..32 {
+                data.push(slot.get_pixel(x, y).0[0] as f32 / 255.0);
+            }
+        }
+        // Channel B (replica)
+        for y in 0..32 {
+            for x in 0..32 {
+                data.push(slot.get_pixel(x, y).0[0] as f32 / 255.0);
+            }
+        }
+        let tensor = ndarray::Array4::from_shape_vec((1, 3, 32, 32), data).ok()?;
+        let inputs = ort::inputs!["input" => ort::value::TensorRef::from_array_view(&tensor).ok()?];
+        let outputs = session.run(inputs).ok()?;
+        let logits = outputs.get("logits")?.try_extract_array::<f32>().ok()?;
+        let logits_view = logits.view();
+        let logits_slice = logits_view.as_slice()?;
+        // Softmax + argmax
+        let max_logit = logits_slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits_slice.iter().map(|x| (x - max_logit).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let mut best_idx = 0;
+        let mut best_prob = 0.0f32;
+        for (i, e) in exps.iter().enumerate() {
+            let p = e / sum;
+            if p > best_prob {
+                best_prob = p;
+                best_idx = i;
+            }
+        }
+        if best_prob < self.confidence_threshold {
+            return None;
+        }
+        let class_name = self.classes.get(best_idx)?.clone();
+        Some((class_name, best_prob))
     }
 }
 
