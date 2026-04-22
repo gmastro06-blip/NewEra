@@ -220,3 +220,7 @@ harness = false
 [[bench]]
 name    = "pathfinding"
 harness = false
+
+[[bench]]
+name    = "fase1_overhead"
+harness = false

@@ -879,9 +879,12 @@ impl Vision {
         }
 
         // Inventory: contar items + leer stack counts via OCR cada N frames.
+        // Fase 2.5 wire: si ml_reader está ready, delega a ML con fallback SSE.
+        // Split borrow: &self.inventory_reader + &mut self.ml_reader (campos
+        // distintos) — Rust lo permite.
         if let Some(ref reader) = self.inventory_reader {
             if self.frame_count % self.inventory_detect_interval as u64 == 0 {
-                let reading = reader.read_with_stacks(frame);
+                let reading = reader.read_with_stacks_ml(frame, self.ml_reader.as_mut());
                 self.last_inventory_counts = reading.slot_counts;
                 self.last_inventory_stacks = reading.stack_totals;
             }

@@ -64,8 +64,12 @@ All code is Rust in a Cargo workspace with two members: `bot/` and `bridge/`.
 ## Build & Run
 
 ```bash
-# Build both members
+# Build both members (default = sin ML)
 cargo build --release
+
+# Build con ML runtime opt-in (ort + ndarray, +~10 MB binary).
+# Requiere libonnxruntime instalada en sistema y ORT_LIB_LOCATION env var.
+cargo build --release --bin NewEra --features ml-runtime
 
 # Run the bot (from tibia-bot/)
 cd tibia-bot && ./target/release/NewEra bot/config.toml assets
@@ -114,9 +118,25 @@ cargo run --release --bin replay_perception -- --input session.jsonl [--summary 
 cargo run --release --bin path_finder -- --walkability assets/walkability.bin \
                                           # multi-floor A* between 2 absolute coords (F4)
   --from X,Y,Z --to X,Y,Z [--simplify] [--overrides assets/pathfinding_overrides.toml] [--output snippet.toml]
+cargo run --release --bin extract_inventory_slots -- --frame frame.png --output /tmp/slots
+                                          # recorta 16 slots del inventory_backpack_strip para calibrar templates live
+cargo run --release --bin tune_inventory_strip -- --frame frame.png --x 1567 --y 22 ...
+                                          # dibuja overlay de slots sobre frame para calibrar backpack_h/offsets
+cargo run --release --bin label_dataset -- --manifest datasets/v1/manifest.csv \
+                                          # CLI etiquetado offline para dataset ML (Fase 2.3)
+  --classes vial,golden_backpack,empty [--relabel]
+cargo run --release --bin click_live -- --coord X,Y --button L [--verify-template NAME]
+                                          # standalone click validator (Fase 1 ADR-003)
 ```
 
 To also build the walkability grid for pathfinding, add `--walkability assets/walkability.bin` to the `build_map_index` command — it parses `Minimap_WaypointCost_*.png` from the same map dir.
+
+**Benchmarks** (criterion):
+```bash
+cargo bench --bench template_matching     # UiDetector template performance
+cargo bench --bench pathfinding           # A* performance sobre walkability grid
+cargo bench --bench fase1_overhead        # Fase 1.4 shift-tolerance + Fase 1.5 region_monitor
+```
 
 ## Architecture
 
@@ -153,8 +173,12 @@ FrameBuffer ──────► │    read frame    │           serial COM)
 | `bot/src/sense/vision/hp_mana.rs` | Pixel counting on color bars (not edge detection) |
 | `bot/src/sense/vision/anchors.rs` | Template matching for reference points; detects window drift |
 | `bot/src/sense/vision/game_coords.rs` | Tile-hashing of minimap → absolute (x,y,z) via dHash + MapIndex |
-| `bot/src/sense/vision/inventory.rs` | Template matching of item icons in backpack slots |
-| `bot/src/act/pico_link.rs` | Async TCP client with exponential backoff and 100ms per-command timeout |
+| `bot/src/sense/vision/inventory.rs` | Template matching SSE + per-template thresholds + NMS + stack strip + shift tolerance (Fase 1.1-1.4) |
+| `bot/src/sense/vision/inventory_ml.rs` | ML classifier opcional (ONNX via ort, feature `ml-runtime`); fallback transparente a SSE matcher |
+| `bot/src/sense/vision/inventory_ocr.rs` | Digit OCR bottom-right 16×8 px para stack counts (1..999) |
+| `bot/src/sense/vision/region_monitor.rs` | Framework diff L1 per-región frame-a-frame (Fase 1.5) |
+| `bot/src/sense/dataset_recorder.rs` | Captura crops 32×32 para training ML; manifest CSV + PNGs en `datasets/` (Fase 2.1) |
+| `bot/src/act/pico_link.rs` | Async TCP client with exponential backoff and 100ms per-command timeout (nombre legacy — hoy habla con Arduino Leonardo) |
 | `bot/src/act/coords.rs` | Viewport → Desktop → HID absolute coordinate transforms |
 | `bot/src/remote/http.rs` | axum REST API: `/status`, `/pause`, `/resume`, `/vision/*`, `/test/*` |
 | `bot/src/cavebot/` | Hunt automation: labels, goto jumps, conditionals, stand_until |
@@ -267,6 +291,7 @@ GET  /vision/loot/debug       — loot detection debug JSON
 GET  /vision/loot/grab        — loot area crop PNG
 GET  /vision/grab/inventory   — frame with backpack slots drawn (yellow boxes)
 GET  /vision/inventory        — JSON: slot count + detected item counts + grid config
+GET  /vision/region_monitor   — JSON: diff ratio per-región (Fase 1.5 wire)
 
 # FSM / combat
 GET  /fsm/debug               — FSM internal state
@@ -295,6 +320,11 @@ GET  /metrics                 — Prometheus/OpenMetrics format (ticks, latencie
 # Recording (F1)
 POST /recording/start?path=X  — start writing perception snapshots to X.jsonl
 POST /recording/stop          — stop writing and flush
+
+# Dataset capture para training ML (Fase 2.2)
+POST /dataset/start?dir=X&interval=N&tag=S  — start capturing inventory slots crops
+POST /dataset/stop            — stop capture + flush manifest CSV
+GET  /dataset/status          — {"active":bool,"crops_total":N,"dir":"..."}
 ```
 
 ## Monitoring stack (Prometheus + Grafana)
@@ -610,7 +640,20 @@ cargo run --release --bin tune_inventory_strip -- \
 # 5. Pegar el bloque TOML que imprime en calibration.toml
 ```
 
-**Templates**: `assets/templates/inventory/<name>.png` — 32 PNGs pre-shipped for all potions + runes (downloaded from Tibia wiki). Match threshold = 0.15 SSE normalized.
+**Templates**: `assets/templates/inventory/<name>.png` — 70+ PNGs (live-extracted with `extract_inventory_slots` + 4 wiki-origin quarantined en `_wiki_unmatched/`). Match threshold = **0.80 por-default, per-template override** via `assets/templates/inventory/thresholds.toml`:
+```toml
+# Template con tendencia a false positives → threshold estricto
+dragon_ham = 0.95
+vial       = 0.85
+# Templates no listados usan MATCH_THRESHOLD (0.80)
+```
+(Commit `fed9387` Fase 1.1 — sube threshold para sprites sparse o de alta similitud cromática con fondo.)
+
+**Fase 1 SSE mejoras** (all opt-in, backward compatible):
+- **Per-template thresholds** (1.1): ver bloque arriba.
+- **NMS cross-slot dedup** (1.2): si 4 slots matchean el mismo template, filtra los scores fuera del `NMS_SCORE_GAP=0.08` del top. Reduce FPs por mobs similares entre sí.
+- **Stack count strip** (1.3): antes del matching, excluye las `STACK_COUNT_HEIGHT_PX=8` rows inferiores (donde se renderiza el número). Evita mismatch entre template "vial×3" y slot "vial×21".
+- **Shift-tolerant matching ±2 px** (1.4): extract slot con `SHIFT_TOLERANCE_PX=2` de padding, `match_template` sliding window cubre 5×5 posiciones. Tolera drift de calibración sin perder matches. **Cost empírico** (bench `fase1_overhead`): 16 slots × 5 templates exact = 121 µs, con shift ±2 px = 1.62 ms (**13× overhead**, no 5× como se estimó inicialmente). Amortizado a cadence 1/15 ticks = ~0.1 ms/tick, dentro del budget 33 ms.
 
 **Verification**: `GET /vision/grab/inventory` returns the current frame with yellow rectangles drawn on each slot ROI. `GET /vision/inventory` returns JSON with current per-item counts.
 
@@ -629,6 +672,93 @@ cargo run --release --bin tune_inventory_strip -- \
 **Conditions**:
 - `has_item(name, N)` — ≥ N slots with the item icon matching
 - `has_stack(name, N)` — ≥ N total units via OCR stack count (falls back to has_item if no digit templates)
+
+## Inventory ML classifier (Fase 2 — opt-in)
+
+`bot/src/sense/vision/inventory_ml.rs` puede reemplazar el matcher SSE del inventory por un classifier CNN entrenado con `ml/train_inventory_classifier.py` (Python). Feature flag `ml-runtime` controla si se compila ort runtime:
+
+```bash
+# Build default (SSE matcher, ort NO linkeado)
+cargo build --release --bin NewEra
+
+# Build con ML (ort + ndarray linkeados, +~10 MB)
+cargo build --release --bin NewEra --features ml-runtime
+```
+
+Config en `config.toml`:
+```toml
+[ml]
+use_ml               = false                                # default off
+model_path           = "ml/models/inventory_v1.onnx"        # vacío = off
+classes_path         = "ml/models/inventory_v1.classes.json"
+confidence_threshold = 0.80                                 # softmax max ≥ esto
+```
+
+**Runtime behavior** cuando `use_ml=true` + modelo cargado + feature activa:
+- `Vision::tick` llama `read_with_stacks_ml(frame, Some(&mut ml_reader))`.
+- Por slot: primero intenta `infer_slot` (32×32 RGB tensor → softmax → argmax).
+- Si confidence ≥ threshold → usa ML class name.
+- Si infer_slot devuelve None → fallback automático al SSE matcher (`best_match_for_slot`).
+- Sin feature `ml-runtime` o sin modelo → 100% fallback SSE (comportamiento identico al previo).
+
+**Dataset capture workflow** (requerido antes de entrenar):
+```bash
+# 1. Captura live (bot + Tibia + OBS activos)
+TOKEN="<bearer del config>"
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+    "http://localhost:8080/dataset/start?dir=datasets/v1&interval=15&tag=hunt1"
+# ...sesión hunt diversa...
+curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:8080/dataset/stop
+curl -s  -H "Authorization: Bearer $TOKEN" http://localhost:8080/dataset/status
+# → {"active":false,"crops_total":1234,"dir":"datasets/v1"}
+
+# 2. Etiquetado offline (abre cada PNG en OS viewer, prompts clase)
+cargo run --release --bin label_dataset -- \
+    --manifest datasets/v1/manifest.csv \
+    --classes vial,golden_backpack,green_backpack,white_key,dragon_ham,empty
+# Atajos: 0..9/a..z selección rápida, s=skip, u=undo, q=quit+save
+
+# 3. Training (Python, fuera de Rust)
+cd tibia-bot/ml
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python train_inventory_classifier.py \
+    --manifest ../datasets/v1/manifest.csv \
+    --output models/inventory_v1.onnx --epochs 30
+# → models/inventory_v1.onnx + .classes.json + .metrics.json
+
+# 4. Runtime: build con feature + set [ml].use_ml=true
+cargo build --release --bin NewEra --features ml-runtime
+```
+
+Ver `ml/README.md` para detalles del pipeline y arquitectura del modelo (CNN 3 conv + 2 dense, ~150K params, ONNX ~600 KB).
+
+## Region monitor — diff genérico per-región (Fase 1.5)
+
+`bot/src/sense/vision/region_monitor.rs` captura snapshots BGRA de ROIs registradas y computa diff L1 normalizado frame-a-frame. Wired en `BotLoop::new()` con 3 regiones default (battle_list, minimap, viewport) con thresholds (0.05, 0.05, 0.10).
+
+**Endpoint** `GET /vision/region_monitor`:
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/vision/region_monitor
+# [{"name":"battle_list","change_ratio":0.012,"above_threshold":false,"first_tick":false},
+#  {"name":"minimap","change_ratio":0.003,"above_threshold":false,"first_tick":false},
+#  {"name":"viewport","change_ratio":0.087,"above_threshold":false,"first_tick":false}]
+```
+
+Útil para diagnóstico: `battle_list change_ratio` salta a 0.5 cuando un mob entra/sale; `viewport` > 0.10 sostenido sugiere transición de escena sin template match (prompt sin calibrar).
+
+Framework genérico — otros consumers pueden `add_region(name, roi, threshold)` y leer `last_change_tick()`. No trigger automático del FSM.
+
+**Cost empírico** (bench `fase1_overhead`): tick() con 3 regiones sobre frame 1920×1080 = **~3 ms** (battle_list 171×997 + minimap 107×110 + viewport 967×719). 9% del budget 33 ms/tick. Si el viewport diff se vuelve caro en el futuro, opciones: sub-sampling stride o cadence < 30 Hz.
+
+## Attack highlight detection (Tibia 12 — Fase post-V7)
+
+`bot/src/sense/vision/color.rs::is_attack_highlight()` detecta el cuadrado cyan/purple que Tibia 12 pinta alrededor del icono del slot atacado (vs el borde rojo clásico). Usado por `detect_is_being_attacked` como **fuente 2** (dual-source):
+
+1. Clientes clásicos: `red_hits ≥ 2` en borde izq del slot (legacy).
+2. Tibia 12: ≥ `ATTACK_HIGHLIGHT_MIN_HITS=10` pixels cyan/purple en area del icono (first `ICON_AREA_WIDTH_PX=25` cols).
+
+Patrón cyan: `B ≥ 180 && B > R + 40 && G ≥ 130` (distingue de `is_player_blue` que tiene `G ≤ 80`). Evidencia empírica: pixels típicos `(146,146,209), (75,196,225), (91,203,245)`.
 
 ## Scripting — Lua hooks
 

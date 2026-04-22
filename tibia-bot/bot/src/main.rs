@@ -199,6 +199,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("assets"));
     let mut vision = Vision::load(&assets_dir);
     vision.load_map_index(&config.game_coords);
+    // Fase 2.5: cargar classifier ML si config.ml.use_ml=true + paths válidos.
+    // Sin feature `ml-runtime` o sin modelo en disco → reader inhábil,
+    // fallback SSE matcher automático.
+    vision.load_ml_model(&config.ml);
     if vision.is_calibrated() {
         info!("Vision calibrada y lista.");
     } else {
