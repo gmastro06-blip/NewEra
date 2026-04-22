@@ -48,6 +48,28 @@ test_frames/
 /slot_*.png
 /clean.png
 /current.png
+# Transient debug PNGs en root (sesión live 2026-04-20+)
+/backpacks.png
+/battle_*.png
+/bl_*.png
+/exp_*.png
+/final_*.png
+/fp_*.png
+/frame*.png
+/inv*.png
+/live*.png
+/mob_*.png
+/mosaic_*.png
+/s10*.png
+/s11*.png
+/s13*.png
+/slot0*.png
+/slots_*.png
+/tuned*.png
+/extracted_slots/
+# Datasets generados por DatasetRecorder (Fase 2 ML) — per-user, voluminosos
+datasets/
+tibia-bot/datasets/
 
 # Debug captures que el bot escribe al CWD del proceso
 tibia-bot/grab_*.png
