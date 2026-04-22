@@ -6,8 +6,10 @@
 //! - Output via `Arc<ArcSwap<HealthStatus>>` — HTTP + FSM read lock-free.
 //! - Histéresis sticky: promote requiere N ticks consecutivos, recovery N ticks.
 //!
-//! Costo estimado por evaluate_tick: ~1 µs (10 threshold checks + 1 ArcSwap
-//! store + alloc del Vec<HealthIssue>). Validar con bench en sesión siguiente.
+//! Costo medido empírico (bench `health_evaluate_tick_steady_state_*`):
+//! - Estado Ok (sin issues): **655 ns/call**
+//! - Estado degraded (multiple critical + composite): **1.10 µs/call**
+//! 0.002-0.003% del budget 33 ms/tick. Negligible.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

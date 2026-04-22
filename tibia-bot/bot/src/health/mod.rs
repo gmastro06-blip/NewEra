@@ -17,10 +17,12 @@
 //! - Output publicado vía `Arc<ArcSwap<HealthStatus>>` — HTTP read lock-free.
 //! - HealthGate clonable a FSM/dispatch (snapshot temporal por tick).
 //!
-//! ## Costo
+//! ## Costo (medido empírico, bench `health_evaluate_tick_steady_state_*`)
 //!
-//! Estimado: ~1 µs por evaluate_tick (10 threshold checks + 2 stddev sobre
-//! windows + 1 ArcSwap store). Validar con bench. <0.003% del budget 33 ms.
+//! - Ok state: **655 ns/call**
+//! - Degraded state (multiple critical + composite): **1.10 µs/call**
+//!
+//! 0.002-0.003% del budget 33 ms/tick. Negligible.
 
 pub mod system;
 pub mod gate;

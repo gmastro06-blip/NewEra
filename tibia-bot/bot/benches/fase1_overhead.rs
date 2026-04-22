@@ -254,6 +254,92 @@ fn bench_instrumentation_record_action_ack(c: &mut Criterion) {
     });
 }
 
+// ── HealthSystem evaluate_tick overhead ────────────────────────────────
+//
+// Mide el costo de la evaluación per-tick del HealthSystem. Claim del
+// commit ee60545: "~1 µs estimado". Validación empírica.
+
+fn bench_health_evaluate_tick(c: &mut Criterion) {
+    use tibia_bot::health::{HealthConfig, HealthSystem};
+    use tibia_bot::health::system::ExtraInputs;
+    use tibia_bot::instrumentation::{
+        ActionKindTag, MetricsRegistry, ReaderId, TickFlags, TickMetrics,
+    };
+
+    let mut sys = HealthSystem::new(HealthConfig::default());
+    let registry = MetricsRegistry::new();
+
+    let mk_tick = |i: u64| {
+        let mut per_reader = [0u16; ReaderId::COUNT];
+        per_reader[ReaderId::HpMana as usize]    = 100;
+        per_reader[ReaderId::Battle as usize]    = 5_000;
+        per_reader[ReaderId::Inventory as usize] = if i % 15 == 0 { 8_000 } else { 0 };
+        TickMetrics {
+            tick: i,
+            frame_seq: i,
+            ts_unix_ms: 1_745_347_291_000 + i,
+            frame_age_us: 80_000,
+            acquire_us: 50,
+            vision_total_us: 12_000,
+            filter_us: 300,
+            fsm_us: 200,
+            dispatch_us: 100,
+            state_write_us: 0,
+            tick_total_us: 18_000,
+            vision_per_reader_us: per_reader,
+            last_action_kind: ActionKindTag::Key,
+            last_action_rtt_us: 0,
+            valid_anchors: 2,
+            total_anchors: 2,
+            anchor_confidence_bp: 10_000,
+            vitals_confidence_bp: 9_500,
+            target_confidence_bp: 8_000,
+            enemies_visible: 3,
+            inventory_items: 5,
+            flags: TickFlags::NONE,
+        }
+    };
+
+    // Pre-warm con 100 ticks para que las windows estén pobladas.
+    for i in 0..100 {
+        registry.record_tick(mk_tick(i));
+        sys.evaluate_tick(&mk_tick(i), &registry, ExtraInputs::default());
+    }
+
+    c.bench_function("health_evaluate_tick_steady_state_ok", |b| {
+        let mut i = 100u64;
+        b.iter(|| {
+            let m = mk_tick(i);
+            registry.record_tick(m);
+            let s = sys.evaluate_tick(black_box(&m), black_box(&registry),
+                                      ExtraInputs::default());
+            black_box(s);
+            i += 1;
+        });
+    });
+
+    // Escenario degradado: varios issues activos + composite triggered.
+    let mk_degraded_tick = |i: u64| {
+        let mut m = mk_tick(i);
+        m.frame_age_us = 250_000;     // FrameStale critical
+        m.tick_total_us = 60_000;     // TickOverrun critical
+        m.vision_total_us = 30_000;   // VisionSlow critical
+        m.flags = TickFlags::ANCHOR_LOST | TickFlags::FRAME_STALE;
+        m
+    };
+    c.bench_function("health_evaluate_tick_steady_state_degraded", |b| {
+        let mut i = 200u64;
+        b.iter(|| {
+            let m = mk_degraded_tick(i);
+            registry.record_tick(m);
+            let s = sys.evaluate_tick(black_box(&m), black_box(&registry),
+                                      ExtraInputs { anchor_drift_streak: 10, bridge_rtt_ms: None });
+            black_box(s);
+            i += 1;
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_inventory_exact_vs_shift,
@@ -261,5 +347,6 @@ criterion_group!(
     bench_perception_filter_apply,
     bench_instrumentation_record_tick,
     bench_instrumentation_record_action_ack,
+    bench_health_evaluate_tick,
 );
 criterion_main!(benches);
