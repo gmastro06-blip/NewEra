@@ -196,8 +196,12 @@ impl MlInventoryReader {
     /// - confidence bajo el threshold
     /// - error en runtime
     /// - dimensiones del slot no son 32×32
+    ///
+    /// **`&mut self`**: requerido por ort v2 API — `Session::run()` toma `&mut`.
+    /// Sin feature `ml-runtime` el mut no se usa, pero se mantiene para evitar
+    /// cambio de signature entre builds.
     #[allow(dead_code)] // wired desde inventory.rs cuando MlConfig.use_ml=true
-    pub fn infer_slot(&self, slot: &GrayImage) -> Option<(String, f32)> {
+    pub fn infer_slot(&mut self, slot: &GrayImage) -> Option<(String, f32)> {
         if !self.ready {
             return None;
         }
@@ -217,8 +221,8 @@ impl MlInventoryReader {
 
     /// Implementación real de inferencia con ort. Solo compilada con feature.
     #[cfg(feature = "ml-runtime")]
-    fn infer_slot_ort(&self, slot: &GrayImage) -> Option<(String, f32)> {
-        let session = self.session.as_ref()?;
+    fn infer_slot_ort(&mut self, slot: &GrayImage) -> Option<(String, f32)> {
+        let session = self.session.as_mut()?;
         // Convertir luma 32×32 a tensor (1, 3, 32, 32) f32 [0, 1].
         // Replica el canal luma para R, G, B (modelo entrenado en RGB).
         let mut data = Vec::with_capacity(3 * 32 * 32);
@@ -361,10 +365,15 @@ mod tests {
         let classes = dir.join("classes.json");
         std::fs::write(&model, b"x").unwrap();
         std::fs::write(&classes, r#"{"classes":["a"]}"#).unwrap();
-        let r = MlInventoryReader::load(&model, &classes, 0.5);
+        let mut r = MlInventoryReader::load(&model, &classes, 0.5);
         assert!(r.is_ready());
         let slot = GrayImage::new(32, 32);
-        // Stub: hasta wire de ort, siempre None aunque ready=true.
+        // Sin feature ml-runtime: siempre None (scaffold).
+        // Con feature ml-runtime pero sin libonnxruntime disponible (load-dynamic):
+        // load() puede fallar y reader quedar inhábil — igualmente None.
+        // Con feature + libonnxruntime + model válido: podría retornar Some,
+        // pero este test usa un fake .onnx (b"placeholder onnx"), así que
+        // la Session::commit_from_file fallará y reader quedará inhábil.
         assert_eq!(r.infer_slot(&slot), None);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -23,12 +23,14 @@ vocation       = "druid"  # druid | knight | paladin | sorcerer
 # Loot (corregido 2026-04-17 con datos del usuario)
 # ─────────────────────────────────────────────────────────────────────
 [loot]
-# Drops wiki-validated 2026-04-20: Wasp dropea SOLO Honeycomb (rare ~1.5%).
-# NO dropea gold_coin ni mana_potion. mana_potion era supply (refill), no loot
-# — movido fuera de [loot]. Si hay otros mobs en spawn (Bug, etc.) sus drops
-# adicionales se acumulan automáticamente.
+# Drops 2026-04-20: wiki-strict dice Wasp solo dropea Honeycomb. PERO el
+# user puede acumular gold_coin de otros mobs en zona (Bug, etc.) o de
+# gold tirado en el mapa. Mantenemos gold_coin en stackables como realidad
+# práctica del hunt.
+# Removido mana_potion: era supply (refill), no loot real.
 stackables = [
-    "honeycomb",           # único drop de Wasp según wiki
+    "gold_coin",           # acumulado desde mobs cercanos + pickup
+    "honeycomb",           # drop principal de Wasp (wiki-validated)
 ]
 
 # Non-stackables: Wasp no tiene non-stackable drops según wiki.

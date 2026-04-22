@@ -268,6 +268,84 @@ impl InventoryReader {
     /// Versión extendida que también lee el stack count via OCR (M1).
     /// Si `digit_templates` está vacío, `stack_totals` cae al fallback de
     /// `slot_counts` (1 unit per slot).
+    ///
+    /// **ML delegation (Fase 2.5)**: si `ml_reader` provisto y ready, por cada
+    /// slot primero intenta `ml_reader.infer_slot()`. Si devuelve `Some((class,
+    /// conf))`, usa esa clase — salta el SSE matcher. Si None, fallback SSE.
+    /// Sin feature `ml-runtime`, `infer_slot` siempre None → 100% fallback SSE.
+    #[allow(dead_code)] // public API
+    pub fn read_with_stacks_ml(
+        &self,
+        frame:      &Frame,
+        ml_reader:  Option<&mut super::inventory_ml::MlInventoryReader>,
+    ) -> InventoryReading {
+        let mut slot_counts:  HashMap<String, u32> = HashMap::new();
+        let mut stack_totals: HashMap<String, u32> = HashMap::new();
+        if self.is_empty() {
+            return InventoryReading { slot_counts, stack_totals };
+        }
+        let use_ml = ml_reader.as_ref().map(|r| r.is_ready()).unwrap_or(false);
+        let ml_ref_opt = if use_ml { ml_reader } else { None };
+        // Wrap en RefCell para permitir &mut desde el loop interno
+        // (ml_ref_opt es Option<&mut>, podemos take y poner back).
+        let mut ml_inner = ml_ref_opt;
+
+        for slot in &self.slots {
+            let Some((slot_img_padded, _)) = extract_slot_with_shift_tolerance(frame, slot) else {
+                continue;
+            };
+            // Extract slot exact también para OCR + ML (ML requiere 32×32 exact).
+            let exact_slot = crop_bgra(frame, Roi::new(slot.x, slot.y, slot.w, slot.h))
+                .and_then(|bgra| {
+                    let luma = bgra_to_luma(&bgra, slot.w, slot.h);
+                    GrayImage::from_raw(slot.w, slot.h, luma)
+                });
+
+            // Intento 1: ML classifier (si provisto + ready).
+            let ml_match: Option<(String, f32)> = if let (Some(ref mut ml), Some(ref slot_exact)) =
+                (ml_inner.as_deref_mut(), exact_slot.as_ref())
+            {
+                ml.infer_slot(slot_exact)
+            } else {
+                None
+            };
+
+            // Intento 2: fallback SSE (best-match + threshold per-template).
+            let sse_match: Option<(f32, String)> = if ml_match.is_none() {
+                best_match_for_slot(&slot_img_padded, &self.templates)
+            } else {
+                None
+            };
+
+            // Determinar resultado final.
+            let (name_opt, _score_opt) = match (ml_match, sse_match) {
+                (Some((cls, conf)), _) => (Some(cls), Some(conf)),
+                (None, Some((score, name))) => (Some(name), Some(score)),
+                (None, None) => (None, None),
+            };
+
+            if let Some(name) = name_opt {
+                *slot_counts.entry(name.clone()).or_insert(0) += 1;
+                let stack = if !self.digit_templates.is_empty() {
+                    exact_slot.as_ref()
+                        .and_then(|s| {
+                            super::inventory_ocr::read_slot_count(s, &self.digit_templates)
+                        })
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
+                *stack_totals.entry(name).or_insert(0) += stack;
+            }
+        }
+        // NOTA: NMS cross-slot NO aplica aquí — el orden de matches ML no es
+        // comparable con scores SSE. Si se quiere dedup, hacer por separado.
+        InventoryReading { slot_counts, stack_totals }
+    }
+
+    /// Versión extendida que también lee el stack count via OCR (M1).
+    /// Si `digit_templates` está vacío, `stack_totals` cae al fallback de
+    /// `slot_counts` (1 unit per slot).
     #[allow(dead_code)] // public API
     pub fn read_with_stacks(&self, frame: &Frame) -> InventoryReading {
         let mut slot_counts: HashMap<String, u32> = HashMap::new();

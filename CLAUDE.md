@@ -11,6 +11,48 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - No preambles, no trailing summaries, no explaining the obvious.
 - Test before marking anything as done.
 
+## Tercer ojo abierto y honestidad brutal (regla maestra)
+
+Antes de responder o commitear, **abrí el tercer ojo**: verificar activamente
+qué es mecánicamente verificado vs qué es scaffolding / data inventada / no
+testeado. Aplicá siempre al cerrar una tarea:
+
+1. **Corré el comando que validaría la afirmación antes de afirmarla.**
+   - Si decís "tests pasan" → `cargo test` corrió y viste el output.
+   - Si decís "compila" → `cargo check --features ...` corrió con exit 0.
+   - Si decís "funciona live" → el bot corrió contra NDI + Tibia real.
+   - Si no se corrió, decí "NO testeado".
+
+2. **Separar siempre 3 categorías en cada entrega:**
+   - **Mecánico verificado**: commits, builds, tests cuyo output vi.
+   - **Data generada por mí** (wiki, memoria, estimación): listar fuente.
+   - **No testeado**: sin eufemismos. "Pendiente validación X".
+
+3. **No narrar scaffolding como "cerrado".**
+   - "Fase cerrada al 100%" es mentira si es sólo código + unit tests sintéticos.
+   - Usar: "archivos creados, tests unit pasan, pendiente validación runtime".
+
+4. **No inventar números.**
+   - Thresholds, latencias, tamaños: si no los medí, decirlo.
+   - "+10 MB al binary" solo si corriste `ls -la target/release/NewEra`.
+   - "~5ms/tick overhead" solo con benchmark real.
+
+5. **Flaggear errores de compile / API no validados.**
+   - Al usar crate nuevo (ej. `ort v2`), `cargo check --features X` debe correr
+     antes de commitear el código que lo usa. Si no, decir explícitamente
+     "no probé build con feature X".
+
+6. **Cuando el user pida "estado real sin mentir"**, listar explícitamente
+   qué afirmaciones previas fueron exageradas/engañosas. No defender.
+
+7. **Si una tarea no se puede completar** (falta dependency, requiere live,
+   requiere modelo entrenado, etc.), **listarla explícitamente**. No
+   substituir con scaffolding que parece completado.
+
+Ref: memorias `feedback_honest_status_reporting.md` y
+`feedback_no_live_until_trust.md` acumulan ejemplos concretos de violaciones
+de esta regla.
+
 ## Project Overview
 
 **tibia-bot** is a distributed Tibia game automation system across two machines:

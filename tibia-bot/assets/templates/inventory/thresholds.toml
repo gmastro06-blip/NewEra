@@ -17,8 +17,12 @@
 # Strategy: subir threshold a 0.88 en templates que aparecen "verdes/oscuros"
 # donde ruido del JPEG NDI produce correlaciones espurias.
 
-# Dragon ham — verde medio, tiende a matchear otros slots verdes del Bag row.
-dragon_ham = 0.88
+# Dragon ham — verde medio. Live sesión 2026-04-20 detectó 4 slots con
+# threshold 0.88 cuando el user tiene 2 reales (slot 10 y 13). 2 FPs.
+# Subido a 0.95 para exigir match casi idéntico — reduce FPs pero puede
+# perder matches legítimos si variación NDI > 5%. Trade-off: prefiero
+# falso negativo que falso positivo en este template.
+dragon_ham = 0.95
 
 # Vial — frasco verde claro, similar shape puede matchear falsamente.
 vial = 0.85

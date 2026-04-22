@@ -131,6 +131,11 @@ pub struct Vision {
     last_inventory_stacks: std::collections::HashMap<String, u32>,
     /// Intervalo de frames entre lecturas de inventario.
     inventory_detect_interval: u32,
+    /// Classifier ML opcional (Fase 2.5). Cargado via `load_ml_model()` si
+    /// `config.ml.use_ml=true`. Cuando Some Y `is_ready()`, el inventory
+    /// reader delega primero a ML; si infer_slot devuelve None, fallback SSE.
+    /// Sin feature `ml-runtime`, el reader devuelve None siempre (scaffold).
+    ml_reader: Option<inventory_ml::MlInventoryReader>,
 }
 
 impl Vision {
@@ -141,6 +146,28 @@ impl Vision {
             .as_ref()
             .map(|r| r.slots())
             .unwrap_or_default()
+    }
+
+    /// Carga el classifier ML (si `ml_config.use_ml=true` y los paths son válidos).
+    /// Con feature `ml-runtime` activa, crea ort::Session; sin feature, scaffold
+    /// que devuelve None en infer_slot (fallback SSE preservado).
+    /// Llamar DESPUÉS de `Vision::load()` desde main.rs.
+    pub fn load_ml_model(&mut self, ml_config: &crate::config::MlConfig) {
+        if !ml_config.use_ml {
+            return;
+        }
+        if ml_config.model_path.is_empty() || ml_config.classes_path.is_empty() {
+            tracing::warn!("Vision::load_ml_model: use_ml=true pero model_path o classes_path vacíos");
+            return;
+        }
+        let reader = inventory_ml::MlInventoryReader::load(
+            Path::new(&ml_config.model_path),
+            Path::new(&ml_config.classes_path),
+            ml_config.confidence_threshold,
+        );
+        if reader.is_ready() {
+            self.ml_reader = Some(reader);
+        }
     }
 
     /// Crea un Vision cargando calibración y templates desde disco.
@@ -284,6 +311,7 @@ impl Vision {
             last_inventory_counts: std::collections::HashMap::new(),
             last_inventory_stacks: std::collections::HashMap::new(),
             inventory_detect_interval: 15,
+            ml_reader: None,  // populate via load_ml_model()
         }
     }
 
