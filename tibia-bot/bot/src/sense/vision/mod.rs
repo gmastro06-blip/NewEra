@@ -125,6 +125,11 @@ impl Vision {
             .unwrap_or_default()
     }
 
+    /// Cantidad de anchors válidos (con match fresco) sobre el total
+    /// configurado. Expuesto para instrumentación / health system.
+    pub fn tracker_valid_count(&self) -> usize { self.tracker.valid_anchor_count() }
+    pub fn tracker_total_count(&self) -> usize { self.tracker.total_anchor_count() }
+
     /// Carga el classifier ML (si `ml_config.use_ml=true` y los paths son válidos).
     /// Con feature `ml-runtime` activa, crea ort::Session; sin feature, scaffold
     /// que devuelve None en infer_slot (fallback SSE preservado).

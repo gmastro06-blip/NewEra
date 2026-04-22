@@ -113,6 +113,9 @@ pub struct BotLoop {
     /// se conserva en `state.last_perception` para HTTP/recorder — solo los
     /// consumers de decisión ven la señal filtrada.
     perception_filter: crate::sense::filter::PerceptionFilter,
+    /// Métricas runtime (histogramas + windows + ArcSwap last_tick).
+    /// Compartido con HTTP server para reads lock-free.
+    metrics: std::sync::Arc<crate::instrumentation::MetricsRegistry>,
 }
 
 /// Umbral de ticks consecutivos sin frame NDI antes de pausar por seguridad.
@@ -215,7 +218,14 @@ impl BotLoop {
             region_monitor,
             no_frame_ticks: 0,
             perception_filter: crate::sense::filter::PerceptionFilter::new(),
+            metrics: std::sync::Arc::new(crate::instrumentation::MetricsRegistry::new()),
         }
+    }
+
+    /// Handle compartible al MetricsRegistry. main.rs lo agarra antes de
+    /// llamar a `spawn()` para pasarlo al AppState del HTTP server.
+    pub fn metrics_handle(&self) -> std::sync::Arc<crate::instrumentation::MetricsRegistry> {
+        std::sync::Arc::clone(&self.metrics)
     }
 
     /// Lanza el game loop en un thread dedicado. No retorna.
@@ -524,7 +534,16 @@ impl BotLoop {
 
             // ── SENSE ─────────────────────────────────────────────────────────
             let frame_arc = self.buffer.load_arc();
+            let t_acquire = Instant::now();
             let has_frame = frame_arc.is_some();
+            // Frame age = wall-clock entre captura NDI y momento en que el game
+            // loop tomó el Arc. Mide la latencia del transit NDI + cualquier
+            // backlog del FrameBuffer (que es ArcSwap, así que ~0 normalmente).
+            let frame_age_us: u32 = match frame_arc.as_ref().as_ref() {
+                Some(f) => t_acquire.duration_since(f.captured_at).as_micros().min(u32::MAX as u128) as u32,
+                None    => u32::MAX,
+            };
+            let acquire_us: u32 = t_acquire.duration_since(tick_start).as_micros() as u32;
 
             // ── WATCHDOG: no-frame ────────────────────────────────────────────
             // Si NDI muere (OBS crasheó, cable desconectado, DistroAV caído) el
@@ -601,6 +620,9 @@ impl BotLoop {
                 }
             };
             let vision_cost_ms = vision_start.elapsed().as_secs_f32() * 1000.0;
+            // Capturar anchor_drift ANTES de cualquier move de perception_raw
+            // (al final del tick se mueve a g.last_perception). Es Copy.
+            let anchor_drift_for_metrics = perception_raw.anchor_drift;
 
             // ── PERCEPTION FILTER ─────────────────────────────────────────────
             // Aplica smoothing temporal (vitals_debouncer + EMA, hysteresis
@@ -610,7 +632,9 @@ impl BotLoop {
             // Coste medido empírico (bench `perception_filter_apply_steady_state`,
             // commit subsiguiente al wire): ~271 ns/apply en release. 0.001%
             // del budget 33 ms/tick — efectivamente gratis.
+            let t_filter_start = Instant::now();
             let perception = self.perception_filter.apply(&perception_raw);
+            let filter_us: u32 = t_filter_start.elapsed().as_micros() as u32;
 
             // ── ANCHOR DRIFT HYSTERESIS → SAFETY PAUSE ────────────────────────
             // Si el AnchorTracker reporta drift inconsistente (>=2 anchors
@@ -1056,6 +1080,7 @@ impl BotLoop {
             // ── THINK (FSM) ───────────────────────────────────────────────────
             // Si safety pausó el bot (break/prompt), forzamos Paused event.
             let fsm_event = if is_safety_paused { BotEvent::PauseRequested } else { BotEvent::Tick };
+            let t_fsm_start = Instant::now();
             let action = {
                 let g = self.state.read();
                 fsm.decide(&DecideContext {
@@ -1070,6 +1095,7 @@ impl BotLoop {
                     attack_override,
                 })
             };
+            let fsm_us: u32 = t_fsm_start.elapsed().as_micros() as u32;
             let fsm_state_snapshot = fsm.state.clone();
             prev_was_interrupting = fsm.is_interrupting_waypoints();
 
@@ -1254,7 +1280,11 @@ impl BotLoop {
             if let BotAction::UseHotkey { hidcode } = limited_action {
                 emitted_hotkeys.push((hidcode, "fsm"));
             }
+            // Capturamos el kind ANTES de dispatch (limited_action se mueve).
+            let action_kind_tag = action_to_kind_tag(&limited_action);
+            let t_dispatch_start = Instant::now();
             self.dispatch_action(limited_action);
+            let dispatch_us: u32 = t_dispatch_start.elapsed().as_micros() as u32;
 
             // ── TICK BOOKKEEPING ──────────────────────────────────────────────
             let elapsed = tick_start.elapsed();
@@ -1416,6 +1446,75 @@ impl BotLoop {
                         if has_frame { "ok" } else { "none" },
                     );
                 }
+            }
+
+            // ── INSTRUMENTATION: record_tick ──────────────────────────────────
+            // Construir TickMetrics con timings + counts capturados durante el
+            // tick. Esto va al MetricsRegistry (histogramas + windows + ArcSwap
+            // last_tick que el HTTP server lee lock-free).
+            //
+            // Costo estimado del record_tick: ~500 ns. Validar con bench.
+            //
+            // Nota: tick_total_us mide hasta este punto (no incluye el SLEEP
+            // posterior, que es el deadline scheduling, no proc time).
+            {
+                use crate::instrumentation::{TickFlags, TickMetrics};
+                let tick_total_us = tick_start.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                let mut flags = TickFlags::NONE;
+                if tick_total_us > tick_budget.as_micros() as u32 {
+                    flags |= TickFlags::TICK_OVERRUN;
+                }
+                if frame_age_us > 200_000 {
+                    flags |= TickFlags::FRAME_STALE;
+                }
+                if vision_cost_ms > 25.0 {
+                    flags |= TickFlags::VISION_SLOW;
+                }
+                if is_safety_paused {
+                    flags |= TickFlags::SAFETY_PAUSED;
+                }
+                use crate::sense::vision::anchors::DriftStatus as DS;
+                match anchor_drift_for_metrics {
+                    DS::Inconsistent => flags |= TickFlags::ANCHOR_DRIFT_WARN,
+                    DS::AllLost      => flags |= TickFlags::ANCHOR_LOST,
+                    DS::Ok           => {}
+                }
+
+                let valid_anchors = self.vision.tracker_valid_count() as u8;
+                let total_anchors = self.vision.tracker_total_count() as u8;
+                let anchor_conf_bp: u16 = if total_anchors == 0 {
+                    10_000
+                } else {
+                    ((valid_anchors as u32 * 10_000) / total_anchors as u32) as u16
+                };
+
+                let m = TickMetrics {
+                    tick: tick_num,
+                    // frame_seq: pendiente Objetivo 1 frame_id propagado.
+                    // Por ahora usamos tick_num como proxy estable monotónico.
+                    frame_seq: tick_num,
+                    ts_unix_ms: now_ms(),
+                    frame_age_us,
+                    acquire_us,
+                    vision_total_us: (vision_cost_ms * 1000.0) as u32,
+                    filter_us,
+                    fsm_us,
+                    dispatch_us,
+                    state_write_us: 0,  // no medido aún (las write() están dispersas)
+                    tick_total_us,
+                    vision_per_reader_us: [0; crate::instrumentation::ReaderId::COUNT],
+                    last_action_kind: action_kind_tag,
+                    last_action_rtt_us: 0, // pendiente: instrumentar bridge thread
+                    valid_anchors,
+                    total_anchors,
+                    anchor_confidence_bp: anchor_conf_bp,
+                    vitals_confidence_bp: 10_000, // pendiente accesor en filter
+                    target_confidence_bp: 10_000,
+                    enemies_visible: perception.battle.enemy_count().min(255) as u8,
+                    inventory_items: perception.inventory_counts.len().min(255) as u8,
+                    flags,
+                };
+                self.metrics.record_tick(m);
             }
 
             // ── SLEEP hasta el próximo deadline ───────────────────────────────
@@ -1676,6 +1775,21 @@ impl BotLoop {
 fn rolling_avg(prev: f64, new_val: f64, n: u64) -> f64 {
     if n == 0 { return new_val; }
     (prev * (n - 1) as f64 + new_val) / n as f64
+}
+
+/// Mapea BotAction a ActionKindTag para instrumentación. UseHotkey colapsa
+/// a Key (categorización Heal/Attack se hace via dispatch_stats con
+/// categorize_hotkey, no acá).
+fn action_to_kind_tag(action: &crate::core::fsm::BotAction) -> crate::instrumentation::ActionKindTag {
+    use crate::core::fsm::BotAction;
+    use crate::instrumentation::ActionKindTag;
+    match action {
+        BotAction::Idle              => ActionKindTag::None,
+        BotAction::MoveTo { .. }     => ActionKindTag::MouseMove,
+        BotAction::UseHotkey { .. }  => ActionKindTag::Key,
+        BotAction::Click { .. }      => ActionKindTag::Click,
+        BotAction::RightClick { .. } => ActionKindTag::Click,
+    }
 }
 
 /// Computa cuánto dormir y el próximo deadline del scheduler 30Hz.
