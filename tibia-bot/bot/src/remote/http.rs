@@ -1809,6 +1809,71 @@ fn validate_load_path(user_path: &str, allowed_dir: &Path) -> Result<PathBuf, St
 /// debajo del cost de OOM en cargar un blob malicioso de varios GB.
 const MAX_LOAD_FILE_BYTES: u64 = 1 * 1024 * 1024;
 
+/// V-003-style validator para paths donde el archivo puede no existir aún
+/// (endpoints que CREAN archivos, no los leen). A diferencia de
+/// `validate_load_path`, canonicaliza el parent directory en vez del path
+/// completo, luego verifica containment.
+///
+/// Garantías:
+/// - Rechaza paths absolutos (evita `/etc/foo`, `C:\Users\...`).
+/// - Rechaza cualquier componente `..` (evita `foo/../../etc/shadow`).
+/// - El `allowed_dir` se crea si no existe (idempotente).
+/// - Si el user_path tiene subdirectorios no existentes bajo el base, los
+///   crea para poder canonicalizar (los endpoints que CREAN siempre pueden
+///   crear parents).
+/// - El path final devuelto es `<allowed_dir canonical>/<user_path normalizado>`.
+fn validate_new_file_path(user_path: &str, allowed_dir: &Path) -> Result<PathBuf, String> {
+    let p = Path::new(user_path);
+
+    // Rechazar absolutos: deben ser relativos al allowed_dir.
+    if p.is_absolute() {
+        return Err(format!(
+            "path '{}' es absoluto; debe ser relativo a '{}'",
+            user_path, allowed_dir.display()
+        ));
+    }
+
+    // Rechazar componentes peligrosos (`..`, prefix de Windows, RootDir).
+    // Sólo Normal y CurDir son aceptables.
+    for c in p.components() {
+        match c {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => return Err(format!(
+                "path '{}' contiene componente no permitido ({:?})",
+                user_path, c
+            )),
+        }
+    }
+
+    // Crear base + canonicalizar.
+    std::fs::create_dir_all(allowed_dir)
+        .map_err(|e| format!("no se pudo crear base '{}': {}", allowed_dir.display(), e))?;
+    let allowed_canonical = std::fs::canonicalize(allowed_dir)
+        .map_err(|e| format!("no se pudo canonicalizar '{}': {}", allowed_dir.display(), e))?;
+
+    // Target tentativo + validar que tenga file_name.
+    let target = allowed_canonical.join(p);
+    let file_name = target.file_name()
+        .ok_or_else(|| format!("path '{}' no tiene nombre de archivo", user_path))?
+        .to_owned();
+
+    // Crear parent si falta + canonicalizar + verificar prefix.
+    let parent = target.parent()
+        .ok_or_else(|| format!("path '{}' no tiene parent", user_path))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("no se pudo crear parent '{}': {}", parent.display(), e))?;
+    let parent_canonical = std::fs::canonicalize(parent)
+        .map_err(|e| format!("no se pudo canonicalizar parent '{}': {}", parent.display(), e))?;
+    if !parent_canonical.starts_with(&allowed_canonical) {
+        return Err(format!(
+            "path '{}' escapa del directorio permitido '{}'",
+            target.display(), allowed_canonical.display()
+        ));
+    }
+
+    Ok(parent_canonical.join(file_name))
+}
+
 async fn handle_waypoints_load(
     State(s): State<AppState>,
     Query(q): Query<WaypointsLoadQuery>,
@@ -2327,7 +2392,7 @@ async fn handle_instr_start_recording(
 
     // V-008-style: validar caracteres seguros en path. No permitir
     // newlines, control chars, etc. para evitar log injection si el path
-    // se loguea downstream.
+    // se loguea downstream. (Primera línea de defensa, hygiene.)
     if !is_safe_recording_path(&path_str) {
         return (StatusCode::BAD_REQUEST, Json(StartRecordingResponse {
             ok: false,
@@ -2337,7 +2402,21 @@ async fn handle_instr_start_recording(
         }));
     }
 
-    let path = std::path::PathBuf::from(&path_str);
+    // V-003 pattern: confinar el path bajo `recordings/` para prevenir
+    // path traversal. El validator rechaza absolutos y `..`, canonicaliza
+    // el parent, y verifica containment. Alinea este endpoint con
+    // /cavebot/load, /waypoints/load, /scripts/reload, /dataset/start.
+    let path = match validate_new_file_path(&path_str, Path::new("recordings")) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(StartRecordingResponse {
+                ok: false,
+                path: path_str,
+                flush_every,
+                error: Some(format!("path rejected: {}", e)),
+            }));
+        }
+    };
     match s.metrics.start_recording(path, flush_every) {
         Ok(()) => (StatusCode::OK, Json(StartRecordingResponse {
             ok: true,
@@ -3358,6 +3437,122 @@ mod tests {
         let result = validate_load_path(path.to_str().unwrap(), &dir);
         assert!(result.is_ok(), "expected accept for normal-sized file, got {:?}", result);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── validate_new_file_path — hardening para endpoints que CREAN archivos
+    //    (/instrumentation/start_recording). Alinea con V-003 pattern.
+
+    #[test]
+    fn validate_new_file_path_rejects_absolute_unix() {
+        let dir = std::env::temp_dir().join(format!("vnf_abs_unix_{}", std::process::id()));
+        let result = validate_new_file_path("/etc/passwd", &dir);
+        assert!(result.is_err(), "expected reject for absolute unix path, got {:?}", result);
+        // En Linux: is_absolute()=true → mensaje "absoluto".
+        // En Windows: is_absolute()=false (no drive letter), pero components()
+        // incluye RootDir → mensaje "no permitido".
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("absoluto") || msg.contains("no permitido"),
+            "unexpected error: {}", msg
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_new_file_path_rejects_absolute_windows() {
+        let dir = std::env::temp_dir().join(format!("vnf_abs_win_{}", std::process::id()));
+        // Windows: drive-letter path. En Linux este path se lee como relativo
+        // (no contiene `/` al inicio) — el test sólo asserts reject en Windows.
+        #[cfg(windows)]
+        {
+            let result = validate_new_file_path("C:\\Users\\foo\\.bashrc", &dir);
+            assert!(result.is_err(), "expected reject for drive-letter path, got {:?}", result);
+        }
+        #[cfg(not(windows))]
+        {
+            // En Unix `C:\Users\...` es un filename relativo raro — el test
+            // no aplica. Validamos al menos que el path se acepta (o se
+            // rechaza por otra razón sin crashear).
+            let _ = validate_new_file_path("C:\\Users\\foo\\.bashrc", &dir);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_new_file_path_rejects_parent_dir_escape() {
+        let dir = std::env::temp_dir().join(format!("vnf_parent_{}", std::process::id()));
+        let result = validate_new_file_path("../../../etc/passwd", &dir);
+        assert!(result.is_err(), "expected reject for ../ escape, got {:?}", result);
+        assert!(result.unwrap_err().contains("no permitido"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_new_file_path_rejects_sneaky_parent_dir() {
+        // Legítimo segmento inicial, pero después intenta escapar.
+        let dir = std::env::temp_dir().join(format!("vnf_sneak_{}", std::process::id()));
+        let result = validate_new_file_path("foo/../../../etc/hosts", &dir);
+        assert!(result.is_err(), "expected reject for embedded ../, got {:?}", result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_new_file_path_accepts_simple_filename() {
+        let dir = std::env::temp_dir().join(format!("vnf_simple_{}", std::process::id()));
+        let result = validate_new_file_path("session.jsonl", &dir);
+        assert!(result.is_ok(), "expected accept for simple filename, got {:?}", result);
+        let resolved = result.unwrap();
+        // El path final debe estar bajo el dir canonical.
+        let dir_canonical = std::fs::canonicalize(&dir).unwrap();
+        assert!(resolved.starts_with(&dir_canonical),
+            "resolved {:?} should start with {:?}", resolved, dir_canonical);
+        assert!(resolved.ends_with("session.jsonl"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_new_file_path_accepts_subdirectory() {
+        let dir = std::env::temp_dir().join(format!("vnf_subdir_{}", std::process::id()));
+        let result = validate_new_file_path("runs/2026-04-23/session.jsonl", &dir);
+        assert!(result.is_ok(), "expected accept for subdir path, got {:?}", result);
+        let resolved = result.unwrap();
+        let dir_canonical = std::fs::canonicalize(&dir).unwrap();
+        assert!(resolved.starts_with(&dir_canonical));
+        // El subdir debe haber sido creado.
+        assert!(dir.join("runs/2026-04-23").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_new_file_path_creates_base_dir_if_missing() {
+        let dir = std::env::temp_dir().join(format!("vnf_create_base_{}", std::process::id()));
+        // NO creamos dir de antemano — el validator debe crearlo.
+        assert!(!dir.exists(), "precondition: dir no existe");
+        let result = validate_new_file_path("foo.jsonl", &dir);
+        assert!(result.is_ok(), "expected accept with auto-created base, got {:?}", result);
+        assert!(dir.exists(), "base dir debería haberse creado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V-001 path traversal regression: el handler de recording NO debe
+    /// permitir abrir /etc/passwd vía `../`, replicando exactamente el
+    /// attack vector que motivó este hardening.
+    #[test]
+    fn vnf_path_traversal_blocked_for_recording_base() {
+        let base = std::env::temp_dir().join(format!("vnf_block_trav_{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        for hostile in &[
+            "../../../../etc/passwd",
+            "../../Users/gmast/.bashrc",
+            "foo/../../../etc/shadow",
+        ] {
+            let result = validate_new_file_path(hostile, &base);
+            assert!(
+                result.is_err(),
+                "expected reject for hostile path '{}', got {:?}", hostile, result
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// V-007: con `stealth_mode=true`, endpoints de debug deben retornar 404.
