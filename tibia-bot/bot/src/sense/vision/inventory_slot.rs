@@ -84,6 +84,19 @@ pub struct SlotReading {
     pub stage:       SlotStage,
     #[serde(default)]
     pub raw_score:   Option<f32>,
+    /// Item "estable" propagado por `PerceptionFilter` — majority vote
+    /// sobre los últimos N reads de este slot_idx. `None` si:
+    /// - El filter no está activo (no corrió apply aún) → igual al `item` raw.
+    /// - La mayoría de reads recientes fueron empty.
+    /// - El slot cambió de item y la ventana aún no re-estabilizó.
+    ///
+    /// Consumers de decisión (FSM, cavebot has_item) deben preferir
+    /// `stable_item` — absorbe flashes false positive de 1 read.
+    /// `item` raw queda para diagnóstico + JSONL post-mortem.
+    ///
+    /// Item #4 del plan inventory robustez 2026-04-22.
+    #[serde(default)]
+    pub stable_item: Option<String>,
 }
 
 impl SlotReading {
@@ -96,6 +109,7 @@ impl SlotReading {
             stack_count: None,
             stage: SlotStage::Empty,
             raw_score: None,
+            stable_item: None,
         }
     }
 
@@ -115,6 +129,7 @@ impl SlotReading {
             stack_count,
             stage,
             raw_score: Some(raw_score),
+            stable_item: None,
         }
     }
 
@@ -134,6 +149,7 @@ impl SlotReading {
             stack_count,
             stage: SlotStage::MlClassified,
             raw_score: None,
+            stable_item: None,
         }
     }
 
@@ -149,7 +165,16 @@ impl SlotReading {
             stack_count: None,
             stage: SlotStage::FullSweep,
             raw_score: None,
+            stable_item: None,
         }
+    }
+
+    /// Accesor de conveniencia: retorna `stable_item` si existe, else `item`.
+    /// Uso típico desde FSM/cavebot: `has_item(slot.effective_item())`.
+    /// Absorbe automáticamente la diferencia entre raw y filtered cuando el
+    /// filter aún no cableó al slot (ej. primeros ticks post-boot).
+    pub fn effective_item(&self) -> Option<&str> {
+        self.stable_item.as_deref().or(self.item.as_deref())
     }
 }
 

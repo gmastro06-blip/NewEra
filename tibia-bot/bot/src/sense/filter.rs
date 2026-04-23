@@ -208,6 +208,29 @@ impl<T: Clone + Eq> MajorityVote<T> {
     }
 
     pub fn reset(&mut self) { self.buf.clear(); }
+
+    /// Retorna el elemento mayoritario actual sin mutar el buffer.
+    /// `None` si el buffer está vacío.
+    /// Útil para inspeccionar el estado sin agregar un sample nuevo
+    /// (p.ej. propagar el filtered value en ticks donde el raw no cambió).
+    pub fn current(&self) -> Option<T> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let mut best: Option<(T, usize)> = None;
+        for item in self.buf.iter().rev() {
+            let count = self.buf.iter().filter(|x| *x == item).count();
+            match &best {
+                None => best = Some((item.clone(), count)),
+                Some((_, bc)) if count > *bc => best = Some((item.clone(), count)),
+                _ => {}
+            }
+        }
+        best.map(|(t, _)| t)
+    }
+
+    pub fn len(&self) -> usize { self.buf.len() }
+    pub fn is_empty(&self) -> bool { self.buf.is_empty() }
 }
 
 /// Streak counter: retorna `true` cuando se acumularon N matches consecutivos.
@@ -332,7 +355,22 @@ pub struct PerceptionFilter {
     /// `filtered_enemy_count()` — no muta el Perception porque BattleList
     /// no expone el count como field público.
     last_enemy_count_filtered: u32,
+
+    /// Historial per-slot para estabilizar `inventory_slots[i].stable_item`.
+    /// Tamaño dinámico: se redimensiona al primer apply si el raw trae
+    /// un slot count distinto. Cap=3 por slot → ventana de 3 reads
+    /// consecutivos (con cadencia 15 ticks = ~1.5s real time) absorbe
+    /// flashes de 1 read.
+    ///
+    /// Item #4 del plan inventory robustez 2026-04-22.
+    slot_history: Vec<MajorityVote<Option<String>>>,
 }
+
+/// Ventana de votación per-slot para estabilizar `inventory_slots[i].stable_item`.
+/// Cap=3 es el mínimo que permite absorber un flash aislado (2/3 gana).
+/// Con cadencia 15 ticks, 3 reads = 45 ticks ≈ 1.5s — trade-off entre
+/// responsiveness y estabilidad aceptable.
+const SLOT_HISTORY_CAP: usize = 3;
 
 impl Default for PerceptionFilter {
     fn default() -> Self {
@@ -348,6 +386,7 @@ impl Default for PerceptionFilter {
             coords_vote:        MajorityVote::new(5),
             last_coords_hold:   None,
             last_enemy_count_filtered: 0,
+            slot_history:       Vec::new(),
         }
     }
 }
@@ -424,7 +463,50 @@ impl PerceptionFilter {
             }
         }
 
+        // ── inventory_slots: per-slot MajorityVote → stable_item.
+        // Item #4 del plan robustez. Absorbe flashes aislados (1 de N reads)
+        // sin latencia excesiva (N=3 × cadencia inventory 15 ticks ≈ 1.5s).
+        //
+        // Edge cases manejados:
+        // - Slot count cambia entre reads (calibration recargada) → resize.
+        // - raw.inventory_slots vacío (inventory no configurado) → no-op.
+        // - Primer apply sin historia previa → majority = item raw actual.
+        self.apply_inventory_slots(&mut out);
+
         out
+    }
+
+    /// Sub-paso del `apply`: procesa `out.inventory_slots` y llena
+    /// `stable_item` con majority vote por slot_idx.
+    fn apply_inventory_slots(&mut self, out: &mut Perception) {
+        let raw_len = out.inventory_slots.len();
+        if raw_len == 0 {
+            // Nada que filtrar (inventory reader desactivado o cadencia
+            // todavía no llenó el cache). Preservar slot_history para
+            // cuando vuelvan los reads.
+            return;
+        }
+        // Resize a raw_len si la calibración cambió. VecDeque clear en cada
+        // slot preserva cap=3 (const). Resize hacia abajo trunca; hacia
+        // arriba agrega vecs nuevos.
+        if self.slot_history.len() != raw_len {
+            self.slot_history.resize_with(raw_len, || {
+                MajorityVote::new(SLOT_HISTORY_CAP)
+            });
+        }
+        for slot in out.inventory_slots.iter_mut() {
+            let idx = slot.slot_idx as usize;
+            if idx >= self.slot_history.len() {
+                // slot_idx inconsistente con el cache (raw trajo un slot con
+                // idx fuera del Vec). Skipeamos para evitar panic — indica
+                // bug upstream pero no rompemos el tick.
+                continue;
+            }
+            // Raw item: None si Empty/Unmatched, Some(name) si matched.
+            let raw_item: Option<String> = slot.item.clone();
+            let voted = self.slot_history[idx].update(raw_item);
+            slot.stable_item = voted;
+        }
     }
 
     /// Accesor separado para el enemy_count filtrado — el Perception
@@ -446,6 +528,7 @@ impl PerceptionFilter {
         self.coords_vote.reset();
         self.last_coords_hold = None;
         self.last_enemy_count_filtered = 0;
+        self.slot_history.clear();
     }
 
     /// Diagnóstico: estado is_moving del último apply (None si no se llamó
@@ -952,6 +1035,159 @@ mod tests {
         // Vuelve un raw=false: como hysteresis está reseteada, output false.
         p.is_moving = Some(false);
         assert_eq!(f.apply(&p).is_moving, Some(false));
+    }
+
+    // ── Per-slot temporal filter (item #4 plan inventory robustez) ────
+
+    fn slot_matched(idx: u32, item: &str) -> crate::sense::vision::inventory_slot::SlotReading {
+        use crate::sense::vision::inventory_slot::{SlotReading, SlotStage};
+        SlotReading::matched(
+            idx, item.into(), 0.92, 0.80, Some(1), SlotStage::FullSweep,
+        )
+    }
+
+    fn slot_empty(idx: u32) -> crate::sense::vision::inventory_slot::SlotReading {
+        crate::sense::vision::inventory_slot::SlotReading::empty(idx)
+    }
+
+    #[test]
+    fn filter_slot_history_first_apply_stable_matches_raw() {
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+        p.inventory_slots = vec![
+            slot_matched(0, "mana_potion"),
+            slot_empty(1),
+        ];
+        let out = f.apply(&p);
+        assert_eq!(out.inventory_slots[0].item.as_deref(), Some("mana_potion"));
+        assert_eq!(out.inventory_slots[0].stable_item.as_deref(), Some("mana_potion"));
+        assert_eq!(out.inventory_slots[1].item, None);
+        assert_eq!(out.inventory_slots[1].stable_item, None);
+    }
+
+    #[test]
+    fn filter_slot_history_absorbs_single_flash() {
+        // slot=0 reporta "mana_potion" 2×, flash "vial" 1×.
+        // Ventana cap=3 → majority vote queda en mana_potion porque 2/3.
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+
+        p.inventory_slots = vec![slot_matched(0, "mana_potion")];
+        f.apply(&p);  // history[0] = [mana_potion]
+
+        p.inventory_slots = vec![slot_matched(0, "mana_potion")];
+        f.apply(&p);  // history[0] = [mana, mana]
+
+        // Flash espurio.
+        p.inventory_slots = vec![slot_matched(0, "vial")];
+        let out = f.apply(&p);
+        // Buffer: [mana, mana, vial] → majority = mana_potion (2/3).
+        assert_eq!(
+            out.inventory_slots[0].stable_item.as_deref(),
+            Some("mana_potion"),
+            "majority debe absorber flash aislado"
+        );
+        // Raw item = vial (honesto).
+        assert_eq!(out.inventory_slots[0].item.as_deref(), Some("vial"));
+    }
+
+    #[test]
+    fn filter_slot_history_propagates_sustained_change() {
+        // Cambio real: 3 reads consecutivos del nuevo item → stable cambia.
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+
+        // Estado inicial: slot[0] = "A" × 3 reads.
+        for _ in 0..3 {
+            p.inventory_slots = vec![slot_matched(0, "A")];
+            f.apply(&p);
+        }
+        // Cambio sostenido a "B": 3 reads consecutivos.
+        p.inventory_slots = vec![slot_matched(0, "B")];
+        let out = f.apply(&p);
+        // Buffer: [A, A, B] → majority = A (2/3 aún).
+        assert_eq!(out.inventory_slots[0].stable_item.as_deref(), Some("A"));
+
+        p.inventory_slots = vec![slot_matched(0, "B")];
+        let out = f.apply(&p);
+        // Buffer: [A, B, B] → majority = B (2/3). Change reconocido.
+        assert_eq!(out.inventory_slots[0].stable_item.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn filter_slot_history_empty_to_item_transition() {
+        // Slot vacío → item requiere 2 reads para estabilizar.
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+
+        for _ in 0..3 {
+            p.inventory_slots = vec![slot_empty(0)];
+            f.apply(&p);  // history = [None, None, None]
+        }
+        p.inventory_slots = vec![slot_matched(0, "vial")];
+        let out = f.apply(&p);
+        // Buffer: [None, None, vial] → majority = None (2/3 empty aún).
+        assert_eq!(out.inventory_slots[0].stable_item, None);
+
+        p.inventory_slots = vec![slot_matched(0, "vial")];
+        let out = f.apply(&p);
+        // Buffer: [None, vial, vial] → majority = vial.
+        assert_eq!(out.inventory_slots[0].stable_item.as_deref(), Some("vial"));
+    }
+
+    #[test]
+    fn filter_slot_history_resizes_when_slot_count_changes() {
+        // Calibration cambia → slots count cambia. Filter debe manejar sin panic.
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+
+        p.inventory_slots = (0..4u32).map(|i| slot_matched(i, "a")).collect();
+        f.apply(&p);
+        assert_eq!(p.inventory_slots.len(), 4);
+
+        // Nueva calibration con 8 slots.
+        p.inventory_slots = (0..8u32).map(|i| slot_matched(i, "b")).collect();
+        let out = f.apply(&p);
+        assert_eq!(out.inventory_slots.len(), 8);
+        // Los nuevos slots (idx 4..8) tienen stable_item en su primer push.
+        for s in &out.inventory_slots[4..] {
+            assert_eq!(s.stable_item.as_deref(), Some("b"));
+        }
+    }
+
+    #[test]
+    fn filter_slot_history_empty_raw_is_noop() {
+        // raw.inventory_slots vacío → no muta nada, no panic.
+        let mut f = PerceptionFilter::new();
+        let p = Perception::default();
+        let out = f.apply(&p);
+        assert!(out.inventory_slots.is_empty());
+    }
+
+    #[test]
+    fn filter_slot_reset_clears_slot_history() {
+        let mut f = PerceptionFilter::new();
+        let mut p = Perception::default();
+        p.inventory_slots = vec![slot_matched(0, "X")];
+        for _ in 0..3 { f.apply(&p); }
+        f.reset();
+        // Tras reset, un apply con item distinto → stable = ese item
+        // (no el "X" viejo acumulado).
+        p.inventory_slots = vec![slot_matched(0, "Y")];
+        let out = f.apply(&p);
+        assert_eq!(out.inventory_slots[0].stable_item.as_deref(), Some("Y"));
+    }
+
+    #[test]
+    fn slot_reading_effective_item_prefers_stable() {
+        use crate::sense::vision::inventory_slot::SlotReading;
+        let mut s = SlotReading::matched(0, "raw".into(), 0.92, 0.80, None,
+            crate::sense::vision::inventory_slot::SlotStage::FullSweep);
+        // Sin stable_item → effective = raw item.
+        assert_eq!(s.effective_item(), Some("raw"));
+        // Con stable_item seteado → preferido.
+        s.stable_item = Some("stable".to_string());
+        assert_eq!(s.effective_item(), Some("stable"));
     }
 
     #[test]
