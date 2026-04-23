@@ -1616,6 +1616,28 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// Validación empírica del compat layer: carga el `.bin` real del
+    /// proyecto (formato bincode legacy pre-migración). Marcado `#[ignore]`
+    /// porque depende de que el asset exista y es de verificación manual,
+    /// no parte del suite por default.
+    ///
+    /// Run: `cargo test --release --lib load_real_map_index_bin -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires assets/map_index.bin checked into repo; run with --ignored"]
+    fn load_real_map_index_bin() {
+        let candidates = [
+            std::path::Path::new("../assets/map_index.bin"),
+            std::path::Path::new("assets/map_index.bin"),
+        ];
+        let path = candidates.iter().find(|p| p.exists())
+            .expect("no se encontró map_index.bin en ../assets ni en assets");
+        eprintln!("cargando {}", path.display());
+        let idx = MapIndex::load(path).expect("load real map_index.bin falló");
+        assert!(!idx.is_empty(), "map_index real no debería estar vacío");
+        eprintln!("OK — {} patches totales, {} hashes únicos",
+                  idx.total_patches, idx.all_entries().len());
+    }
+
     // ── MinimapMatcher tests ─────────────────────────────────────────────
 
     /// Crea un reference PNG sintético 256×256 con patrones únicos globales

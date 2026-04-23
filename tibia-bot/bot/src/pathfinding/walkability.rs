@@ -408,6 +408,29 @@ mod tests {
         std::fs::remove_file(&tmp).ok();
     }
 
+    /// Validación empírica: cargar el `walkability.bin` real del proyecto
+    /// (formato bincode legacy, ~146 MB). `#[ignore]` porque depende del
+    /// asset + es verificación manual.
+    ///
+    /// Run: `cargo test --release --lib load_real_walkability_bin -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires assets/walkability.bin checked into repo; run with --ignored"]
+    fn load_real_walkability_bin() {
+        let candidates = [
+            std::path::Path::new("../assets/walkability.bin"),
+            std::path::Path::new("assets/walkability.bin"),
+        ];
+        let path = candidates.iter().find(|p| p.exists())
+            .expect("no se encontró walkability.bin en ../assets ni en assets");
+        eprintln!("cargando {} (puede tardar ~1-2s @ 146 MB)", path.display());
+        let t0 = std::time::Instant::now();
+        let grid = WalkabilityGrid::load(path).expect("load real walkability.bin falló");
+        let dt_ms = t0.elapsed().as_millis();
+        assert!(!grid.is_empty(), "walkability real no debería estar vacío");
+        eprintln!("OK — {} tiles, {} transitions, load time {} ms",
+                  grid.len(), grid.transitions_count(), dt_ms);
+    }
+
     #[test]
     fn detect_transitions_marks_stacked_walkable() {
         let mut g = WalkabilityGrid::new();
