@@ -860,18 +860,34 @@ Plan completo Fase 2 (sesión live) + Fase 3 (post-mortem rules) en
 
 ### Deuda técnica priorizada (sin live)
 
-1. **bincode → postcard migration** (advertencia `bincode` unmaintained).
-   - `assets/map_index.bin` y `assets/walkability.bin` se generan con bincode.
-   - Postcard es no-std friendly + mantenido. Migración: cambiar derive macros,
-     actualizar `build_map_index` para escribir formato nuevo, cargar ambos
-     formatos temporalmente para compat.
-   - Riesgo: reconstruir index (~5s) + walkability (~230 MB). Bajo.
+1. **bincode → postcard migration** — LANDED (commit `e4ec435` + `7f4cad0`).
+   - Postcard 1.0 reemplaza bincode 1.3 (RUSTSEC-2023-0074 unmaintained).
+   - `MapIndex` y `WalkabilityGrid` serializan con formato `[MAGIC|VERSION|postcard]`
+     (magic = `TBMI` / `TBWG`). Magic header necesario porque `postcard::from_bytes`
+     acepta bytes arbitrarios como "success" con resultado silent-corrupt.
+   - Compat layer: `load()` detecta magic → postcard; si no → fallback bincode
+     legacy con `tracing::warn!`. Validado empíricamente contra `assets/*.bin`
+     reales (map_index 357K patches + walkability 11M tiles, tests `#[ignore]`
+     `load_real_map_index_bin` / `load_real_walkability_bin`).
+   - bincode aún en `Cargo.toml` como fallback-only. Path a eliminación:
+     (a) regenerar con `build_map_index` contra map dir de Tibia, o
+     (b) binary `migrate_bin` (load + save) que convierta legacy → postcard.
+     Cuando los `.bin` del repo estén en postcard, remover dep + fallback.
 
 2. **HPA* / waypoints intermedios** para 4 hunts con pathfinding fallando:
    - `orcs_thais`, `minos_plains`, `water_elementals`, `asura_palace`.
-   - A* actual sobre walkability grid diverge o tarda >10s en estos mapas.
-   - Opciones: HPA* (hierarchical), waypoints explícitos en el cavebot que
-     corten el path en segmentos <200 tiles, o heurística mejorada.
+   - A* monolítico sobre walkability grid excede `DEFAULT_MAX_ITERS=100_000`
+     en distancias >600 tiles en terreno complejo.
+   - **Workaround aplicado** (mecánico verificado, commit TBD): 2 flags en
+     `path_finder` CLI:
+     - `--max-iters N` — permite subir el límite (default 100k).
+     - `--via X,Y,Z` repetible — segmenta el path en tramos `from→via1→via2→…→to`
+       y hace A* por tramo. El user corta manualmente un path largo en segmentos
+       cortos <300 tiles que A* resuelve.
+   - **HPA* completo sigue pendiente** (scope multi-sesión, no hay crate Rust
+     mantenido sobre grid sparse). Implementación futura: pre-compute clusters
+     ~16×16 tiles con entry/exit points + heurística jerárquica + A* local
+     refinement. Audit en `assets/catalogs/_audits/pathfinding_audit_2026-04-19.md`.
 
 3. **Tests flakeys pre-existentes** (no bloqueantes, no introducidos por audit):
    - `sense::vision::inventory::tests::read_with_realistic_load_under_budget` —

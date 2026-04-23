@@ -47,6 +47,6 @@ pub mod astar;
 pub mod overrides;
 pub mod walkability;
 
-pub use astar::{find_path, simplify_path, FLOOR_CHANGE_PENALTY};
+pub use astar::{find_path, find_path_with_limit, simplify_path, DEFAULT_MAX_ITERS, FLOOR_CHANGE_PENALTY};
 pub use overrides::Overrides;
 pub use walkability::{TileCost, WalkabilityGrid};

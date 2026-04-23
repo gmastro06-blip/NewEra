@@ -28,11 +28,31 @@
 //!     --to   32100,32300,7 \
 //!     --simplify \
 //!     --output path_snippet.toml
+//!
+//! # Path largo con via waypoints (4 hunts failing — el user corta
+//! # manualmente un path largo en 2-3 segmentos cortos que A* resuelve)
+//! cargo run --release --bin path_finder -- \
+//!     --walkability assets/walkability.bin \
+//!     --from 32015,32212,7 \
+//!     --via  32200,32300,7 \
+//!     --via  32350,32380,7 \
+//!     --to   32500,32500,7 \
+//!     --simplify --output orcs_path.toml
+//!
+//! # Path con límite de iters custom (default 100k; subir a 1M para
+//! # distancias largas en terreno complejo sin segmentar)
+//! cargo run --release --bin path_finder -- \
+//!     --walkability assets/walkability.bin \
+//!     --from 32015,32212,7 \
+//!     --to   32500,32500,7 \
+//!     --max-iters 1000000
 //! ```
 
 use std::path::PathBuf;
 
-use tibia_bot::pathfinding::{find_path, simplify_path, Overrides, WalkabilityGrid};
+use tibia_bot::pathfinding::{
+    find_path_with_limit, simplify_path, DEFAULT_MAX_ITERS, Overrides, WalkabilityGrid,
+};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -55,6 +75,15 @@ fn main() -> anyhow::Result<()> {
     let nearest_walkable_radius: i32 = arg(&args, "--nearest-walkable")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let max_iters: usize = arg(&args, "--max-iters")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_ITERS);
+    // --via X,Y,Z repeatable: segmenta el path en tramos from→via1→via2→…→to.
+    // Ayuda para distancias largas donde A* monolítico excede max_iters.
+    let vias: Vec<Tile> = collect_args(&args, "--via")
+        .iter()
+        .filter_map(|s| parse_coord(s))
+        .collect();
 
     println!("Loading walkability from {}...", walkability.display());
     let mut grid = WalkabilityGrid::load(&walkability)?;
@@ -80,19 +109,34 @@ fn main() -> anyhow::Result<()> {
     let from = remap_if_needed(&grid, from, "start", nearest_walkable_radius)?;
     let to = remap_if_needed(&grid, to, "goal", nearest_walkable_radius)?;
 
+    // Remap vias (puede que el user pase una coord 1 tile off). Usa el mismo
+    // radio que start/goal para coherencia.
+    let mut waypoints: Vec<Tile> = Vec::with_capacity(2 + vias.len());
+    waypoints.push(from);
+    for (i, via) in vias.iter().enumerate() {
+        let remapped = remap_if_needed(&grid, *via, &format!("via[{}]", i), nearest_walkable_radius)?;
+        waypoints.push(remapped);
+    }
+    waypoints.push(to);
+
+    if !vias.is_empty() {
+        println!("Segmented path: {} segment(s) via {} waypoint(s)",
+                 waypoints.len() - 1, vias.len());
+    }
+
     let start = std::time::Instant::now();
-    let path = find_path(from, to, &grid)
-        .ok_or_else(|| anyhow::anyhow!("no hay path posible entre {:?} y {:?}", from, to))?;
+    let path = find_path_segmented(&waypoints, &grid, max_iters)?;
     let elapsed = start.elapsed();
 
     let floor_changes = count_floor_changes(&path.tiles);
     println!(
-        "Path found: {} tiles, cost {}, nodes expanded {}, {} floor changes, in {:?}",
+        "Path found: {} tiles, cost {}, nodes expanded {}, {} floor changes, in {:?} (max_iters={})",
         path.tiles.len(),
         path.total_cost,
         path.nodes_expanded,
         floor_changes,
-        elapsed
+        elapsed,
+        max_iters
     );
 
     if floor_changes > 0 {
@@ -228,6 +272,68 @@ fn arg(args: &[String], name: &str) -> Option<String> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// Recolecta TODOS los valores de un flag repeatable (ej. `--via a --via b`).
+/// Útil para `--via` que puede aparecer múltiples veces. Los pares dangling
+/// (flag sin valor subsecuente) se ignoran silenciosamente.
+fn collect_args(args: &[String], name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a == name {
+            if let Some(v) = args.get(i + 1) {
+                out.push(v.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Busca un path segmentado entre múltiples waypoints consecutivos. Corre A*
+/// en cada par `(waypoints[i], waypoints[i+1])` con el mismo `max_iters` y
+/// concatena los tiles resultantes, deduplicando el tile compartido entre
+/// segmentos (goal de uno = start del siguiente).
+///
+/// Retorna Err si cualquier segmento falla. El mensaje indica qué par fue.
+fn find_path_segmented(
+    waypoints: &[Tile],
+    grid: &WalkabilityGrid,
+    max_iters: usize,
+) -> anyhow::Result<tibia_bot::pathfinding::astar::Path> {
+    use tibia_bot::pathfinding::astar::Path;
+
+    if waypoints.len() < 2 {
+        anyhow::bail!("find_path_segmented: necesita al menos 2 waypoints");
+    }
+
+    let mut all_tiles: Vec<Tile> = Vec::new();
+    let mut total_cost: u64 = 0;
+    let mut total_nodes: usize = 0;
+
+    for (i, pair) in waypoints.windows(2).enumerate() {
+        let a = pair[0];
+        let b = pair[1];
+        let seg = find_path_with_limit(a, b, grid, max_iters).ok_or_else(|| {
+            anyhow::anyhow!(
+                "segmento {} ({:?} → {:?}) sin path (max_iters={})",
+                i, a, b, max_iters
+            )
+        })?;
+        total_cost += seg.total_cost;
+        total_nodes += seg.nodes_expanded;
+        if all_tiles.is_empty() {
+            all_tiles.extend(seg.tiles);
+        } else {
+            // Skip primer tile (duplica el goal del segmento anterior).
+            all_tiles.extend(seg.tiles.into_iter().skip(1));
+        }
+    }
+
+    Ok(Path {
+        tiles: all_tiles,
+        total_cost,
+        nodes_expanded: total_nodes,
+    })
 }
 
 fn parse_coord(s: &str) -> Option<(i32, i32, i32)> {
@@ -408,6 +514,94 @@ mod tests {
             (x, y, z) == (11, 10, 7) || (x, y, z) == (13, 10, 7)
         });
         assert_eq!(result, Some((11, 10, 7)));
+    }
+
+    // ─── --via / --max-iters integration ──────────────────────────────
+
+    #[test]
+    fn collect_args_returns_all_repeats() {
+        let args = vec![
+            "bin".into(),
+            "--via".into(), "1,2,7".into(),
+            "--foo".into(),
+            "--via".into(), "3,4,7".into(),
+            "--via".into(), "5,6,7".into(),
+        ];
+        let out = collect_args(&args, "--via");
+        assert_eq!(out, vec!["1,2,7", "3,4,7", "5,6,7"]);
+    }
+
+    #[test]
+    fn collect_args_ignores_dangling_flag() {
+        // `--via` al final sin valor no debe panicar ni agregar entry.
+        let args = vec!["bin".into(), "--via".into(), "1,2,7".into(), "--via".into()];
+        let out = collect_args(&args, "--via");
+        assert_eq!(out, vec!["1,2,7"]);
+    }
+
+    #[test]
+    fn segmented_path_concatenates_without_duplicate_tiles() {
+        use tibia_bot::pathfinding::WalkabilityGrid;
+        // Grid 10×1 en z=7, todo walkable.
+        let mut g = WalkabilityGrid::new();
+        for x in 0..10 {
+            g.set_tile(x, 0, 7, 100);
+        }
+
+        // Path directo 0→9 (sin vias).
+        let direct = find_path_segmented(&[(0, 0, 7), (9, 0, 7)], &g, 10_000).unwrap();
+        assert_eq!(direct.tiles.len(), 10);
+        assert_eq!(direct.tiles.first(), Some(&(0, 0, 7)));
+        assert_eq!(direct.tiles.last(), Some(&(9, 0, 7)));
+
+        // Path segmentado 0→4→9 (1 via). Debe tener los mismos 10 tiles sin
+        // duplicar (4,0,7).
+        let segmented = find_path_segmented(&[(0, 0, 7), (4, 0, 7), (9, 0, 7)], &g, 10_000).unwrap();
+        assert_eq!(segmented.tiles.len(), 10, "no debe duplicar tile en seam");
+        assert_eq!(segmented.tiles.first(), Some(&(0, 0, 7)));
+        assert_eq!(segmented.tiles.last(), Some(&(9, 0, 7)));
+        // El via debe aparecer exactamente una vez.
+        let via_count = segmented.tiles.iter().filter(|t| **t == (4, 0, 7)).count();
+        assert_eq!(via_count, 1);
+    }
+
+    #[test]
+    fn segmented_path_aggregates_cost_and_nodes() {
+        use tibia_bot::pathfinding::WalkabilityGrid;
+        let mut g = WalkabilityGrid::new();
+        for x in 0..10 {
+            g.set_tile(x, 0, 7, 100);
+        }
+
+        let direct = find_path_segmented(&[(0, 0, 7), (9, 0, 7)], &g, 10_000).unwrap();
+        let segmented = find_path_segmented(&[(0, 0, 7), (4, 0, 7), (9, 0, 7)], &g, 10_000).unwrap();
+
+        // El cost total debe ser igual (misma distancia Manhattan).
+        assert_eq!(direct.total_cost, segmented.total_cost);
+        // nodes_expanded: segmented >= direct (dos A* separados tienen algo
+        // de overhead pero menos expansion por segmento).
+        assert!(segmented.nodes_expanded > 0);
+    }
+
+    #[test]
+    fn segmented_path_fails_if_any_segment_impossible() {
+        use tibia_bot::pathfinding::WalkabilityGrid;
+        // Grid: (0,0) y (9,0) walkable, pero gap de walls entre (2..5, 0) bloquea
+        // la primera mitad. La segunda mitad (5..9) es open.
+        let mut g = WalkabilityGrid::new();
+        for x in 0..10 {
+            g.set_tile(x, 0, 7, 100);
+        }
+        for x in 2..5 {
+            g.set_tile(x, 0, 7, 255); // wall
+        }
+        // (4, 0, 7) es wall → via inalcanzable.
+        let result = find_path_segmented(&[(0, 0, 7), (4, 0, 7), (9, 0, 7)], &g, 10_000);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        // El error debe identificar qué segmento falló.
+        assert!(msg.contains("segmento") || msg.contains("sin path"),
+            "unexpected error: {}", msg);
     }
 
     #[test]
