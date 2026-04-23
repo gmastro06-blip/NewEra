@@ -15,6 +15,7 @@ pub mod game_coords;
 pub mod inventory;
 pub mod inventory_ml;
 pub mod inventory_ocr;
+pub mod inventory_slot;
 pub mod minimap;
 pub mod prompts;
 pub mod region_monitor;
@@ -104,6 +105,9 @@ pub struct Vision {
     inventory_reader: Option<inventory::InventoryReader>,
     /// Último conteo de items por template (cacheado entre intervalos).
     last_inventory_counts: std::collections::HashMap<String, u32>,
+    /// Último snapshot per-slot (item #2 plan robustez). Cacheado entre
+    /// cadencias para propagar a Perception.inventory_slots sin re-run.
+    last_inventory_slots: Vec<inventory_slot::SlotReading>,
     /// Última suma de unidades por item via OCR del stack count (M1).
     last_inventory_stacks: std::collections::HashMap<String, u32>,
     /// Intervalo de frames entre lecturas de inventario.
@@ -308,6 +312,7 @@ impl Vision {
             last_game_coords: None,
             inventory_reader,
             last_inventory_counts: std::collections::HashMap::new(),
+            last_inventory_slots:  Vec::new(),
             last_inventory_stacks: std::collections::HashMap::new(),
             inventory_detect_interval: 15,
             ml_reader: None,  // populate via load_ml_model()
@@ -858,11 +863,13 @@ impl Vision {
                     let reading = reader.read_with_stacks_ml(frame, self.ml_reader.as_mut());
                     self.last_inventory_counts = reading.slot_counts;
                     self.last_inventory_stacks = reading.stack_totals;
+                    self.last_inventory_slots  = reading.slots;
                 }
             }
         });
         let inventory_counts = self.last_inventory_counts.clone();
         let inventory_stacks = self.last_inventory_stacks.clone();
+        let inventory_slots  = self.last_inventory_slots.clone();
 
         // Drift status del tracker — poblado por `adjust_roi()` calls previos
         // en este tick (HP, mana, battle, status, etc. todos pasan por
@@ -890,6 +897,7 @@ impl Vision {
             game_coords,
             inventory_counts,
             inventory_stacks,
+            inventory_slots,
             anchor_drift,
         }
     }

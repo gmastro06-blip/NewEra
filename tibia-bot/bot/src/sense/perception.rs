@@ -28,6 +28,11 @@ pub struct PerceptionSnapshot {
     pub conditions:           Vec<String>,
     pub inventory_counts:     std::collections::HashMap<String, u32>,
     pub inventory_stacks:     std::collections::HashMap<String, u32>,
+    /// Output per-slot del inventory reader (item #2 plan robustez).
+    /// `Vec` vacío si no hay inventory configurado o no corrió este tick.
+    /// `#[serde(default)]` → JSONL antiguos sin el campo cargan vacío.
+    #[serde(default)]
+    pub inventory_slots:      Vec<super::vision::inventory_slot::SlotReading>,
     /// Veredicto del AnchorTracker en este tick.
     /// `#[serde(default)]` → JSONL antiguos sin el campo cargan como `Ok`.
     #[serde(default)]
@@ -102,6 +107,11 @@ pub struct Perception {
     /// Si los digit templates no están cargados, suele coincidir con
     /// inventory_counts (1 unit per slot).
     pub inventory_stacks: std::collections::HashMap<String, u32>,
+    /// Output per-slot del inventory reader (item #2 plan robustez 2026-04-22).
+    /// Cada entrada incluye slot_idx + item + confidence + stack_count + stage.
+    /// Vacío si no hay inventory configurado o no corrió este tick (cadencia).
+    /// Propagado al PerceptionSnapshot → JSONL recorder para análisis offline.
+    pub inventory_slots: Vec<super::vision::inventory_slot::SlotReading>,
     /// Veredicto del AnchorTracker sobre consistencia geométrica de anchors.
     /// `Ok` → ROIs confiables. `Inconsistent` → anchors divergen, offset no
     /// fiable. `AllLost` → ningún anchor matcheó, bot ciego al shift de ventana.
@@ -137,6 +147,7 @@ impl Perception {
             conditions:           self.conditions.active.iter().map(|c| format!("{:?}", c)).collect(),
             inventory_counts:     self.inventory_counts.clone(),
             inventory_stacks:     self.inventory_stacks.clone(),
+            inventory_slots:      self.inventory_slots.clone(),
             anchor_drift:         self.anchor_drift,
         }
     }

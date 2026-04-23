@@ -1570,6 +1570,12 @@ async fn handle_vision_inventory(State(s): State<AppState>) -> Response {
         .as_ref()
         .map(|p| p.inventory_counts.clone())
         .unwrap_or_default();
+    // Item #2: per-slot output con confidence + stage. Vacío si no hay
+    // perception actual o la inventory cadence no corrió este tick.
+    let slots_per_reading = g.last_perception
+        .as_ref()
+        .map(|p| p.inventory_slots.clone())
+        .unwrap_or_default();
     drop(g);
 
     // Prioridad: backpack_strip > inventory_grid > inventory_slots manuales.
@@ -1586,6 +1592,11 @@ async fn handle_vision_inventory(State(s): State<AppState>) -> Response {
         slot_count: usize,
         counts:     HashMap<String, u32>,
         grid:       Option<GridInfo>,
+        /// Per-slot output con item + confidence + stage + stack (item #2
+        /// plan robustez). Vacío si no hay perception actual. Para consumers
+        /// que necesiten el count agregado, `counts` sigue disponible.
+        #[serde(default)]
+        slots:      Vec<crate::sense::vision::inventory_slot::SlotReading>,
     }
     #[derive(Serialize)]
     struct GridInfo {
@@ -1603,6 +1614,7 @@ async fn handle_vision_inventory(State(s): State<AppState>) -> Response {
         slot_count: slots.len(),
         counts,
         grid,
+        slots: slots_per_reading,
     }).into_response()
 }
 

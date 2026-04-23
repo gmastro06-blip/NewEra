@@ -229,11 +229,17 @@ struct ItemTemplate {
 /// `slot_counts` es el número de slots que matchean cada item (lo que ya
 /// retornaba `read()`). `stack_totals` es la suma de unidades reales leídas
 /// por OCR del stack count en la esquina del slot.
+///
+/// `slots`: output per-slot con confidence + stage (item #2 del plan
+/// inventory robustez 2026-04-22). `Vec` vacío en readers antiguos o
+/// inventarios sin slots configurados. Consumers que prefieran el output
+/// agregado siguen con `slot_counts` + `stack_totals` — retro-compat total.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)] // public API, used by tests + downstream consumers
 pub struct InventoryReading {
     pub slot_counts:  HashMap<String, u32>,
     pub stack_totals: HashMap<String, u32>,
+    pub slots:        Vec<super::inventory_slot::SlotReading>,
 }
 
 /// Reader de inventario: template matching por slot.
@@ -258,6 +264,18 @@ impl InventoryReader {
     #[allow(dead_code)] // user-callable from main.rs
     pub fn load_digit_templates(&mut self, dir: &std::path::Path) -> usize {
         self.digit_templates.load_dir(dir)
+    }
+
+    /// Threshold per-template para mapeo de score → confidence.
+    /// Retorna `MATCH_THRESHOLD` si el template no existe (no debería
+    /// ocurrir porque el name viene del match previo).
+    /// Lineal O(n templates) — n ≤ ~70, negligible.
+    fn threshold_for(&self, name: &str) -> f32 {
+        self.templates
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.threshold)
+            .unwrap_or(MATCH_THRESHOLD)
     }
 
     /// Carga todos los templates PNG del directorio indicado.
@@ -392,32 +410,36 @@ impl InventoryReader {
         frame:      &Frame,
         ml_reader:  Option<&mut super::inventory_ml::MlInventoryReader>,
     ) -> InventoryReading {
+        use super::inventory_slot::{SlotReading, SlotStage};
+
         let mut slot_counts:  HashMap<String, u32> = HashMap::new();
         let mut stack_totals: HashMap<String, u32> = HashMap::new();
+        let mut slots_out:    Vec<SlotReading> = Vec::with_capacity(self.slots.len());
+
         if self.is_empty() {
-            return InventoryReading { slot_counts, stack_totals };
+            return InventoryReading { slot_counts, stack_totals, slots: slots_out };
         }
         let use_ml = ml_reader.as_ref().map(|r| r.is_ready()).unwrap_or(false);
         let ml_ref_opt = if use_ml { ml_reader } else { None };
-        // Wrap en RefCell para permitir &mut desde el loop interno
-        // (ml_ref_opt es Option<&mut>, podemos take y poner back).
         let mut ml_inner = ml_ref_opt;
 
-        for slot in &self.slots {
+        for (slot_idx, slot) in self.slots.iter().enumerate() {
+            let slot_idx = slot_idx as u32;
+
             // Stage A: empty-slot short-circuit (plan inventory robustez).
-            // Luma stddev sobre el slot exact BGRA→luma. Slots vacíos tienen
-            // variación <EMPTY_STDDEV_MAX y se skipean completamente.
-            // Coste ~1.5 µs por slot. Ahorra 100-300 µs por slot vacío
-            // (template match + NMS + OCR).
             let stddev = frame_roi_luma_stddev(
                 frame,
                 &Roi::new(slot.x, slot.y, slot.w, slot.h),
             );
             if stddev < EMPTY_STDDEV_MAX {
+                slots_out.push(SlotReading::empty(slot_idx));
                 continue;
             }
 
             let Some((slot_img_padded, _)) = extract_slot_with_shift_tolerance(frame, slot) else {
+                // Extract falló (ROI fuera del frame). Marcar como unmatched
+                // en vez de skip silencioso — ayuda al debug del JSONL.
+                slots_out.push(SlotReading::unmatched(slot_idx));
                 continue;
             };
             // Extract slot exact también para OCR + ML (ML requiere 32×32 exact).
@@ -443,30 +465,44 @@ impl InventoryReader {
                 None
             };
 
-            // Determinar resultado final.
-            let (name_opt, _score_opt) = match (ml_match, sse_match) {
-                (Some((cls, conf)), _) => (Some(cls), Some(conf)),
-                (None, Some((score, name))) => (Some(name), Some(score)),
-                (None, None) => (None, None),
+            // Helper para leer stack via OCR (solo si digit templates cargados).
+            let read_stack = |slot_img: Option<&GrayImage>| -> Option<u32> {
+                if self.digit_templates.is_empty() {
+                    return None;
+                }
+                slot_img.and_then(|s| {
+                    super::inventory_ocr::read_slot_count(s, &self.digit_templates)
+                })
             };
 
-            if let Some(name) = name_opt {
-                *slot_counts.entry(name.clone()).or_insert(0) += 1;
-                let stack = if !self.digit_templates.is_empty() {
-                    exact_slot.as_ref()
-                        .and_then(|s| {
-                            super::inventory_ocr::read_slot_count(s, &self.digit_templates)
-                        })
-                        .unwrap_or(1)
-                } else {
-                    1
-                };
-                *stack_totals.entry(name).or_insert(0) += stack;
+            match (ml_match, sse_match) {
+                (Some((cls, conf)), _) => {
+                    let stack = read_stack(exact_slot.as_ref());
+                    *slot_counts.entry(cls.clone()).or_insert(0) += 1;
+                    *stack_totals.entry(cls.clone()).or_insert(0) += stack.unwrap_or(1);
+                    slots_out.push(SlotReading::ml_classified(
+                        slot_idx, cls, conf, stack,
+                    ));
+                }
+                (None, Some((score, name))) => {
+                    let threshold = self.threshold_for(&name);
+                    let stack = read_stack(exact_slot.as_ref());
+                    *slot_counts.entry(name.clone()).or_insert(0) += 1;
+                    *stack_totals.entry(name.clone()).or_insert(0) += stack.unwrap_or(1);
+                    slots_out.push(SlotReading::matched(
+                        slot_idx, name, score, threshold, stack, SlotStage::FullSweep,
+                    ));
+                }
+                (None, None) => {
+                    // Slot con contenido pero ningún template matcheó el threshold.
+                    // Item nuevo sin template O template similar que no alcanzó.
+                    slots_out.push(SlotReading::unmatched(slot_idx));
+                }
             }
         }
         // NOTA: NMS cross-slot NO aplica aquí — el orden de matches ML no es
         // comparable con scores SSE. Si se quiere dedup, hacer por separado.
-        InventoryReading { slot_counts, stack_totals }
+        InventoryReading { slot_counts, stack_totals, slots: slots_out }
     }
 
     /// Versión extendida que también lee el stack count via OCR (M1).
@@ -474,36 +510,46 @@ impl InventoryReader {
     /// `slot_counts` (1 unit per slot).
     #[allow(dead_code)] // public API
     pub fn read_with_stacks(&self, frame: &Frame) -> InventoryReading {
+        use super::inventory_slot::{SlotReading, SlotStage};
+
+        // Estado transitorio por slot, resuelto a `SlotReading` tras NMS.
+        enum SlotRaw {
+            Empty,
+            Unmatched,
+            Pending { name: String, score: f32, stack: Option<u32> },
+        }
+
         let mut slot_counts: HashMap<String, u32> = HashMap::new();
         let mut stack_totals: HashMap<String, u32> = HashMap::new();
+        let mut slots_raw: Vec<SlotRaw> = Vec::with_capacity(self.slots.len());
         if self.is_empty() {
-            return InventoryReading { slot_counts, stack_totals };
+            return InventoryReading {
+                slot_counts, stack_totals, slots: Vec::new(),
+            };
         }
-        // 1. Collect: match por slot, guardar scores crudos + stacks por template.
-        //    Usamos Vec<(score, stack)> para poder aplicar NMS después manteniendo
-        //    la correspondencia score↔stack (ambos se filtran al descartar el slot).
-        let mut data_per_template: HashMap<String, Vec<(f32, u32)>> = HashMap::new();
-        for slot in &self.slots {
-            // Stage A: empty-slot short-circuit (plan inventory robustez).
-            // Ver `read_with_stacks_ml` para justificación. Mismo check aquí
-            // para mantener consistencia entre ambos read paths.
+
+        // Pase 1: recolectar estado per-slot preservando índice.
+        // Usamos también `matches_by_template` para el NMS posterior.
+        let mut matches_by_template: HashMap<String, Vec<(usize, f32)>> = HashMap::new();
+        for (slot_idx, slot) in self.slots.iter().enumerate() {
+            // Stage A.
             let stddev = frame_roi_luma_stddev(
                 frame,
                 &Roi::new(slot.x, slot.y, slot.w, slot.h),
             );
             if stddev < EMPTY_STDDEV_MAX {
+                slots_raw.push(SlotRaw::Empty);
                 continue;
             }
 
             let Some((slot_img_padded, _used_shift)) = extract_slot_with_shift_tolerance(frame, slot) else {
+                slots_raw.push(SlotRaw::Unmatched);
                 continue;
             };
 
             if let Some((score, name)) = best_match_for_slot(&slot_img_padded, &self.templates) {
-                // OCR sobre el slot ORIGINAL (sin padding) — el OCR scanea
-                // bottom-right corner que puede estar en distinta posición
-                // si usamos el padded slot. Re-extract sólo el slot exacto.
-                let stack = if !self.digit_templates.is_empty() {
+                // OCR sobre el slot ORIGINAL (sin padding).
+                let stack: Option<u32> = if !self.digit_templates.is_empty() {
                     crop_bgra(frame, Roi::new(slot.x, slot.y, slot.w, slot.h))
                         .and_then(|bgra| {
                             let luma = bgra_to_luma(&bgra, slot.w, slot.h);
@@ -512,27 +558,63 @@ impl InventoryReader {
                         .and_then(|exact_slot| {
                             super::inventory_ocr::read_slot_count(&exact_slot, &self.digit_templates)
                         })
-                        .unwrap_or(1)
                 } else {
-                    1
+                    None
                 };
-                data_per_template.entry(name).or_default().push((score, stack));
+                matches_by_template.entry(name.clone())
+                    .or_default()
+                    .push((slot_idx, score));
+                slots_raw.push(SlotRaw::Pending { name, score, stack });
+            } else {
+                slots_raw.push(SlotRaw::Unmatched);
             }
         }
-        // 2. NMS cross-slot: por template, filtrar slots fuera del gap del top score.
-        for (name, mut data) in data_per_template {
+
+        // Pase 2: NMS cross-slot por template → set de slot_idx que SOBREVIVEN.
+        let mut survivors: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (name, mut data) in matches_by_template {
             if data.is_empty() {
                 continue;
             }
-            data.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            let top_score = data[0].0;
-            let kept: Vec<(f32, u32)> = data.into_iter()
-                .filter(|(s, _)| *s >= top_score - NMS_SCORE_GAP)
+            data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let top_score = data[0].1;
+            let kept: Vec<(usize, f32)> = data.into_iter()
+                .filter(|(_, s)| *s >= top_score - NMS_SCORE_GAP)
                 .collect();
-            slot_counts.insert(name.clone(), kept.len() as u32);
-            stack_totals.insert(name, kept.iter().map(|(_, s)| *s).sum());
+            let count = kept.len() as u32;
+            slot_counts.insert(name.clone(), count);
+            // stack_totals se reconstruye tras saber qué slots sobreviven.
+            let _ = name;
+            for (idx, _) in kept {
+                survivors.insert(idx);
+            }
         }
-        InventoryReading { slot_counts, stack_totals }
+
+        // Pase 3: construir `slots` output + `stack_totals` agregado.
+        let mut slots_out: Vec<SlotReading> = Vec::with_capacity(slots_raw.len());
+        for (slot_idx, raw) in slots_raw.into_iter().enumerate() {
+            let slot_idx_u32 = slot_idx as u32;
+            let reading = match raw {
+                SlotRaw::Empty     => SlotReading::empty(slot_idx_u32),
+                SlotRaw::Unmatched => SlotReading::unmatched(slot_idx_u32),
+                SlotRaw::Pending { name, score, stack } => {
+                    if survivors.contains(&slot_idx) {
+                        let threshold = self.threshold_for(&name);
+                        *stack_totals.entry(name.clone()).or_insert(0) += stack.unwrap_or(1);
+                        SlotReading::matched(
+                            slot_idx_u32, name, score, threshold, stack, SlotStage::FullSweep,
+                        )
+                    } else {
+                        // Descartado por NMS — el match original existía pero
+                        // otro slot con score superior lo absorbió como FP.
+                        // Reportar como unmatched en el output per-slot.
+                        SlotReading::unmatched(slot_idx_u32)
+                    }
+                }
+            };
+            slots_out.push(reading);
+        }
+        InventoryReading { slot_counts, stack_totals, slots: slots_out }
     }
 }
 
@@ -857,6 +939,102 @@ mod tests {
         let mut reader = InventoryReader::new();
         reader.set_slots(vec![RoiDef::new(0, 0, 32, 32)]);
         assert!(reader.is_empty()); // sin templates = empty
+    }
+
+    // ── Item #2: per-slot output integration ─────────────────────────────
+
+    #[test]
+    fn read_returns_empty_slots_vec_when_unconfigured() {
+        // Sin templates → InventoryReading.slots vacío.
+        let reader = InventoryReader::new();
+        let frame = crate::sense::frame_buffer::Frame {
+            width: 100, height: 100, data: vec![50u8; 100 * 100 * 4],
+            captured_at: std::time::Instant::now(),
+        };
+        let reading = reader.read_with_stacks(&frame);
+        assert!(reading.slots.is_empty());
+    }
+
+    #[test]
+    fn read_ml_variant_emits_empty_slot_reading_for_uniform_frame() {
+        use crate::sense::vision::inventory_slot::SlotStage;
+
+        // Frame uniforme → todos los slots luma stddev ~0 → Stage A Empty.
+        let mut reader = InventoryReader::new();
+        reader.templates.push(ItemTemplate {
+            name: "dummy".into(),
+            template: make_template(42),
+            threshold: MATCH_THRESHOLD,
+        });
+        reader.set_slots(vec![
+            RoiDef::new(10, 10, 32, 32),
+            RoiDef::new(50, 10, 32, 32),
+        ]);
+
+        let frame = crate::sense::frame_buffer::Frame {
+            width: 200, height: 200,
+            data: vec![100u8; 200 * 200 * 4],  // uniforme → stddev ~0
+            captured_at: std::time::Instant::now(),
+        };
+        let reading = reader.read_with_stacks_ml(&frame, None);
+        assert_eq!(reading.slots.len(), 2);
+        for slot in &reading.slots {
+            assert_eq!(slot.stage, SlotStage::Empty);
+            assert!(slot.item.is_none());
+            assert_eq!(slot.confidence, 1.0);
+            assert!(slot.raw_score.is_none());
+        }
+        // Aggregate HashMaps vacíos también.
+        assert!(reading.slot_counts.is_empty());
+        assert!(reading.stack_totals.is_empty());
+    }
+
+    #[test]
+    fn read_ml_variant_preserves_slot_idx_order() {
+        // Confirma que slot_idx en Vec<SlotReading> matches el orden de
+        // configuración del reader.set_slots. Importante para consumers
+        // que indexan por slot_idx.
+        let mut reader = InventoryReader::new();
+        reader.templates.push(ItemTemplate {
+            name: "dummy".into(),
+            template: make_template(42),
+            threshold: MATCH_THRESHOLD,
+        });
+        reader.set_slots(vec![
+            RoiDef::new(0,   0, 32, 32),
+            RoiDef::new(50,  0, 32, 32),
+            RoiDef::new(100, 0, 32, 32),
+        ]);
+
+        let frame = crate::sense::frame_buffer::Frame {
+            width: 200, height: 100,
+            data: vec![50u8; 200 * 100 * 4],
+            captured_at: std::time::Instant::now(),
+        };
+        let reading = reader.read_with_stacks_ml(&frame, None);
+        assert_eq!(reading.slots.len(), 3);
+        for (i, slot) in reading.slots.iter().enumerate() {
+            assert_eq!(slot.slot_idx, i as u32);
+        }
+    }
+
+    #[test]
+    fn threshold_for_returns_override_or_default() {
+        let mut reader = InventoryReader::new();
+        reader.templates.push(ItemTemplate {
+            name: "white_pearl".into(),
+            template: make_template(0),
+            threshold: 0.95,  // override
+        });
+        reader.templates.push(ItemTemplate {
+            name: "mana_potion".into(),
+            template: make_template(0),
+            threshold: MATCH_THRESHOLD,
+        });
+        assert!((reader.threshold_for("white_pearl") - 0.95).abs() < 0.001);
+        assert!((reader.threshold_for("mana_potion") - MATCH_THRESHOLD).abs() < 0.001);
+        // Template inexistente → MATCH_THRESHOLD default.
+        assert!((reader.threshold_for("nonexistent") - MATCH_THRESHOLD).abs() < 0.001);
     }
 
     #[test]
