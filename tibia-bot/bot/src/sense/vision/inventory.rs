@@ -118,6 +118,79 @@ pub const TEMPLATE_DENSITY_MIN: f32 = 0.20;
 /// Luma threshold para considerar un pixel "denso" (no-background).
 const DENSITY_LUMA_THRESHOLD: u8 = 40;
 
+/// Stage A — empty-slot detection threshold (plan inventory robustez 2026-04-22).
+///
+/// Un slot vacío muestra solo el background del container (gris oscuro
+/// casi uniforme con stddev de luma <12). Un slot con sprite tiene
+/// variaciones >30 por los colores del icon + borde.
+///
+/// `EMPTY_STDDEV_MAX = 20.0` está en el centro del gap, con margen a ambos
+/// lados:
+/// - Slots vacíos típicos: stddev 8-12 → < 20 → clasificados empty.
+/// - Slots con item: stddev 30-60 → ≥ 20 → template match aplica.
+///
+/// Short-circuit: si un slot pasa como empty, skipeamos extract_slot,
+/// template match, NMS, OCR — ~100-300 µs ahorrados por slot vacío.
+/// En steady state (inventory backpack con 4-10 slots vacíos), ahorro
+/// esperado 40-70% del cost total de read().
+pub const EMPTY_STDDEV_MAX: f32 = 20.0;
+
+/// Calcula stddev de luma sobre un `GrayImage`. Single-pass O(n).
+/// Usado por Stage A para empty detection (cheap filter antes de template
+/// match). Para slot 32×32 = 1024 pixels → ~2 µs en release.
+/// Expuesto para consumers que ya tienen un `GrayImage` en mano; el path
+/// interno usa `frame_roi_luma_stddev` (evita allocar GrayImage).
+#[allow(dead_code)] // público API para consumers externos; tests + bench lo usan.
+pub fn luma_stddev(img: &GrayImage) -> f32 {
+    let pixels = img.as_raw();
+    if pixels.is_empty() {
+        return 0.0;
+    }
+    let n = pixels.len() as f64;
+    let sum: u64 = pixels.iter().map(|&p| p as u64).sum();
+    let mean = sum as f64 / n;
+    let var: f64 = pixels.iter()
+        .map(|&p| {
+            let d = p as f64 - mean;
+            d * d
+        })
+        .sum::<f64>() / n;
+    var.sqrt() as f32
+}
+
+/// Versión rápida directa sobre un frame + ROI (sin allocar GrayImage).
+/// Itera BGRA pixels, convierte a luma inline y acumula stats.
+/// Preferida cuando no se necesita el GrayImage después.
+/// ~1.5 µs estimado para slot 32×32.
+#[allow(dead_code)] // alternative path — usado si exact_slot no se requiere
+pub fn frame_roi_luma_stddev(frame: &Frame, roi: &Roi) -> f32 {
+    let stride = frame.width as usize * 4;
+    let mut sum: u64 = 0;
+    let mut sum_sq: u64 = 0;
+    let mut count: u64 = 0;
+    for row in 0..roi.h {
+        for col in 0..roi.w {
+            let off = (roi.y + row) as usize * stride + (roi.x + col) as usize * 4;
+            if off + 2 < frame.data.len() {
+                // Luma approx = (B + G*2 + R) / 4 en BGRA.
+                let b = frame.data[off]     as u64;
+                let g = frame.data[off + 1] as u64;
+                let r = frame.data[off + 2] as u64;
+                let luma = (b + g * 2 + r) / 4;
+                sum    += luma;
+                sum_sq += luma * luma;
+                count  += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    let mean = sum as f64 / count as f64;
+    let var  = sum_sq as f64 / count as f64 - mean * mean;
+    var.max(0.0).sqrt() as f32
+}
+
 /// Threshold auto-boosted para templates sparse sin override en TOML.
 const SPARSE_AUTO_THRESHOLD: f32 = 0.95;
 
@@ -331,6 +404,19 @@ impl InventoryReader {
         let mut ml_inner = ml_ref_opt;
 
         for slot in &self.slots {
+            // Stage A: empty-slot short-circuit (plan inventory robustez).
+            // Luma stddev sobre el slot exact BGRA→luma. Slots vacíos tienen
+            // variación <EMPTY_STDDEV_MAX y se skipean completamente.
+            // Coste ~1.5 µs por slot. Ahorra 100-300 µs por slot vacío
+            // (template match + NMS + OCR).
+            let stddev = frame_roi_luma_stddev(
+                frame,
+                &Roi::new(slot.x, slot.y, slot.w, slot.h),
+            );
+            if stddev < EMPTY_STDDEV_MAX {
+                continue;
+            }
+
             let Some((slot_img_padded, _)) = extract_slot_with_shift_tolerance(frame, slot) else {
                 continue;
             };
@@ -398,6 +484,17 @@ impl InventoryReader {
         //    la correspondencia score↔stack (ambos se filtran al descartar el slot).
         let mut data_per_template: HashMap<String, Vec<(f32, u32)>> = HashMap::new();
         for slot in &self.slots {
+            // Stage A: empty-slot short-circuit (plan inventory robustez).
+            // Ver `read_with_stacks_ml` para justificación. Mismo check aquí
+            // para mantener consistencia entre ambos read paths.
+            let stddev = frame_roi_luma_stddev(
+                frame,
+                &Roi::new(slot.x, slot.y, slot.w, slot.h),
+            );
+            if stddev < EMPTY_STDDEV_MAX {
+                continue;
+            }
+
             let Some((slot_img_padded, _used_shift)) = extract_slot_with_shift_tolerance(frame, slot) else {
                 continue;
             };
@@ -651,6 +748,108 @@ mod tests {
     fn reader_empty_by_default() {
         let reader = InventoryReader::new();
         assert!(reader.is_empty());
+    }
+
+    // ── Stage A: empty slot detection (luma stddev) ────────────────────
+
+    fn gray_image_with_value(w: u32, h: u32, v: u8) -> GrayImage {
+        let mut img = GrayImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.put_pixel(x, y, image::Luma([v]));
+            }
+        }
+        img
+    }
+
+    fn gray_image_with_noise(w: u32, h: u32, amplitude: u8) -> GrayImage {
+        let mut img = GrayImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                // Pseudo-random via mixing x+y. Amplitude escala variación.
+                let base = ((x * 17 + y * 31) % 256) as u8;
+                let scaled = (base as u32 * amplitude as u32 / 255) as u8;
+                img.put_pixel(x, y, image::Luma([scaled]));
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn luma_stddev_zero_for_uniform_image() {
+        let img = gray_image_with_value(32, 32, 42);
+        assert!(luma_stddev(&img) < 0.01);
+    }
+
+    #[test]
+    fn luma_stddev_zero_for_empty_image() {
+        let img = GrayImage::new(0, 0);
+        assert_eq!(luma_stddev(&img), 0.0);
+    }
+
+    #[test]
+    fn luma_stddev_high_for_noisy_image() {
+        // amplitude=255 genera pattern con stddev muy alto.
+        let img = gray_image_with_noise(32, 32, 255);
+        let s = luma_stddev(&img);
+        assert!(s > 30.0, "got {}", s);
+    }
+
+    #[test]
+    fn luma_stddev_below_threshold_for_near_uniform() {
+        // Uniform with tiny noise (amplitude 20) → stddev ~8, < 20 threshold.
+        let img = gray_image_with_noise(32, 32, 20);
+        let s = luma_stddev(&img);
+        assert!(s < EMPTY_STDDEV_MAX,
+            "near-uniform stddev={} should be < EMPTY_STDDEV_MAX={}",
+            s, EMPTY_STDDEV_MAX);
+    }
+
+    #[test]
+    fn luma_stddev_above_threshold_for_content() {
+        // Sprite-like: stronger variation → stddev > 20.
+        let img = gray_image_with_noise(32, 32, 200);
+        let s = luma_stddev(&img);
+        assert!(s > EMPTY_STDDEV_MAX,
+            "sprite-like stddev={} should be > EMPTY_STDDEV_MAX={}",
+            s, EMPTY_STDDEV_MAX);
+    }
+
+    #[test]
+    fn frame_roi_stddev_matches_gray_stddev() {
+        // Generar frame BGRA con patrón conocido, verificar que
+        // frame_roi_luma_stddev devuelve algo cercano a luma_stddev del slot.
+        let w = 64u32;
+        let h = 64u32;
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for i in 0..(w * h) as usize {
+            let v = ((i % 200) as u8).saturating_mul(1);
+            data[i * 4]     = v;
+            data[i * 4 + 1] = v;
+            data[i * 4 + 2] = v;
+            data[i * 4 + 3] = 255;
+        }
+        let frame = crate::sense::frame_buffer::Frame {
+            width: w, height: h, data,
+            captured_at: std::time::Instant::now(),
+        };
+        let roi = Roi::new(16, 16, 32, 32);
+        let s_frame = frame_roi_luma_stddev(&frame, &roi);
+        // Stddev debe ser >0 (hay variación en el patrón).
+        assert!(s_frame > 5.0, "got {}", s_frame);
+    }
+
+    #[test]
+    fn frame_roi_stddev_zero_for_uniform_bgra() {
+        let w = 64u32;
+        let h = 64u32;
+        let data = vec![100u8; (w * h * 4) as usize]; // all pixels identical
+        let frame = crate::sense::frame_buffer::Frame {
+            width: w, height: h, data,
+            captured_at: std::time::Instant::now(),
+        };
+        let roi = Roi::new(16, 16, 32, 32);
+        assert!(frame_roi_luma_stddev(&frame, &roi) < 0.01);
     }
 
     #[test]

@@ -333,9 +333,60 @@ fn bench_health_evaluate_tick(c: &mut Criterion) {
             let m = mk_degraded_tick(i);
             registry.record_tick(m);
             let s = sys.evaluate_tick(black_box(&m), black_box(&registry),
-                                      ExtraInputs { anchor_drift_streak: 10, bridge_rtt_ms: None });
+                                      ExtraInputs {
+                                          anchor_drift_streak: 10,
+                                          bridge_rtt_ms: None,
+                                          bridge_last_pong_ms_ago: 0,
+                                      });
             black_box(s);
             i += 1;
+        });
+    });
+}
+
+// ── Inventory Stage A (empty-slot detection via luma stddev) ──────────
+//
+// Valida el claim del plan inventory robustez: ~1.5 µs por slot 32×32.
+// Si Stage A cuesta mucho más, anula el beneficio del short-circuit.
+
+fn bench_inventory_stage_a(c: &mut Criterion) {
+    use std::time::Instant;
+    use tibia_bot::sense::frame_buffer::Frame;
+    use tibia_bot::sense::vision::crop::Roi;
+    use tibia_bot::sense::vision::inventory::{frame_roi_luma_stddev, luma_stddev};
+
+    // Frame sintético 1920×1080 con patrón no uniforme.
+    let w = 1920u32;
+    let h = 1080u32;
+    let mut data = vec![0u8; (w * h * 4) as usize];
+    for i in 0..(w * h) as usize {
+        let v = (i % 200) as u8;
+        data[i * 4]     = v;
+        data[i * 4 + 1] = v.saturating_add(30);
+        data[i * 4 + 2] = v.saturating_add(60);
+        data[i * 4 + 3] = 255;
+    }
+    let frame = Frame { width: w, height: h, data, captured_at: Instant::now() };
+    let roi = Roi::new(1600, 200, 32, 32);
+
+    c.bench_function("inventory_stage_a_frame_roi_stddev_32x32", |b| {
+        b.iter(|| {
+            let s = frame_roi_luma_stddev(black_box(&frame), black_box(&roi));
+            black_box(s);
+        });
+    });
+
+    // Version alternativa: luma_stddev sobre GrayImage prealocado.
+    let mut img = image::GrayImage::new(32, 32);
+    for y in 0..32u32 {
+        for x in 0..32u32 {
+            img.put_pixel(x, y, image::Luma([((x * 17 + y * 31) % 256) as u8]));
+        }
+    }
+    c.bench_function("inventory_stage_a_luma_stddev_32x32", |b| {
+        b.iter(|| {
+            let s = luma_stddev(black_box(&img));
+            black_box(s);
         });
     });
 }
@@ -348,5 +399,6 @@ criterion_group!(
     bench_instrumentation_record_tick,
     bench_instrumentation_record_action_ack,
     bench_health_evaluate_tick,
+    bench_inventory_stage_a,
 );
 criterion_main!(benches);
