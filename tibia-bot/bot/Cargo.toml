@@ -150,7 +150,8 @@ tower-http         = { version = "0.6", features = ["cors", "limit"] }
 image              = "0.25"
 base64             = "0.22"
 imageproc          = "0.25"
-bincode            = "1.3"               # serialización del map index para coords
+bincode            = "1.3"               # legacy: solo para cargar .bin pre-migración postcard
+postcard           = { version = "1", features = ["alloc"] }  # reemplazo mantenido de bincode
 
 # ── Pathfinding ──────────────────────────────────────────────────────────────
 # Crate batería-incluida: A*, Dijkstra, BFS, Kruskal, etc. Reemplaza el

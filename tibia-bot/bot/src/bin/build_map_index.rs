@@ -1,7 +1,8 @@
 /// build_map_index — Genera el índice de tile-hashes para posicionamiento absoluto.
 ///
 /// Lee los archivos Minimap_Color_*.png del directorio de minimapas de Tibia
-/// y construye un HashMap<dHash, Vec<MapPos>> serializado con bincode.
+/// y construye un HashMap<dHash, Vec<MapPos>> serializado con postcard
+/// (con fallback de lectura a bincode legacy — ver MapIndex::load).
 ///
 /// Opcionalmente también construye la grilla de walkability leyendo los
 /// `Minimap_WaypointCost_*.png` del mismo directorio.

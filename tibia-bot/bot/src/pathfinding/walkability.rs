@@ -29,6 +29,12 @@ pub type TileCost = u8;
 /// Tibia usa 255 para walls amarillas; anything below 250 es walkable.
 pub const WALL_THRESHOLD: u8 = 250;
 
+/// Magic header para WalkabilityGrid on-disk (postcard format). Primeros 4
+/// bytes del archivo. Distingue postcard de bincode legacy sin ambigüedad.
+const WALKABILITY_MAGIC: &[u8; 4] = b"TBWG"; // "Tibia Bot Walkability Grid"
+/// Version byte tras el magic. Bump al cambiar schema.
+const WALKABILITY_VERSION: u8 = 1;
+
 /// Grilla sparse de walkability por tile absoluto `(x, y, z)`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WalkabilityGrid {
@@ -214,28 +220,69 @@ impl WalkabilityGrid {
         self.transitions.len()
     }
 
-    /// Serializa la grilla a un archivo usando bincode.
+    /// Serializa la grilla a un archivo usando postcard.
+    ///
+    /// Migración 2026-04-23: bincode 1.3 → postcard (bincode unmaintained,
+    /// RUSTSEC-2023-0074). Los `.bin` pre-migración se siguen cargando por
+    /// el fallback de `load()`.
+    ///
+    /// Formato on-disk: `[MAGIC (4) | VERSION (1) | postcard bytes...]`. El
+    /// magic distingue postcard de bincode legacy sin ambigüedad (postcard
+    /// acepta bytes arbitrarios como parsing "success" silent-corrupt).
+    ///
+    /// Nota: `to_allocvec` mantiene todo el buffer en memoria (~230 MB
+    /// para el walkability completo). Bincode hacía lo mismo internamente
+    /// con `BufWriter`, así que el footprint es equivalente.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let file = std::fs::File::create(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        let writer = std::io::BufWriter::new(file);
-        bincode::serialize_into(writer, self)
-            .with_context(|| format!("bincode serialize failed for {}", path.display()))?;
+        let payload = postcard::to_allocvec(self)
+            .with_context(|| format!("postcard serialize WalkabilityGrid: {}", path.display()))?;
+        let mut data = Vec::with_capacity(5 + payload.len());
+        data.extend_from_slice(WALKABILITY_MAGIC);
+        data.push(WALKABILITY_VERSION);
+        data.extend_from_slice(&payload);
+        std::fs::write(path, data)
+            .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
     }
 
     /// Carga una grilla serializada.
+    ///
+    /// Si los primeros 5 bytes son `[TBWG, version]` → postcard. Si no →
+    /// fallback bincode legacy con warning. Cuando ya no queden archivos
+    /// legacy se puede eliminar el fallback y la dep `bincode`.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        let reader = std::io::BufReader::new(file);
-        let grid: Self = bincode::deserialize_from(reader)
-            .with_context(|| format!("bincode deserialize failed for {}", path.display()))?;
+        let data = std::fs::read(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if data.len() >= 5 && &data[..4] == WALKABILITY_MAGIC {
+            let version = data[4];
+            if version != WALKABILITY_VERSION {
+                anyhow::bail!(
+                    "WalkabilityGrid '{}': versión on-disk {} no soportada (esperaba {})",
+                    path.display(), version, WALKABILITY_VERSION
+                );
+            }
+            return postcard::from_bytes::<Self>(&data[5..])
+                .with_context(|| format!(
+                    "WalkabilityGrid '{}': postcard decode falló", path.display()
+                ));
+        }
+        // Sin magic → formato legacy bincode.
+        let grid: Self = bincode::deserialize(&data)
+            .with_context(|| format!(
+                "WalkabilityGrid '{}': ni postcard (magic mismatch) ni bincode legacy",
+                path.display()
+            ))?;
+        tracing::warn!(
+            "WalkabilityGrid '{}': cargado en formato bincode legacy. \
+             Regenerar con `build_map_index --walkability ...` para \
+             migrar a postcard.",
+            path.display()
+        );
         Ok(grid)
     }
 
@@ -328,6 +375,35 @@ mod tests {
         assert!(loaded.is_transition(100, 200, 7));
         assert!(loaded.is_transition(100, 200, 6));
         assert_eq!(loaded.transitions_count(), 2);
+
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    /// Compat: `load()` debe aceptar `.bin` escritos con bincode legacy
+    /// (formato pre-migración 2026-04-23). Escribimos un grid serializado
+    /// en bincode y verificamos que el loader moderno lo parsea vía fallback.
+    #[test]
+    fn load_accepts_legacy_bincode() {
+        let mut g = WalkabilityGrid::new();
+        g.set_tile(50, 60, 7, 50);
+        g.set_tile(51, 60, 7, 200);
+        g.add_transition(50, 60, 7);
+        g.files_loaded = 1;
+
+        // Escribir en formato legacy (bincode).
+        let legacy_bytes = bincode::serialize(&g).unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "walkability_legacy_{}.bin", std::process::id()
+        ));
+        std::fs::write(&tmp, &legacy_bytes).unwrap();
+
+        // Load via el método moderno — fallback bincode debe parsear OK.
+        let loaded = WalkabilityGrid::load(&tmp).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.cost(50, 60, 7), Some(50));
+        assert_eq!(loaded.cost(51, 60, 7), Some(200));
+        assert!(loaded.is_transition(50, 60, 7));
+        assert_eq!(loaded.files_loaded, 1);
 
         std::fs::remove_file(&tmp).ok();
     }

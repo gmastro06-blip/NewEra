@@ -101,6 +101,14 @@ pub fn hamming(a: u64, b: u64) -> u32 {
 
 // ── MapIndex ──────────────────────────────────────────────────────────────────
 
+/// Magic header para MapIndex on-disk (postcard format). Primeros 4 bytes del
+/// archivo. Permite distinguir bytes postcard de bytes bincode legacy, porque
+/// postcard::from_bytes acepta entradas arbitrarias como "parseadas" aunque
+/// devuelva resultado corrupto.
+const MAP_INDEX_MAGIC: &[u8; 4] = b"TBMI"; // "Tibia Bot Map Index"
+/// Version byte que sigue al magic. Bump al cambiar schema de MapIndex.
+const MAP_INDEX_VERSION: u8 = 1;
+
 /// Posición absoluta en el mundo de Tibia.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MapPos {
@@ -154,18 +162,63 @@ impl MapIndex {
         results
     }
 
-    /// Serializa el índice a bytes (bincode).
+    /// Serializa el índice a bytes (postcard — formato actual).
+    ///
+    /// Migración 2026-04-23: bincode 1.3 es unmaintained (security advisory
+    /// RUSTSEC-2023-0074). Postcard es el reemplazo mantenido y no-std
+    /// friendly. Los `.bin` pre-migración se siguen cargando por el fallback
+    /// de `load()`, así que no hay que regenerar nada manualmente.
+    ///
+    /// Formato on-disk: `[MAGIC (4) | VERSION (1) | postcard bytes...]`. El
+    /// magic permite detectar unambiguamente formato legacy (sin header) vs
+    /// postcard — postcard acepta bytes arbitrarios como parsing "success"
+    /// con resultado silenciosamente corrupto, así que try/catch puro no
+    /// distingue los dos formatos.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let data = bincode::serialize(self)?;
+        let payload = postcard::to_allocvec(self)
+            .map_err(|e| anyhow::anyhow!("postcard serialize MapIndex: {}", e))?;
+        let mut data = Vec::with_capacity(5 + payload.len());
+        data.extend_from_slice(MAP_INDEX_MAGIC);
+        data.push(MAP_INDEX_VERSION);
+        data.extend_from_slice(&payload);
         std::fs::write(path, data)?;
         Ok(())
     }
 
     /// Carga el índice desde un archivo .bin.
+    ///
+    /// Si los primeros 5 bytes son `[TBPC, version]` → parsea con postcard.
+    /// Si no → fallback bincode legacy con warning. Cuando ya no queden
+    /// archivos legacy en circulación se puede eliminar el fallback y la
+    /// dependencia `bincode`.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let data = std::fs::read(path)?;
-        let index: Self = bincode::deserialize(&data)?;
-        Ok(index)
+        if data.len() >= 5 && &data[..4] == MAP_INDEX_MAGIC {
+            let version = data[4];
+            if version != MAP_INDEX_VERSION {
+                anyhow::bail!(
+                    "MapIndex '{}': versión on-disk {} no soportada (esperaba {})",
+                    path.display(), version, MAP_INDEX_VERSION
+                );
+            }
+            return postcard::from_bytes::<Self>(&data[5..])
+                .map_err(|e| anyhow::anyhow!(
+                    "MapIndex '{}': postcard decode falló: {}", path.display(), e
+                ));
+        }
+        // Sin magic → formato legacy bincode.
+        let idx = bincode::deserialize::<Self>(&data)
+            .map_err(|e| anyhow::anyhow!(
+                "MapIndex '{}': ni postcard (magic mismatch) ni bincode legacy: {}",
+                path.display(), e
+            ))?;
+        tracing::warn!(
+            "MapIndex '{}': cargado en formato bincode legacy. \
+             Regenerar con `cargo run --release --bin build_map_index` \
+             para migrar a postcard y silenciar este warning.",
+            path.display()
+        );
+        Ok(idx)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1510,16 +1563,57 @@ mod tests {
     }
 
     #[test]
-    fn map_index_serialize_roundtrip() {
+    fn map_index_serialize_roundtrip_postcard() {
         let mut index = MapIndex::new();
         index.insert(0xAAAA, MapPos { x: 1, y: 2, z: 3 });
         index.insert(0xBBBB, MapPos { x: 4, y: 5, z: 6 });
 
-        let serialized = bincode::serialize(&index).unwrap();
-        let deserialized: MapIndex = bincode::deserialize(&serialized).unwrap();
+        let serialized = postcard::to_allocvec(&index).unwrap();
+        let deserialized: MapIndex = postcard::from_bytes(&serialized).unwrap();
 
         assert_eq!(deserialized.lookup_exact(0xAAAA).len(), 1);
         assert_eq!(deserialized.lookup_exact(0xBBBB)[0], MapPos { x: 4, y: 5, z: 6 });
+    }
+
+    /// Compat: `MapIndex::load()` debe aceptar `.bin` serializados en bincode
+    /// legacy pre-migración 2026-04-23. Escribimos un archivo con bincode +
+    /// llamamos `load()` + verificamos que parsea.
+    #[test]
+    fn map_index_load_accepts_legacy_bincode() {
+        let mut index = MapIndex::new();
+        index.insert(0xCAFE, MapPos { x: 10, y: 20, z: 7 });
+        index.insert(0xBEEF, MapPos { x: 11, y: 22, z: 8 });
+
+        // Escribe en formato legacy (bincode).
+        let legacy_bytes = bincode::serialize(&index).unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "map_index_legacy_{}.bin", std::process::id()
+        ));
+        std::fs::write(&tmp, &legacy_bytes).unwrap();
+
+        // Load vía el método moderno — debe caer al fallback y parsear OK.
+        let loaded = MapIndex::load(&tmp).unwrap();
+        assert_eq!(loaded.lookup_exact(0xCAFE)[0], MapPos { x: 10, y: 20, z: 7 });
+        assert_eq!(loaded.lookup_exact(0xBEEF)[0], MapPos { x: 11, y: 22, z: 8 });
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Save escribe postcard (formato actual); load lo reconoce sin
+    /// disparar el fallback bincode.
+    #[test]
+    fn map_index_save_and_load_roundtrip_file() {
+        let mut index = MapIndex::new();
+        index.insert(0xDEAD, MapPos { x: -3, y: 100, z: 0 });
+
+        let tmp = std::env::temp_dir().join(format!(
+            "map_index_postcard_{}.bin", std::process::id()
+        ));
+        index.save(&tmp).unwrap();
+        let loaded = MapIndex::load(&tmp).unwrap();
+        assert_eq!(loaded.lookup_exact(0xDEAD)[0], MapPos { x: -3, y: 100, z: 0 });
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     // ── MinimapMatcher tests ─────────────────────────────────────────────

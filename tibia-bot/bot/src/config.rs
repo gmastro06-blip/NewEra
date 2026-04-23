@@ -382,7 +382,8 @@ pub struct CavebotConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct GameCoordsConfig {
-    /// Ruta al archivo de índice pre-computado (bincode). Vacío = deshabilitado.
+    /// Ruta al archivo de índice pre-computado (postcard; acepta bincode
+    /// legacy vía MapIndex::load fallback). Vacío = deshabilitado.
     pub map_index_path: String,
     /// Frames entre detecciones (default 15 = ~500ms @ 30fps).
     pub detect_interval: Option<u32>,
