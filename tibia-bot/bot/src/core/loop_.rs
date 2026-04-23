@@ -1537,6 +1537,15 @@ impl BotLoop {
                 };
                 self.metrics.record_tick(m);
 
+                // ── Inventory per-slot metrics (item #5 plan robustez) ────
+                // Cost ~100 ns × N slots. Con cadencia 15 ticks del reader,
+                // el mismo cache se ingesta cada tick — counters son "slot-
+                // observations" no "slot-reads reales". Normalizar por
+                // inventory_slots_observed / N si se quiere rate por read.
+                if !perception.inventory_slots.is_empty() {
+                    self.metrics.ingest_inventory_slots(&perception.inventory_slots);
+                }
+
                 // ── HealthSystem evaluate ─────────────────────────────────
                 // Consume el TickMetrics que acabamos de publicar +
                 // MetricsRegistry (windows, action_success_rate) + extras

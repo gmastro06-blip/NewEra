@@ -2697,6 +2697,43 @@ async fn handle_prometheus_metrics(State(s): State<AppState>) -> Response {
         writeln!(out, "tibia_health_issue_active{{kind=\"{}\"}} {}", kind, v).ok();
     }
 
+    // ── Inventory per-slot gauges (item #5 plan robustez 2026-04-22) ────
+    // Counters de observaciones acumuladas desde boot. Para rates,
+    // Grafana calcula rate() con intervalos, o el operador normaliza
+    // dividiendo por el slot count configurado.
+    writeln!(out, "# HELP tibia_inventory_slots_observed_total Total slot observations ingested").ok();
+    writeln!(out, "# TYPE tibia_inventory_slots_observed_total counter").ok();
+    writeln!(out, "tibia_inventory_slots_observed_total {}",
+        s.metrics.inventory_slots_observed.load(std::sync::atomic::Ordering::Relaxed)).ok();
+
+    writeln!(out, "# HELP tibia_inventory_slots_by_stage Slot observations grouped by stage").ok();
+    writeln!(out, "# TYPE tibia_inventory_slots_by_stage counter").ok();
+    writeln!(out, "tibia_inventory_slots_by_stage{{stage=\"empty\"}} {}",
+        s.metrics.inventory_slots_empty.load(std::sync::atomic::Ordering::Relaxed)).ok();
+    writeln!(out, "tibia_inventory_slots_by_stage{{stage=\"matched\"}} {}",
+        s.metrics.inventory_slots_matched.load(std::sync::atomic::Ordering::Relaxed)).ok();
+    writeln!(out, "tibia_inventory_slots_by_stage{{stage=\"unmatched\"}} {}",
+        s.metrics.inventory_slots_unmatched.load(std::sync::atomic::Ordering::Relaxed)).ok();
+
+    writeln!(out, "# HELP tibia_inventory_slots_with_stable_total Slots with stable_item populated by filter").ok();
+    writeln!(out, "# TYPE tibia_inventory_slots_with_stable_total counter").ok();
+    writeln!(out, "tibia_inventory_slots_with_stable_total {}",
+        s.metrics.inventory_slots_with_stable.load(std::sync::atomic::Ordering::Relaxed)).ok();
+
+    // Confidence histogram: emitir percentiles p50/p95/p99 directamente
+    // (bucket array es demasiado verbose para /metrics). Unidad: basis
+    // points 0..10000, donde 10000 = confidence 1.0.
+    let conf_p50 = s.metrics.inventory_slot_confidence.percentile(0.50);
+    let conf_p95 = s.metrics.inventory_slot_confidence.percentile(0.95);
+    let conf_p99 = s.metrics.inventory_slot_confidence.percentile(0.99);
+    let conf_count = s.metrics.inventory_slot_confidence.count();
+    writeln!(out, "# HELP tibia_inventory_slot_confidence_bp Per-slot confidence distribution (basis points, 0..10000)").ok();
+    writeln!(out, "# TYPE tibia_inventory_slot_confidence_bp gauge").ok();
+    writeln!(out, "tibia_inventory_slot_confidence_bp{{quantile=\"0.50\"}} {}", conf_p50).ok();
+    writeln!(out, "tibia_inventory_slot_confidence_bp{{quantile=\"0.95\"}} {}", conf_p95).ok();
+    writeln!(out, "tibia_inventory_slot_confidence_bp{{quantile=\"0.99\"}} {}", conf_p99).ok();
+    writeln!(out, "tibia_inventory_slot_confidence_samples {}", conf_count).ok();
+
     (
         [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         out,
@@ -3056,6 +3093,35 @@ mod tests {
         // Issues no emitidos están en 0 (todos los kinds listados).
         assert!(text.contains("tibia_health_issue_active{kind=\"frame_stale\"} 0"));
         assert!(text.contains("tibia_health_issue_active{kind=\"blind_mode\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn metrics_includes_inventory_slot_gauges() {
+        use crate::sense::vision::inventory_slot::{SlotReading, SlotStage};
+        let state = test_state().await;
+        // Ingesta algunos slots sintéticos para poblar los counters.
+        let slots = vec![
+            SlotReading::empty(0),
+            SlotReading::matched(
+                1, "mana_potion".into(), 0.92, 0.80, Some(47),
+                SlotStage::FullSweep,
+            ),
+            SlotReading::unmatched(2),
+        ];
+        state.metrics.ingest_inventory_slots(&slots);
+
+        let app = build_router(state);
+        let (status, body) = get(app, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        let text = String::from_utf8_lossy(&body);
+        // Counters base presentes.
+        assert!(text.contains("tibia_inventory_slots_observed_total 3"));
+        assert!(text.contains("tibia_inventory_slots_by_stage{stage=\"empty\"} 1"));
+        assert!(text.contains("tibia_inventory_slots_by_stage{stage=\"matched\"} 1"));
+        assert!(text.contains("tibia_inventory_slots_by_stage{stage=\"unmatched\"} 1"));
+        // Confidence percentiles presentes (solo 1 sample → p50/p95/p99 iguales).
+        assert!(text.contains("tibia_inventory_slot_confidence_bp{quantile=\"0.50\"}"));
+        assert!(text.contains("tibia_inventory_slot_confidence_samples 1"));
     }
 
     #[tokio::test]

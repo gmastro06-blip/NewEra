@@ -50,6 +50,28 @@ pub struct MetricsRegistry {
     pub ticks_overrun:    AtomicU64,
     pub frame_seq_gaps:   AtomicU64,
 
+    // ── Inventory per-slot metrics (item #5 plan robustez 2026-04-22) ────
+    // Observaciones acumuladas por tick. Cada entry SlotReading incrementa:
+    // - _observed: siempre (total slots × ticks)
+    // - _empty / _matched / _unmatched: según stage del SlotReading
+    // - _with_stable: si stable_item.is_some() (filter propagó majority)
+    // Confidence histogram: sólo para stage FullSweep/MlClassified/CachedHit
+    // con confidence > 0 (skipea Empty que siempre es 1.0 trivial).
+    pub inventory_slots_observed:     AtomicU64,
+    pub inventory_slots_empty:        AtomicU64,
+    pub inventory_slots_matched:      AtomicU64,
+    pub inventory_slots_unmatched:    AtomicU64,
+    pub inventory_slots_with_stable:  AtomicU64,
+    /// Confidence distribution. Units: confidence × 10000 (basis points),
+    /// reusa LatencyHistogram (buckets exponenciales base 500 us).
+    /// Bucket 0 → confidence < 0.05 (rechazos borderline).
+    /// Bucket ~8 → confidence > 0.95 (matches fuertes).
+    /// Cadencia: inventory_detect_interval ~15 ticks → el mismo cache se
+    /// re-ingesta en ticks "dormidos" → multiplicador fijo × 15. Normalizar
+    /// dividiendo por `inventory_slots_observed / slot_count` si se quiere
+    /// distribución por read real.
+    pub inventory_slot_confidence:    LatencyHistogram,
+
     /// `actions_emitted[kind as usize]` y `actions_acked` — separados por kind.
     pub actions_emitted:  [AtomicU64; 8],
     pub actions_acked:    [AtomicU64; 8],
@@ -129,6 +151,12 @@ impl MetricsRegistry {
             ticks_total:      AtomicU64::new(0),
             ticks_overrun:    AtomicU64::new(0),
             frame_seq_gaps:   AtomicU64::new(0),
+            inventory_slots_observed:    AtomicU64::new(0),
+            inventory_slots_empty:       AtomicU64::new(0),
+            inventory_slots_matched:     AtomicU64::new(0),
+            inventory_slots_unmatched:   AtomicU64::new(0),
+            inventory_slots_with_stable: AtomicU64::new(0),
+            inventory_slot_confidence:   LatencyHistogram::new(),
             actions_emitted:  Default::default(),
             actions_acked:    Default::default(),
             actions_failed:   Default::default(),
@@ -261,6 +289,47 @@ impl MetricsRegistry {
     /// Snapshot del último tick. Lock-free (ArcSwap load).
     pub fn last_tick_snapshot(&self) -> Arc<TickMetrics> {
         self.last_tick.load_full()
+    }
+
+    /// Ingesta observaciones per-slot al finalizar el tick (item #5 plan
+    /// robustez). Llamado por BotLoop tras record_tick si hay
+    /// `perception.inventory_slots` poblado.
+    ///
+    /// Incrementa counters por stage + alimenta histograma de confidence
+    /// (en basis points 0..10000). Cost ~100 ns × N slots. Con N=16:
+    /// ~1.6 µs. Se ingesta cada tick (incluso ticks "dormidos" que reusan
+    /// el cache del último read real) — ver comentario en el registry.
+    pub fn ingest_inventory_slots(
+        &self,
+        slots: &[crate::sense::vision::inventory_slot::SlotReading],
+    ) {
+        use crate::sense::vision::inventory_slot::SlotStage;
+        for s in slots {
+            self.inventory_slots_observed.fetch_add(1, Ordering::Relaxed);
+            match s.stage {
+                SlotStage::Empty => {
+                    self.inventory_slots_empty.fetch_add(1, Ordering::Relaxed);
+                }
+                SlotStage::CachedHit | SlotStage::FullSweep | SlotStage::MlClassified => {
+                    if s.item.is_some() {
+                        self.inventory_slots_matched.fetch_add(1, Ordering::Relaxed);
+                        // Confidence en basis points [0..10000]. Histograma
+                        // interpreta como "µs" pero es solo un bucket index.
+                        let bp = (s.confidence * 10_000.0).clamp(0.0, 10_000.0) as u32;
+                        self.inventory_slot_confidence.record_us(bp);
+                    } else {
+                        // Stage FullSweep con item=None → unmatched real.
+                        self.inventory_slots_unmatched.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                SlotStage::Unknown => {
+                    // No contar — estado transitorio, no debería emitirse.
+                }
+            }
+            if s.stable_item.is_some() {
+                self.inventory_slots_with_stable.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Snapshot agregado de los rolling windows (jitter, FPS, vision).
@@ -483,5 +552,60 @@ mod tests {
         // 4 threads × 100 ticks = 400 records.
         assert_eq!(r.tick_total.count(), 400);
         assert_eq!(r.action_rtt.count(), 400);
+    }
+
+    // ── Inventory per-slot metrics (item #5 plan robustez) ────────────
+
+    #[test]
+    fn ingest_inventory_slots_increments_counters_by_stage() {
+        use crate::sense::vision::inventory_slot::{SlotReading, SlotStage};
+        let r = MetricsRegistry::new();
+        let slots = vec![
+            SlotReading::empty(0),
+            SlotReading::empty(1),
+            SlotReading::matched(
+                2, "mana_potion".into(), 0.92, 0.80, Some(47),
+                SlotStage::FullSweep,
+            ),
+            SlotReading::unmatched(3),
+        ];
+        r.ingest_inventory_slots(&slots);
+        assert_eq!(r.inventory_slots_observed.load(Ordering::Relaxed), 4);
+        assert_eq!(r.inventory_slots_empty.load(Ordering::Relaxed), 2);
+        assert_eq!(r.inventory_slots_matched.load(Ordering::Relaxed), 1);
+        assert_eq!(r.inventory_slots_unmatched.load(Ordering::Relaxed), 1);
+        assert_eq!(r.inventory_slots_with_stable.load(Ordering::Relaxed), 0);
+        // Confidence histogram: solo 1 sample (la slot matched).
+        assert_eq!(r.inventory_slot_confidence.count(), 1);
+    }
+
+    #[test]
+    fn ingest_counts_stable_item_when_filter_populated() {
+        use crate::sense::vision::inventory_slot::{SlotReading, SlotStage};
+        let r = MetricsRegistry::new();
+        let mut s = SlotReading::matched(
+            0, "X".into(), 0.85, 0.80, None, SlotStage::FullSweep,
+        );
+        s.stable_item = Some("X".into());  // filter activo
+        r.ingest_inventory_slots(&[s]);
+        assert_eq!(r.inventory_slots_with_stable.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn ingest_empty_slots_zero_confidence_samples() {
+        use crate::sense::vision::inventory_slot::SlotReading;
+        let r = MetricsRegistry::new();
+        // Slot Empty tiene confidence 1.0 por default pero NO se ingesta al
+        // histograma (es trivial; solo matched slots contribuyen).
+        r.ingest_inventory_slots(&[SlotReading::empty(0), SlotReading::empty(1)]);
+        assert_eq!(r.inventory_slot_confidence.count(), 0);
+        assert_eq!(r.inventory_slots_empty.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn ingest_empty_slots_vec_is_noop() {
+        let r = MetricsRegistry::new();
+        r.ingest_inventory_slots(&[]);
+        assert_eq!(r.inventory_slots_observed.load(Ordering::Relaxed), 0);
     }
 }
