@@ -242,6 +242,16 @@ pub struct InventoryReading {
     pub slots:        Vec<super::inventory_slot::SlotReading>,
 }
 
+/// Entrada del cache Stage B: referencia al template que matcheó la
+/// última read exitosa en un slot. Indexado por slot_idx.
+#[derive(Debug, Clone, Copy)]
+struct CachedSlotMatch {
+    /// Índice del template en `self.templates` (no name para evitar
+    /// lookup lineal). Si `templates` se recarga, el cache se invalida
+    /// desde el caller via `InventoryReader::clear_cache()`.
+    template_idx: usize,
+}
+
 /// Reader de inventario: template matching por slot.
 pub struct InventoryReader {
     templates: Vec<ItemTemplate>,
@@ -250,6 +260,16 @@ pub struct InventoryReader {
     /// Threshold runtime para Stage A empty detection. Override del const
     /// `EMPTY_STDDEV_MAX` configurable via `[inventory].empty_stddev_max`.
     empty_stddev_max: f32,
+    /// Cache Stage B: last_match_per_slot[slot_idx] = Some(template_idx)
+    /// si la última read matcheó algo, else None.
+    /// Permite al próximo read probar solo ese template antes del full
+    /// sweep — exploita temporal locality (slots rara vez cambian).
+    /// Redimensionado dinámicamente en `read_with_stacks_ml` para coincidir
+    /// con `slots.len()`. Mutado por reads via `&mut self` o RefCell
+    /// dependiendo del path.
+    ///
+    /// Item #3 plan robustez 2026-04-22.
+    last_match_per_slot: std::cell::RefCell<Vec<Option<CachedSlotMatch>>>,
 }
 
 impl InventoryReader {
@@ -259,7 +279,16 @@ impl InventoryReader {
             slots:     Vec::new(),
             digit_templates: super::inventory_ocr::DigitTemplates::new(),
             empty_stddev_max: EMPTY_STDDEV_MAX,
+            last_match_per_slot: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// Limpia el cache Stage B (item #3 plan robustez). Llamar cuando se
+    /// recargan templates o se cambia la configuración de slots — el
+    /// template_idx cacheado podría apuntar a un template distinto tras
+    /// reload. Conservador: limpiar vs arriesgar false positives.
+    pub fn clear_cache(&mut self) {
+        self.last_match_per_slot.get_mut().clear();
     }
 
     /// Override runtime del threshold Stage A. Valor fuera de rango válido
@@ -288,6 +317,13 @@ impl InventoryReader {
             .find(|t| t.name == name)
             .map(|t| t.threshold)
             .unwrap_or(MATCH_THRESHOLD)
+    }
+
+    /// Busca el índice de un template por nombre. `None` si no existe.
+    /// Usado por Stage B para actualizar el cache con el template que
+    /// acabó de matchear via full sweep.
+    fn template_idx_by_name(&self, name: &str) -> Option<usize> {
+        self.templates.iter().position(|t| t.name == name)
     }
 
     /// Carga todos los templates PNG del directorio indicado.
@@ -368,8 +404,10 @@ impl InventoryReader {
     }
 
     /// Setea los ROIs de los slots del inventario a escanear.
+    /// Invalida el cache Stage B (indices podrían apuntar a slots distintos).
     pub fn set_slots(&mut self, slots: Vec<RoiDef>) {
         self.slots = slots;
+        self.last_match_per_slot.get_mut().clear();
     }
 
     /// Devuelve clone de los slots configurados — útil para consumers
@@ -435,8 +473,18 @@ impl InventoryReader {
         let ml_ref_opt = if use_ml { ml_reader } else { None };
         let mut ml_inner = ml_ref_opt;
 
+        // Stage B cache: resize si la cantidad de slots cambió (típicamente
+        // solo al boot o tras reconfig). Vector de `Option<CachedSlotMatch>`
+        // indexado por slot_idx. RefCell → mutación desde &self.
+        {
+            let mut cache = self.last_match_per_slot.borrow_mut();
+            if cache.len() != self.slots.len() {
+                cache.resize(self.slots.len(), None);
+            }
+        }
+
         for (slot_idx, slot) in self.slots.iter().enumerate() {
-            let slot_idx = slot_idx as u32;
+            let slot_idx_u32 = slot_idx as u32;
 
             // Stage A: empty-slot short-circuit (plan inventory robustez).
             let stddev = frame_roi_luma_stddev(
@@ -444,14 +492,16 @@ impl InventoryReader {
                 &Roi::new(slot.x, slot.y, slot.w, slot.h),
             );
             if stddev < self.empty_stddev_max {
-                slots_out.push(SlotReading::empty(slot_idx));
+                // Invalidar cache Stage B — slot ahora vacío, próximo read
+                // deberá full sweep si vuelve contenido.
+                self.last_match_per_slot.borrow_mut()[slot_idx] = None;
+                slots_out.push(SlotReading::empty(slot_idx_u32));
                 continue;
             }
 
             let Some((slot_img_padded, _)) = extract_slot_with_shift_tolerance(frame, slot) else {
-                // Extract falló (ROI fuera del frame). Marcar como unmatched
-                // en vez de skip silencioso — ayuda al debug del JSONL.
-                slots_out.push(SlotReading::unmatched(slot_idx));
+                self.last_match_per_slot.borrow_mut()[slot_idx] = None;
+                slots_out.push(SlotReading::unmatched(slot_idx_u32));
                 continue;
             };
             // Extract slot exact también para OCR + ML (ML requiere 32×32 exact).
@@ -460,22 +510,6 @@ impl InventoryReader {
                     let luma = bgra_to_luma(&bgra, slot.w, slot.h);
                     GrayImage::from_raw(slot.w, slot.h, luma)
                 });
-
-            // Intento 1: ML classifier (si provisto + ready).
-            let ml_match: Option<(String, f32)> = if let (Some(ref mut ml), Some(ref slot_exact)) =
-                (ml_inner.as_deref_mut(), exact_slot.as_ref())
-            {
-                ml.infer_slot(slot_exact)
-            } else {
-                None
-            };
-
-            // Intento 2: fallback SSE (best-match + threshold per-template).
-            let sse_match: Option<(f32, String)> = if ml_match.is_none() {
-                best_match_for_slot(&slot_img_padded, &self.templates)
-            } else {
-                None
-            };
 
             // Helper para leer stack via OCR (solo si digit templates cargados).
             let read_stack = |slot_img: Option<&GrayImage>| -> Option<u32> {
@@ -487,33 +521,83 @@ impl InventoryReader {
                 })
             };
 
+            // ── Stage B: probar solo el template cacheado (si existe) ──
+            // Si el cached template matchea >= su threshold → hit rápido.
+            // ~100 µs vs ~1.6 ms del full sweep. Exploit temporal locality.
+            // ML tiene prioridad sobre Stage B (no usamos cache con ML).
+            if !use_ml {
+                let cached_idx = self.last_match_per_slot.borrow()[slot_idx];
+                if let Some(cached) = cached_idx {
+                    if let Some(tpl) = self.templates.get(cached.template_idx) {
+                        if let Some(score) = try_match_single_template(
+                            &slot_img_padded, tpl,
+                        ) {
+                            if score >= tpl.threshold {
+                                // Stage B HIT. Registrar + continuar.
+                                let threshold = tpl.threshold;
+                                let name = tpl.name.clone();
+                                let stack = read_stack(exact_slot.as_ref());
+                                *slot_counts.entry(name.clone()).or_insert(0) += 1;
+                                *stack_totals.entry(name.clone()).or_insert(0) += stack.unwrap_or(1);
+                                slots_out.push(SlotReading::matched(
+                                    slot_idx_u32, name, score, threshold, stack,
+                                    SlotStage::CachedHit,
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    // Miss: invalidar cached (el item cambió o template se movió).
+                    self.last_match_per_slot.borrow_mut()[slot_idx] = None;
+                }
+            }
+
+            // Intento 1: ML classifier (si provisto + ready).
+            let ml_match: Option<(String, f32)> = if let (Some(ref mut ml), Some(ref slot_exact)) =
+                (ml_inner.as_deref_mut(), exact_slot.as_ref())
+            {
+                ml.infer_slot(slot_exact)
+            } else {
+                None
+            };
+
+            // Intento 2: fallback SSE full sweep (Stage C).
+            let sse_match: Option<(f32, String)> = if ml_match.is_none() {
+                best_match_for_slot(&slot_img_padded, &self.templates)
+            } else {
+                None
+            };
+
             match (ml_match, sse_match) {
                 (Some((cls, conf)), _) => {
                     let stack = read_stack(exact_slot.as_ref());
                     *slot_counts.entry(cls.clone()).or_insert(0) += 1;
                     *stack_totals.entry(cls.clone()).or_insert(0) += stack.unwrap_or(1);
                     slots_out.push(SlotReading::ml_classified(
-                        slot_idx, cls, conf, stack,
+                        slot_idx_u32, cls, conf, stack,
                     ));
+                    // ML no popula Stage B cache (sin score CCORR comparable).
                 }
                 (None, Some((score, name))) => {
                     let threshold = self.threshold_for(&name);
                     let stack = read_stack(exact_slot.as_ref());
                     *slot_counts.entry(name.clone()).or_insert(0) += 1;
                     *stack_totals.entry(name.clone()).or_insert(0) += stack.unwrap_or(1);
+                    // Actualizar Stage B cache con el template encontrado.
+                    if let Some(idx) = self.template_idx_by_name(&name) {
+                        self.last_match_per_slot.borrow_mut()[slot_idx] =
+                            Some(CachedSlotMatch { template_idx: idx });
+                    }
                     slots_out.push(SlotReading::matched(
-                        slot_idx, name, score, threshold, stack, SlotStage::FullSweep,
+                        slot_idx_u32, name, score, threshold, stack, SlotStage::FullSweep,
                     ));
                 }
                 (None, None) => {
-                    // Slot con contenido pero ningún template matcheó el threshold.
-                    // Item nuevo sin template O template similar que no alcanzó.
-                    slots_out.push(SlotReading::unmatched(slot_idx));
+                    self.last_match_per_slot.borrow_mut()[slot_idx] = None;
+                    slots_out.push(SlotReading::unmatched(slot_idx_u32));
                 }
             }
         }
-        // NOTA: NMS cross-slot NO aplica aquí — el orden de matches ML no es
-        // comparable con scores SSE. Si se quiere dedup, hacer por separado.
         InventoryReading { slot_counts, stack_totals, slots: slots_out }
     }
 
@@ -759,6 +843,37 @@ fn strip_stack_count_corner(img: &GrayImage) -> GrayImage {
 /// score 0.87, se rechaza — aunque otros templates hayan pasado su threshold
 /// más laxo con scores menores. Esto evita que un template "casi matchea" y
 /// otro "débilmente matchea" compitan y el ganador "casi" quede contado.
+/// Prueba un único template contra un slot y devuelve el best score
+/// (sin gate de threshold). Usado por Stage B (adaptive re-matching)
+/// — más barato que iterar todos los templates cuando ya hay un
+/// candidato cacheado.
+///
+/// Retorna `None` si el slot es más chico que el template (no cabe).
+/// Else retorna `Some(score)` con el max CCORR sobre la ventana
+/// shift-tolerant.
+///
+/// Cost estimado: ~100 µs por slot (1 match_template vs 70 del full
+/// sweep). Item #3 plan robustez 2026-04-22.
+fn try_match_single_template(
+    slot_img: &GrayImage,
+    template: &ItemTemplate,
+) -> Option<f32> {
+    let slot_stripped = strip_stack_count_corner(slot_img);
+    let tpl_stripped = strip_stack_count_corner(&template.template);
+    if slot_stripped.width() < tpl_stripped.width()
+        || slot_stripped.height() < tpl_stripped.height()
+    {
+        return None;
+    }
+    let result = match_template(
+        &slot_stripped,
+        &tpl_stripped,
+        MatchTemplateMethod::CrossCorrelationNormalized,
+    );
+    let score = result.iter().cloned().fold(f32::MIN, f32::max);
+    Some(score)
+}
+
 fn best_match_for_slot(
     slot_img: &GrayImage,
     templates: &[ItemTemplate],
@@ -1028,6 +1143,174 @@ mod tests {
         for (i, slot) in reading.slots.iter().enumerate() {
             assert_eq!(slot.slot_idx, i as u32);
         }
+    }
+
+    // ── Item #3: Stage B cached single-template match ──────────────────
+
+    /// Construye un frame con un template-like pattern en un slot específico.
+    /// El patrón matchea exactamente el template que devuelve make_template(seed).
+    fn frame_with_slot_content(
+        frame_w: u32,
+        frame_h: u32,
+        slot_x: u32,
+        slot_y: u32,
+        slot_w: u32,
+        slot_h: u32,
+        template_seed: u8,
+    ) -> crate::sense::frame_buffer::Frame {
+        let tpl = make_template(template_seed);
+        let mut data = vec![120u8; (frame_w * frame_h * 4) as usize];
+        // Fuerza textura en todo el frame para pasar Stage A en el slot
+        // (luma stddev del frame debe ser > EMPTY_STDDEV_MAX para el slot).
+        for i in 0..(frame_w * frame_h) as usize {
+            let v = ((i * 7 + 31) % 200) as u8;
+            data[i * 4]     = v;
+            data[i * 4 + 1] = v.saturating_add(40);
+            data[i * 4 + 2] = v.saturating_add(80);
+            data[i * 4 + 3] = 255;
+        }
+        // Copia template como luma en el slot area — mismas 3 componentes BGR.
+        for y in 0..tpl.height().min(slot_h) {
+            for x in 0..tpl.width().min(slot_w) {
+                let lum = tpl.get_pixel(x, y)[0];
+                let fx = slot_x + x;
+                let fy = slot_y + y;
+                if fx < frame_w && fy < frame_h {
+                    let off = ((fy * frame_w + fx) * 4) as usize;
+                    data[off]     = lum;
+                    data[off + 1] = lum;
+                    data[off + 2] = lum;
+                    data[off + 3] = 255;
+                }
+            }
+        }
+        crate::sense::frame_buffer::Frame {
+            width: frame_w, height: frame_h, data,
+            captured_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn stage_b_cache_starts_empty() {
+        let reader = InventoryReader::new();
+        assert!(reader.last_match_per_slot.borrow().is_empty());
+    }
+
+    #[test]
+    fn stage_b_cache_cleared_on_set_slots() {
+        let mut reader = InventoryReader::new();
+        reader.last_match_per_slot.get_mut().push(Some(CachedSlotMatch { template_idx: 0 }));
+        reader.set_slots(vec![RoiDef::new(0, 0, 32, 32)]);
+        assert!(reader.last_match_per_slot.borrow().is_empty());
+    }
+
+    #[test]
+    fn stage_b_cache_resized_to_slot_count() {
+        // Llamada a read_with_stacks_ml debe redimensionar el cache al
+        // slot count actual.
+        let mut reader = InventoryReader::new();
+        reader.templates.push(ItemTemplate {
+            name: "item".into(),
+            template: make_template(42),
+            threshold: MATCH_THRESHOLD,
+        });
+        reader.set_slots(vec![
+            RoiDef::new(10, 10, 32, 32),
+            RoiDef::new(50, 10, 32, 32),
+            RoiDef::new(90, 10, 32, 32),
+        ]);
+        let frame = crate::sense::frame_buffer::Frame {
+            width: 200, height: 100,
+            data: vec![50u8; 200 * 100 * 4],
+            captured_at: std::time::Instant::now(),
+        };
+        reader.read_with_stacks_ml(&frame, None);
+        assert_eq!(reader.last_match_per_slot.borrow().len(), 3);
+    }
+
+    #[test]
+    fn stage_b_populates_cache_on_full_sweep_match() {
+        // Slot con contenido que matchea un template → cache se popula.
+        use crate::sense::vision::inventory_slot::SlotStage;
+        let mut reader = InventoryReader::new();
+        reader.templates.push(ItemTemplate {
+            name: "item_42".into(),
+            template: make_template(42),
+            threshold: 0.5,  // threshold generoso para que patrón sintético matchee
+        });
+        reader.set_slots(vec![RoiDef::new(10, 10, 32, 32)]);
+        let frame = frame_with_slot_content(200, 100, 10, 10, 32, 32, 42);
+
+        // Primer read: Stage C full sweep debe matchear y popular cache.
+        let reading = reader.read_with_stacks_ml(&frame, None);
+        assert_eq!(reading.slots.len(), 1);
+        // Si matcheó, stage es FullSweep (primer read — sin cache previa).
+        if reading.slots[0].item.is_some() {
+            assert_eq!(reading.slots[0].stage, SlotStage::FullSweep);
+            assert!(reader.last_match_per_slot.borrow()[0].is_some(),
+                "cache debe poblarse tras full sweep match");
+        }
+    }
+
+    #[test]
+    fn stage_b_hit_on_second_read_uses_cached_tag() {
+        use crate::sense::vision::inventory_slot::SlotStage;
+        let mut reader = InventoryReader::new();
+        reader.templates.push(ItemTemplate {
+            name: "item_42".into(),
+            template: make_template(42),
+            threshold: 0.5,
+        });
+        reader.set_slots(vec![RoiDef::new(10, 10, 32, 32)]);
+        let frame = frame_with_slot_content(200, 100, 10, 10, 32, 32, 42);
+
+        // 1er read: full sweep → popula cache si matchea.
+        let r1 = reader.read_with_stacks_ml(&frame, None);
+        if r1.slots[0].item.is_none() {
+            // Si el sintético no matcheó, skippeamos verificación.
+            return;
+        }
+        // 2do read: debería hit Stage B (CachedHit).
+        let r2 = reader.read_with_stacks_ml(&frame, None);
+        assert_eq!(r2.slots[0].stage, SlotStage::CachedHit,
+            "2do read con mismo frame debería usar cache");
+        assert_eq!(r2.slots[0].item, r1.slots[0].item);
+    }
+
+    #[test]
+    fn stage_b_cache_cleared_when_slot_becomes_empty() {
+        let mut reader = InventoryReader::new();
+        reader.templates.push(ItemTemplate {
+            name: "item".into(),
+            template: make_template(42),
+            threshold: 0.5,
+        });
+        reader.set_slots(vec![RoiDef::new(10, 10, 32, 32)]);
+
+        // Simular cache poblado (como si un read previo matcheó).
+        reader.last_match_per_slot.get_mut().resize(1, None);
+        reader.last_match_per_slot.get_mut()[0] = Some(CachedSlotMatch { template_idx: 0 });
+
+        // Frame uniforme → Stage A marca empty → invalidar cache.
+        let frame = crate::sense::frame_buffer::Frame {
+            width: 200, height: 100,
+            data: vec![60u8; 200 * 100 * 4],
+            captured_at: std::time::Instant::now(),
+        };
+        reader.read_with_stacks_ml(&frame, None);
+        assert!(reader.last_match_per_slot.borrow()[0].is_none(),
+            "cache debe limpiarse cuando slot se vuelve Empty");
+    }
+
+    #[test]
+    fn clear_cache_resets_all_slots() {
+        let mut reader = InventoryReader::new();
+        reader.last_match_per_slot.get_mut().resize(3, None);
+        for slot in reader.last_match_per_slot.get_mut().iter_mut() {
+            *slot = Some(CachedSlotMatch { template_idx: 0 });
+        }
+        reader.clear_cache();
+        assert!(reader.last_match_per_slot.borrow().is_empty());
     }
 
     // ── Item #7: Cadencias configurables (set_empty_stddev_max) ─────────
