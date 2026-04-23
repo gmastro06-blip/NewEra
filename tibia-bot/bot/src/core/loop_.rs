@@ -1432,6 +1432,11 @@ impl BotLoop {
                         })
                         .collect();
                 }
+                // AnchorHealth snapshot (item AnchorHealth extended):
+                // publicar cada tick para HTTP `/vision/anchors` + post-mortem.
+                // Cost O(n anchors), N ≤ ~5 típico — negligible.
+                g.anchor_health = self.vision.anchor_health_snapshot();
+
                 // HTTP `/vision/perception` lee `last_perception` → exponemos
                 // RAW para diagnóstico fiel. Los consumers de decisión (FSM,
                 // cavebot) ya consumieron `perception` (filtered) arriba.

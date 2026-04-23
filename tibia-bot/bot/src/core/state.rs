@@ -244,6 +244,11 @@ pub struct GameState {
     /// Vacío si region monitor no está inicializado o no ha corrido aún.
     /// Visible vía `GET /vision/region_monitor`.
     pub region_monitor_diffs: Vec<RegionMonitorEntry>,
+
+    /// Snapshot del AnchorHealth state machine per-anchor (item AnchorHealth
+    /// extended). Publicado cada tick desde BotLoop para HTTP read.
+    /// Vacío si vision no está calibrado o no hay anchors configurados.
+    pub anchor_health: Vec<crate::sense::vision::anchors::AnchorHealthSnapshot>,
 }
 
 /// Snapshot serializable de `RegionDiff` para publicar en SharedState.

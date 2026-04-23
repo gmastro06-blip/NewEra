@@ -110,6 +110,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/dataset/stop",          post(handle_dataset_stop))
         .route("/dataset/status",        get(handle_dataset_status))
         .route("/vision/region_monitor", get(handle_region_monitor))
+        .route("/vision/anchors",         get(handle_vision_anchors))
         .route("/instrumentation/last_tick",        get(handle_instr_last_tick))
         .route("/instrumentation/percentiles",      get(handle_instr_percentiles))
         .route("/instrumentation/histograms",       get(handle_instr_histograms))
@@ -2145,6 +2146,16 @@ async fn handle_dataset_status(State(s): State<AppState>) -> Json<DatasetStatus>
 //      {"name":"minimap","change_ratio":0.003,"above_threshold":false,"first_tick":false},
 //      {"name":"viewport","change_ratio":0.087,"above_threshold":false,"first_tick":false}]
 
+/// GET /vision/anchors — snapshot del AnchorHealth state machine per-anchor.
+/// Incluye health state, noise_floor, last_score, fail_count, samples.
+/// Post-mortem: analizar transiciones Healthy → Degraded → Lost → Recovering.
+async fn handle_vision_anchors(State(s): State<AppState>)
+    -> Json<Vec<crate::sense::vision::anchors::AnchorHealthSnapshot>>
+{
+    let g = s.game_state.read();
+    Json(g.anchor_health.clone())
+}
+
 async fn handle_region_monitor(State(s): State<AppState>)
     -> Json<Vec<crate::core::state::RegionMonitorEntry>>
 {
@@ -3105,6 +3116,45 @@ mod tests {
         // Issues no emitidos están en 0 (todos los kinds listados).
         assert!(text.contains("tibia_health_issue_active{kind=\"frame_stale\"} 0"));
         assert!(text.contains("tibia_health_issue_active{kind=\"blind_mode\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn get_vision_anchors_returns_empty_when_no_state() {
+        let state = test_state().await;
+        let app = build_router(state);
+        let (status, body) = get(app, "/vision/anchors").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert!(v.is_array());
+        assert_eq!(v.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_vision_anchors_reflects_published_state() {
+        use crate::sense::vision::anchors::{AnchorHealth, AnchorHealthSnapshot};
+        let state = test_state().await;
+        {
+            let mut g = state.game_state.write();
+            g.anchor_health = vec![
+                AnchorHealthSnapshot {
+                    name: "primary_top".into(),
+                    health: AnchorHealth::Degraded,
+                    noise_floor: 0.15,
+                    last_score: Some(0.20),
+                    fail_count: 2,
+                    samples_in_window: 25,
+                },
+            ];
+        }
+        let app = build_router(state);
+        let (status, body) = get(app, "/vision/anchors").await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "primary_top");
+        assert_eq!(arr[0]["health"], "degraded");
+        assert_eq!(arr[0]["fail_count"], 2);
     }
 
     #[tokio::test]

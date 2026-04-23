@@ -70,6 +70,75 @@ impl DriftStatus {
     }
 }
 
+/// Estado de salud granular per-anchor. Complementa `fail_counts` (binary
+/// healthy/lost) con estados intermedios observables desde el análisis
+/// post-mortem + health system.
+///
+/// Transiciones:
+/// - `Healthy` → `Degraded`: 3 scores consecutivos por encima del
+///   `noise_floor_score` (p95 de los últimos N reads).
+/// - `Degraded` → `Healthy`: 3 scores consecutivos dentro del noise floor.
+/// - `Any` → `Lost`: fail_counts > max_fails (legado existente).
+/// - `Lost` → `Recovering`: al submit un full-frame recovery job.
+/// - `Recovering` → `Healthy`: match exitoso tras recovery.
+///
+/// Suspicious se marca externamente por el cluster offset cuando el anchor
+/// deriva geométricamente (no encaja en el cluster). Se resetea al próximo
+/// match coherente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default,
+         serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum AnchorHealth {
+    /// Matches consistentes, score dentro del ruido histórico esperado.
+    #[default]
+    Healthy    = 0,
+    /// Match válido pero score elevado vs noise floor — el template
+    /// encaja pero con menos confianza. Pre-warning de un failure.
+    Degraded   = 1,
+    /// Anchor matchea pero el offset diverge del cluster dominante.
+    /// Probable false positive local — excluido del cálculo de offset
+    /// por `cluster_offset`.
+    Suspicious = 2,
+    /// fail_counts > max_fails. matches[i] = None, cae al fallback
+    /// last_good si existe + dentro de TTL.
+    Lost       = 3,
+    /// Full-frame recovery job enviado, esperando outcome. Estado
+    /// transitorio entre Lost y (Healthy | Lost si el recovery falla).
+    Recovering = 4,
+}
+
+impl AnchorHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnchorHealth::Healthy    => "healthy",
+            AnchorHealth::Degraded   => "degraded",
+            AnchorHealth::Suspicious => "suspicious",
+            AnchorHealth::Lost       => "lost",
+            AnchorHealth::Recovering => "recovering",
+        }
+    }
+
+    pub fn is_usable(self) -> bool {
+        matches!(self, AnchorHealth::Healthy | AnchorHealth::Degraded)
+    }
+}
+
+/// Config runtime de la state machine de AnchorHealth.
+/// Hardcoded porque son valores operacionales defensivos; expose cuando
+/// validación live indique necesidad de tuning.
+///
+/// Ventana del ring `recent_scores`: 30 reads. Con `refresh_interval=500ms`
+/// = 15s de histórico. Suficiente para detectar degradación progresiva
+/// sin acumular scores muy viejos que distorsionen el noise floor.
+const NOISE_FLOOR_WINDOW: usize = 30;
+/// Percentil para calcular noise floor: p95 de los últimos N scores.
+/// Un score que supere `noise_floor * DEGRADED_MULTIPLIER` cuenta como bad.
+const DEGRADED_MULTIPLIER: f32 = 1.30;
+/// Transiciones requieren N scores consecutivos para cambiar estado.
+/// Filtra transients que sino disparan cambios espurios.
+const HEALTH_STREAK_REQUIRED: u32 = 3;
+
 /// Resultado de localizar un ancla en el frame actual.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // extension point: found_x/y/score exposed for diagnostics
@@ -150,6 +219,21 @@ struct AnchorShared {
     /// fallbacks demasiado viejos (LAST_GOOD_TTL). `None` significa que el
     /// anchor nunca tuvo match exitoso desde startup.
     last_good_at: Vec<Option<Instant>>,
+    /// Ring de los últimos `NOISE_FLOOR_WINDOW` scores de cada anchor.
+    /// Cap fijo → cuando se llena, se descarta el más viejo (FIFO).
+    /// Usado para calcular noise_floor (p95) y detectar degradación.
+    recent_scores: Vec<std::collections::VecDeque<f32>>,
+    /// Estado granular per-anchor. Default Healthy hasta que scores
+    /// acumulados indiquen lo contrario. Mutado por el drain loop de
+    /// `tick` tras cada outcome.
+    health: Vec<AnchorHealth>,
+    /// Streak counter para transiciones de health. Se resetea al cambiar
+    /// de dirección (e.g., Healthy→Degraded candidate encuentra un score
+    /// bueno → reset).
+    health_streak: Vec<u32>,
+    /// Noise floor cacheado (p95 de recent_scores). Recalculado al push
+    /// de un score nuevo.
+    noise_floor: Vec<f32>,
 }
 
 // ── Slot de ancla (datos estáticos + scheduling) ──────────────────────────────
@@ -226,6 +310,10 @@ impl AnchorTracker {
         s.fail_counts.push(0);
         s.last_good.push(None);
         s.last_good_at.push(None);
+        s.recent_scores.push(std::collections::VecDeque::with_capacity(NOISE_FLOOR_WINDOW));
+        s.health.push(AnchorHealth::Healthy);
+        s.health_streak.push(0);
+        s.noise_floor.push(0.30); // default = config.max_score típico
     }
 
     /// Llamar una vez por tick desde el game loop. NUNCA bloquea.
@@ -240,6 +328,10 @@ impl AnchorTracker {
                     let idx = outcome.anchor_idx;
                     let mut s = self.shared.write();
                     if idx < s.matches.len() && idx < s.fail_counts.len() {
+                        let was_lost_or_recovering = matches!(
+                            s.health.get(idx).copied().unwrap_or_default(),
+                            AnchorHealth::Lost | AnchorHealth::Recovering
+                        );
                         if let Some(m) = outcome.m {
                             // Match exitoso — actualizar matches + last_good.
                             if s.fail_counts[idx] > self.config.max_fails {
@@ -251,6 +343,30 @@ impl AnchorTracker {
                             s.last_good[idx]    = Some(m);
                             s.last_good_at[idx] = Some(Instant::now());
                             s.fail_counts[idx]  = 0;
+
+                            // ── AnchorHealth: ring + noise floor + transición ──
+                            // SSE score: lower = better. Push a la ventana.
+                            if let Some(ring) = s.recent_scores.get_mut(idx) {
+                                if ring.len() >= NOISE_FLOOR_WINDOW {
+                                    ring.pop_front();
+                                }
+                                ring.push_back(m.score);
+                            }
+                            let floor = compute_noise_floor_p95(
+                                s.recent_scores.get(idx).map(|r| r.iter()),
+                            );
+                            if let Some(f) = s.noise_floor.get_mut(idx) {
+                                *f = floor;
+                            }
+                            // Transición de health.
+                            let new_health = decide_health_on_match(
+                                s.health.get(idx).copied().unwrap_or_default(),
+                                s.health_streak.get(idx).copied().unwrap_or(0),
+                                m.score,
+                                floor,
+                                was_lost_or_recovering,
+                            );
+                            update_health_state(&mut s, idx, new_health);
                         } else {
                             s.fail_counts[idx] += 1;
                             if s.fail_counts[idx] == self.config.max_fails + 1 {
@@ -261,6 +377,7 @@ impl AnchorTracker {
                             }
                             if s.fail_counts[idx] > self.config.max_fails {
                                 s.matches[idx] = None;
+                                update_health_state(&mut s, idx, AnchorHealth::Lost);
                             }
                         }
                     }
@@ -327,6 +444,9 @@ impl AnchorTracker {
                         tracing::info!(
                             "Anchor #{}: submitted full-frame recovery job", idx
                         );
+                        // Transición Lost → Recovering: esperando outcome del job.
+                        let mut s = self.shared.write();
+                        update_health_state(&mut s, idx, AnchorHealth::Recovering);
                     } else {
                         anchor.last_submitted = Some(now);
                     }
@@ -575,6 +695,128 @@ impl AnchorTracker {
     }
 
     pub fn total_anchor_count(&self) -> usize { self.anchors.len() }
+
+    /// Snapshot del health state per-anchor (item post-live: AnchorHealth
+    /// enum extended). Mantiene el orden de registration — `snapshot[i]`
+    /// corresponde a `self.anchors[i]`.
+    ///
+    /// Campos por entry: (name, health, noise_floor, last_score).
+    /// Usado por HealthSystem como input granular + HTTP `/vision/anchors`.
+    pub fn anchor_health_snapshot(&self) -> Vec<AnchorHealthSnapshot> {
+        let s = self.shared.read();
+        self.anchors.iter().enumerate().map(|(idx, slot)| {
+            AnchorHealthSnapshot {
+                name:        slot.def.name.clone(),
+                health:      s.health.get(idx).copied().unwrap_or_default(),
+                noise_floor: s.noise_floor.get(idx).copied().unwrap_or(0.30),
+                last_score:  s.matches.get(idx)
+                    .and_then(|m| m.map(|am| am.score)),
+                fail_count:  s.fail_counts.get(idx).copied().unwrap_or(0),
+                samples_in_window: s.recent_scores.get(idx)
+                    .map(|r| r.len()).unwrap_or(0),
+            }
+        }).collect()
+    }
+}
+
+/// Snapshot per-anchor para consumers (HealthSystem, HTTP).
+/// Public struct serializable para JSONL recorder.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AnchorHealthSnapshot {
+    pub name:        String,
+    pub health:      AnchorHealth,
+    pub noise_floor: f32,
+    #[serde(default)]
+    pub last_score:  Option<f32>,
+    #[serde(default)]
+    pub fail_count:  u32,
+    #[serde(default)]
+    pub samples_in_window: usize,
+}
+
+// ── AnchorHealth state machine helpers ──────────────────────────────────────
+
+/// Calcula p95 del iterador de scores. Retorna `0.30` (default max_score)
+/// si el iterador es vacío o None. Scores SSE: lower = better; p95 del
+/// ruido = el 95to percentile → 5% peores scores observados.
+fn compute_noise_floor_p95<'a, I>(scores: Option<I>) -> f32
+where
+    I: Iterator<Item = &'a f32>,
+{
+    let Some(iter) = scores else { return 0.30; };
+    let mut vals: Vec<f32> = iter.copied().collect();
+    if vals.is_empty() { return 0.30; }
+    // Sort ascending (scores crecen con peor match en SSE).
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((vals.len() as f32) * 0.95) as usize;
+    vals[idx.min(vals.len() - 1)]
+}
+
+/// Decide el estado siguiente basado en el score actual vs noise floor +
+/// streak previa. Llamado sólo tras un match exitoso (outcome.m = Some).
+fn decide_health_on_match(
+    current: AnchorHealth,
+    streak: u32,
+    score: f32,
+    noise_floor: f32,
+    was_lost_or_recovering: bool,
+) -> AnchorHealth {
+    // Recovery inmediato desde Lost/Recovering: match exitoso tras
+    // recovery → directo a Healthy sin esperar streak.
+    if was_lost_or_recovering {
+        return AnchorHealth::Healthy;
+    }
+    // Score "bad" = supera noise floor × multiplier.
+    let threshold_bad = noise_floor * DEGRADED_MULTIPLIER;
+    let is_bad = score > threshold_bad;
+
+    match (current, is_bad) {
+        (AnchorHealth::Healthy, false) => AnchorHealth::Healthy,
+        (AnchorHealth::Healthy, true) => {
+            // Streak de bad reads; si llega al required, degrada.
+            if streak + 1 >= HEALTH_STREAK_REQUIRED {
+                AnchorHealth::Degraded
+            } else {
+                AnchorHealth::Healthy
+            }
+        }
+        (AnchorHealth::Degraded, true) => AnchorHealth::Degraded,
+        (AnchorHealth::Degraded, false) => {
+            // Streak de good reads; promueve cuando se alcanza required.
+            if streak + 1 >= HEALTH_STREAK_REQUIRED {
+                AnchorHealth::Healthy
+            } else {
+                AnchorHealth::Degraded
+            }
+        }
+        (AnchorHealth::Suspicious, _) => {
+            // Suspicious se limpia externamente por cluster_offset. Mientras,
+            // mantener. (Match exitoso solo no refuta la divergencia geom.)
+            AnchorHealth::Suspicious
+        }
+        (AnchorHealth::Lost | AnchorHealth::Recovering, _) => AnchorHealth::Healthy,
+    }
+}
+
+/// Actualiza `health[idx]` + manejo de streak counter.
+/// Llamar desde el drain loop u otros paths que cambian health state.
+fn update_health_state(s: &mut AnchorShared, idx: usize, new_health: AnchorHealth) {
+    let prev = s.health.get(idx).copied().unwrap_or_default();
+    if idx < s.health.len() {
+        if prev == new_health {
+            // Streak de "mantener estado" cuenta (useful para transiciones
+            // con required N consecutivos).
+            s.health_streak[idx] = s.health_streak[idx].saturating_add(1);
+        } else {
+            // Transición real → reset streak + log.
+            s.health[idx] = new_health;
+            s.health_streak[idx] = 1;
+            tracing::debug!(
+                "Anchor #{}: health {:?} → {:?}",
+                idx, prev, new_health
+            );
+        }
+    }
 }
 
 // ── Background: template matching ─────────────────────────────────────────────
@@ -674,6 +916,119 @@ mod tests {
             found_x: 0, found_y: 0, score: 0.05,
             offset_x: ox, offset_y: oy,
         }
+    }
+
+    // ── AnchorHealth pure helpers (no tracker) ────────────────────────
+
+    #[test]
+    fn noise_floor_empty_is_default() {
+        let v: Vec<f32> = vec![];
+        let floor = compute_noise_floor_p95(Some(v.iter()));
+        assert!((floor - 0.30).abs() < 0.001);
+    }
+
+    #[test]
+    fn noise_floor_single_sample() {
+        let v = vec![0.10f32];
+        let floor = compute_noise_floor_p95(Some(v.iter()));
+        assert!((floor - 0.10).abs() < 0.001);
+    }
+
+    #[test]
+    fn noise_floor_p95_ordered() {
+        // 100 scores rango 0.05..0.25; p95 cae cerca del valor en posición 95.
+        let v: Vec<f32> = (0..100).map(|i| 0.05 + (i as f32) * 0.002).collect();
+        let floor = compute_noise_floor_p95(Some(v.iter()));
+        // p95 ≈ 0.05 + 95*0.002 = 0.24.
+        assert!(floor > 0.23 && floor < 0.25, "floor={}", floor);
+    }
+
+    #[test]
+    fn decide_health_recovery_from_lost_is_immediate() {
+        // Match exitoso desde Lost → Healthy directo, sin streak.
+        let h = decide_health_on_match(
+            AnchorHealth::Lost, 0, 0.05, 0.30, true,
+        );
+        assert_eq!(h, AnchorHealth::Healthy);
+    }
+
+    #[test]
+    fn decide_health_healthy_stays_with_good_score() {
+        let h = decide_health_on_match(
+            AnchorHealth::Healthy, 5, 0.05, 0.10, false,
+        );
+        assert_eq!(h, AnchorHealth::Healthy);
+    }
+
+    #[test]
+    fn decide_health_healthy_to_degraded_requires_streak() {
+        // Score bad (0.15 > noise 0.10 × 1.30 = 0.13) con streak 0, 1 → aún Healthy.
+        // Al streak 2 (prev) + 1 (este) = 3 → Degraded.
+        let h = decide_health_on_match(
+            AnchorHealth::Healthy, 0, 0.15, 0.10, false,
+        );
+        assert_eq!(h, AnchorHealth::Healthy);  // 1 bad, streak llegará a 1.
+        let h = decide_health_on_match(
+            AnchorHealth::Healthy, 1, 0.15, 0.10, false,
+        );
+        assert_eq!(h, AnchorHealth::Healthy);  // 2 bad, streak llegará a 2.
+        let h = decide_health_on_match(
+            AnchorHealth::Healthy, 2, 0.15, 0.10, false,
+        );
+        assert_eq!(h, AnchorHealth::Degraded);  // 3 bad, cruza threshold.
+    }
+
+    #[test]
+    fn decide_health_degraded_to_healthy_requires_streak() {
+        // Good score desde Degraded con streak <required → se mantiene.
+        let h = decide_health_on_match(
+            AnchorHealth::Degraded, 0, 0.05, 0.10, false,
+        );
+        assert_eq!(h, AnchorHealth::Degraded);
+        let h = decide_health_on_match(
+            AnchorHealth::Degraded, 2, 0.05, 0.10, false,
+        );
+        assert_eq!(h, AnchorHealth::Healthy);
+    }
+
+    #[test]
+    fn decide_health_suspicious_persists() {
+        // Suspicious no se limpia automáticamente por match exitoso.
+        let h = decide_health_on_match(
+            AnchorHealth::Suspicious, 5, 0.05, 0.10, false,
+        );
+        assert_eq!(h, AnchorHealth::Suspicious);
+    }
+
+    #[test]
+    fn anchor_health_is_usable_only_healthy_and_degraded() {
+        assert!(AnchorHealth::Healthy.is_usable());
+        assert!(AnchorHealth::Degraded.is_usable());
+        assert!(!AnchorHealth::Suspicious.is_usable());
+        assert!(!AnchorHealth::Lost.is_usable());
+        assert!(!AnchorHealth::Recovering.is_usable());
+    }
+
+    #[test]
+    fn anchor_health_snapshot_returns_initial_state() {
+        let mut t = make_tracker();
+        add_dummy_anchor(&mut t);
+        let snap = t.anchor_health_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].health, AnchorHealth::Healthy);
+        assert_eq!(snap[0].fail_count, 0);
+        assert_eq!(snap[0].samples_in_window, 0);
+        assert!(snap[0].last_score.is_none());
+    }
+
+    #[test]
+    fn anchor_health_snapshot_serializes_to_json() {
+        let mut t = make_tracker();
+        add_dummy_anchor(&mut t);
+        let snap = t.anchor_health_snapshot();
+        let json = serde_json::to_string(&snap).expect("serialize");
+        assert!(json.contains("\"health\":\"healthy\""));
+        assert!(json.contains("\"noise_floor\""));
     }
 
     fn make_tracker() -> AnchorTracker {
