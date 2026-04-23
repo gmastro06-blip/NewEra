@@ -1098,6 +1098,28 @@ impl BotLoop {
             // ── THINK (FSM) ───────────────────────────────────────────────────
             // Si safety pausó el bot (break/prompt), forzamos Paused event.
             let fsm_event = if is_safety_paused { BotEvent::PauseRequested } else { BotEvent::Tick };
+
+            // HealthGate: traduce el HealthStatus (publicado tick anterior)
+            // a un veredicto compacto para el FSM. Solo actúa si el config
+            // tiene `[health].apply_degradation = true` — sin él, gate es
+            // permisivo y el bot opera normalmente incluso en degradación.
+            let health_gate = {
+                let hs = self.health.last_status();
+                if !self.config.health.apply_degradation {
+                    crate::core::fsm::HealthGateDecision::permissive()
+                } else {
+                    match hs.degraded {
+                        None
+                        | Some(crate::health::DegradationLevel::Light) =>
+                            crate::core::fsm::HealthGateDecision::permissive(),
+                        Some(crate::health::DegradationLevel::Heavy) =>
+                            crate::core::fsm::HealthGateDecision::heavy(),
+                        Some(crate::health::DegradationLevel::SafeMode) =>
+                            crate::core::fsm::HealthGateDecision::safe_mode(),
+                    }
+                }
+            };
+
             let t_fsm_start = Instant::now();
             let action = {
                 let g = self.state.read();
@@ -1111,6 +1133,7 @@ impl BotLoop {
                     waypoint_hint,
                     heal_override,
                     attack_override,
+                    health_gate,
                 })
             };
             let fsm_us: u32 = t_fsm_start.elapsed().as_micros() as u32;

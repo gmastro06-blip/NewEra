@@ -102,6 +102,55 @@ pub struct DecideContext<'a> {
     /// Override de la hotkey de ataque: si `Some`, se usa en vez de
     /// `hotkeys.attack_default`. Viene de SpellTable.
     pub attack_override: Option<u8>,
+    /// Gate del HealthSystem. Cuando `degraded == Heavy`, las acciones
+    /// "normal" (walking, looting) se suprimen; solo emergency actions
+    /// (heal crítico, escape) pasan. SafeMode ya es safety pause externa;
+    /// Light permite todo. Default `allow_all` (equivalente a sin gate)
+    /// para retro-compat con consumers que no setean este campo.
+    ///
+    /// Sólo efectivo si `[health].apply_degradation = true` en config.
+    /// Si false, BotLoop pasa `HealthGate::permissive()` siempre.
+    pub health_gate: HealthGateDecision,
+}
+
+/// Veredicto compacto del HealthGate consumido por FSM. Evita depender
+/// del lifetime del Arc<HealthStatus> adentro del DecideContext.
+/// Default = permisivo (allow all) — invariant deliberado para que cualquier
+/// consumer que no setee explícitamente el gate NO termine bloqueando.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthGateDecision {
+    /// Si `false`, FSM debería suprimir acciones "normal priority"
+    /// (attack, walking, looting). Default `true`.
+    pub allow_normal: bool,
+    /// Si `false`, también suprimir emergency (heal crítico, escape).
+    /// Solo `false` cuando degradation == SafeMode (raro — BotLoop
+    /// maneja SafeMode via safety pause antes del FSM).
+    pub allow_emergency: bool,
+}
+
+impl HealthGateDecision {
+    /// Gate permisivo: deja pasar todo. Usar cuando HealthSystem está
+    /// desactivado O apply_degradation=false O el degradation level actual
+    /// es None/Light.
+    pub fn permissive() -> Self {
+        Self { allow_normal: true, allow_emergency: true }
+    }
+    /// Gate restrictivo (Heavy): bloquea normal, permite emergency.
+    pub fn heavy() -> Self {
+        Self { allow_normal: false, allow_emergency: true }
+    }
+    /// Gate SafeMode: bloquea todo (FSM no debería decidir nada).
+    /// BotLoop typically route this via safety_pause instead of FSM gate.
+    pub fn safe_mode() -> Self {
+        Self { allow_normal: false, allow_emergency: false }
+    }
+}
+
+impl Default for HealthGateDecision {
+    /// IMPORTANTE: default es permisivo para preservar semántica
+    /// "sin HealthSystem = bot opera normal". Derive default daría
+    /// false/false que bloquearía todo.
+    fn default() -> Self { Self::permissive() }
 }
 
 /// Cooldowns con modelo "next allowed tick". Evitan spam cuando la percepción
@@ -230,6 +279,35 @@ impl Fsm {
     ///
     /// Ver `DecideContext` para los inputs agrupados.
     pub fn decide(&mut self, ctx: &DecideContext<'_>) -> BotAction {
+        let action = self.decide_internal(ctx);
+        // ── HealthGate post-decide filter ─────────────────────────────────
+        // Aplica sólo cuando `[health].apply_degradation = true` hace que
+        // BotLoop nos pase un gate no-permissive.
+        //
+        // - allow_normal=false (Heavy): bloquea acciones no-emergency.
+        //   Emergency = FSM state == Emergency (HP crítico, heal disparado).
+        // - allow_emergency=false (SafeMode): bloquea todo. Normalmente
+        //   BotLoop ya disparó safety pause antes de llegar aquí, pero
+        //   mantenemos el chequeo como defensa en profundidad.
+        if !ctx.health_gate.allow_emergency {
+            return BotAction::Idle;
+        }
+        if !ctx.health_gate.allow_normal
+            && self.state != FsmState::Emergency
+            && !matches!(action, BotAction::Idle)
+        {
+            tracing::debug!(
+                "HealthGate: suppressing {:?} in state {:?} (degraded: allow_normal=false)",
+                action, self.state
+            );
+            return BotAction::Idle;
+        }
+        action
+    }
+
+    /// Versión interna sin HealthGate — preserva todo el flow existente
+    /// para mantener tests y no impactar semántica de priority chain.
+    fn decide_internal(&mut self, ctx: &DecideContext<'_>) -> BotAction {
         // ── Prioridad 0: control del operador ─────────────────────────────────
         match ctx.event {
             BotEvent::PauseRequested => {
@@ -480,7 +558,7 @@ mod tests {
         let game = game_at_tick(0);
         let perception = perception_vitals(Some(1.0), Some(1.0));
 
-        let action = fsm.decide(&DecideContext { game: &game, event: BotEvent::Tick, perception: &perception, hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30, waypoint_hint: WaypointHint::Inactive, heal_override: None, attack_override: None });
+        let action = fsm.decide(&DecideContext { game: &game, event: BotEvent::Tick, perception: &perception, hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30, waypoint_hint: WaypointHint::Inactive, heal_override: None, attack_override: None, health_gate: HealthGateDecision::default() });
         assert_eq!(action, BotAction::Idle);
         assert_eq!(fsm.state, FsmState::Idle);
     }
@@ -491,7 +569,7 @@ mod tests {
         let game = game_at_tick(100);
         let perception = perception_vitals(Some(0.20), Some(1.0));
 
-        let action = fsm.decide(&DecideContext { game: &game, event: BotEvent::Tick, perception: &perception, hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30, waypoint_hint: WaypointHint::Inactive, heal_override: None, attack_override: None });
+        let action = fsm.decide(&DecideContext { game: &game, event: BotEvent::Tick, perception: &perception, hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30, waypoint_hint: WaypointHint::Inactive, heal_override: None, attack_override: None, health_gate: HealthGateDecision::default() });
         assert_eq!(action, BotAction::UseHotkey { hidcode: 0x3A });
         assert_eq!(fsm.state, FsmState::Emergency);
     }
@@ -502,7 +580,7 @@ mod tests {
         let game = game_at_tick(100);
         let perception = perception_vitals(Some(1.0), Some(0.10));
 
-        let action = fsm.decide(&DecideContext { game: &game, event: BotEvent::Tick, perception: &perception, hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30, waypoint_hint: WaypointHint::Inactive, heal_override: None, attack_override: None });
+        let action = fsm.decide(&DecideContext { game: &game, event: BotEvent::Tick, perception: &perception, hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30, waypoint_hint: WaypointHint::Inactive, heal_override: None, attack_override: None, health_gate: HealthGateDecision::default() });
         assert_eq!(action, BotAction::UseHotkey { hidcode: 0x3C });
         assert_eq!(fsm.state, FsmState::Emergency);
     }
@@ -513,7 +591,7 @@ mod tests {
         let game = game_at_tick(100);
         let perception = perception_vitals(Some(0.10), Some(0.10));
 
-        let action = fsm.decide(&DecideContext { game: &game, event: BotEvent::Tick, perception: &perception, hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30, waypoint_hint: WaypointHint::Inactive, heal_override: None, attack_override: None });
+        let action = fsm.decide(&DecideContext { game: &game, event: BotEvent::Tick, perception: &perception, hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30, waypoint_hint: WaypointHint::Inactive, heal_override: None, attack_override: None, health_gate: HealthGateDecision::default() });
         assert_eq!(action, BotAction::UseHotkey { hidcode: 0x3A }); // heal, no mana
     }
 
@@ -533,6 +611,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(a1, BotAction::UseHotkey { hidcode: 0x3A });
 
@@ -547,6 +626,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(a2, BotAction::Idle);
         assert_eq!(fsm.state, FsmState::Emergency, "sigue en Emergency aunque no emita");
@@ -562,6 +642,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(a3, BotAction::UseHotkey { hidcode: 0x3A });
     }
@@ -579,6 +660,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(action, BotAction::UseHotkey { hidcode: 0x2C });
         assert_eq!(fsm.state, FsmState::Fighting);
@@ -623,6 +705,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         // Flanco de subida (prev=None, now=1) → emit.
         assert_eq!(a1, BotAction::UseHotkey { hidcode: 0x2C });
@@ -640,6 +723,7 @@ mod tests {
                    waypoint_hint: WaypointHint::Inactive,
                    heal_override: None,
                    attack_override: None,
+                   health_gate: HealthGateDecision::default(),
                });
             assert_eq!(a, BotAction::Idle, "tick {}: esperaba Idle con enemy estable", t);
             assert_eq!(fsm.state, FsmState::Fighting);
@@ -659,6 +743,7 @@ mod tests {
             hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
             waypoint_hint: WaypointHint::Inactive, heal_override: None,
             attack_override: None,
+            health_gate: HealthGateDecision::default(),
         });
         assert_eq!(a, BotAction::UseHotkey { hidcode: 0x2C },
             "sin target y hay combat, debe emit PgDown");
@@ -676,6 +761,7 @@ mod tests {
             hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
             waypoint_hint: WaypointHint::Inactive, heal_override: None,
             attack_override: None,
+            health_gate: HealthGateDecision::default(),
         });
         assert_eq!(a, BotAction::Idle,
             "con target activo no debe emit (evita rotar targets)");
@@ -695,6 +781,7 @@ mod tests {
             hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
             waypoint_hint: WaypointHint::Inactive, heal_override: None,
             attack_override: None,
+            health_gate: HealthGateDecision::default(),
         });
         assert_eq!(a, BotAction::Idle);
 
@@ -705,6 +792,7 @@ mod tests {
             hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
             waypoint_hint: WaypointHint::Inactive, heal_override: None,
             attack_override: None,
+            health_gate: HealthGateDecision::default(),
         });
         assert_eq!(a, BotAction::UseHotkey { hidcode: 0x2C },
             "flanco target_active true→false debe disparar retarget");
@@ -725,6 +813,7 @@ mod tests {
                 hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
                 waypoint_hint: WaypointHint::Inactive, heal_override: None,
                 attack_override: None,
+                health_gate: HealthGateDecision::default(),
             });
             assert_eq!(a, BotAction::Idle,
                 "tick {}: target activo, nunca debe emit por flanco", t);
@@ -746,6 +835,7 @@ mod tests {
                 hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
                 waypoint_hint: WaypointHint::Inactive, heal_override: None,
                 attack_override: None,
+                health_gate: HealthGateDecision::default(),
             });
             assert_eq!(a, BotAction::Idle,
                 "tick {}: keepalive NO debe expirar mientras target activo", t);
@@ -771,6 +861,7 @@ mod tests {
                hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
                waypoint_hint: WaypointHint::Inactive, heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(a, BotAction::UseHotkey { hidcode: 0x2C });
 
@@ -783,6 +874,7 @@ mod tests {
                    hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
                    waypoint_hint: WaypointHint::Inactive, heal_override: None,
                    attack_override: None,
+                   health_gate: HealthGateDecision::default(),
                });
             assert_eq!(a, BotAction::Idle, "tick {}: esperaba Idle antes del keepalive", t);
         }
@@ -794,6 +886,7 @@ mod tests {
                hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
                waypoint_hint: WaypointHint::Inactive, heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(a, BotAction::UseHotkey { hidcode: 0x2C },
             "tick 150: keepalive debió disparar PgDown");
@@ -814,6 +907,7 @@ mod tests {
                hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
                waypoint_hint: WaypointHint::Inactive, heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(a, BotAction::UseHotkey { hidcode: 0x2C });
 
@@ -824,6 +918,7 @@ mod tests {
                hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
                waypoint_hint: WaypointHint::Inactive, heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(a, BotAction::Idle);
         assert_eq!(fsm.state, FsmState::Idle);
@@ -835,6 +930,7 @@ mod tests {
                hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
                waypoint_hint: WaypointHint::Inactive, heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(a, BotAction::UseHotkey { hidcode: 0x2C });
     }
@@ -856,6 +952,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(action, BotAction::UseHotkey { hidcode: 0x3A }); // heal, no attack
         assert_eq!(fsm.state, FsmState::Emergency);
@@ -877,6 +974,7 @@ mod tests {
             hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
             waypoint_hint: WaypointHint::Inactive, heal_override: None,
             attack_override: None,
+            health_gate: HealthGateDecision::default(),
         });
         assert_eq!(fsm.prev_target_active, Some(true));
 
@@ -887,6 +985,7 @@ mod tests {
             hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
             waypoint_hint: WaypointHint::Inactive, heal_override: None,
             attack_override: None,
+            health_gate: HealthGateDecision::default(),
         });
         assert_eq!(fsm.state, FsmState::Paused);
         assert_eq!(fsm.prev_target_active, None,
@@ -899,6 +998,7 @@ mod tests {
             hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
             waypoint_hint: WaypointHint::Inactive, heal_override: None,
             attack_override: None,
+            health_gate: HealthGateDecision::default(),
         });
         assert_eq!(fsm.state, FsmState::Idle);
         assert_eq!(fsm.prev_target_active, None,
@@ -911,6 +1011,7 @@ mod tests {
             hotkeys: &test_hotkeys(), cd_heal: 10, cd_attack: 30,
             waypoint_hint: WaypointHint::Inactive, heal_override: None,
             attack_override: None,
+            health_gate: HealthGateDecision::default(),
         });
         assert_eq!(a, BotAction::UseHotkey { hidcode: 0x2C },
             "tras resume, nuevo enemy sin target debe disparar emit limpio");
@@ -929,6 +1030,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(action, BotAction::Idle);
         assert_eq!(fsm.state, FsmState::Paused);
@@ -950,6 +1052,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(action, BotAction::Idle);
         assert_eq!(fsm.state, FsmState::Paused);
@@ -969,6 +1072,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         // Tras resume, el mismo tick decide normalmente → Idle (todo nominal).
         assert_eq!(action, BotAction::Idle);
@@ -990,6 +1094,7 @@ mod tests {
                waypoint_hint: WaypointHint::Active { emit: Some(WaypointEmit::KeyTap(0x60)) },
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(action, BotAction::UseHotkey { hidcode: 0x60 });
         assert_eq!(fsm.state, FsmState::Walking);
@@ -1011,6 +1116,7 @@ mod tests {
                waypoint_hint: WaypointHint::Active { emit: None },
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(action, BotAction::Idle);
         assert_eq!(fsm.state, FsmState::Walking);
@@ -1029,6 +1135,7 @@ mod tests {
                waypoint_hint: WaypointHint::Active { emit: Some(WaypointEmit::KeyTap(0x60)) },
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         // HP crítico gana — ignora el hint del waypoint.
         assert_eq!(action, BotAction::UseHotkey { hidcode: 0x3A });
@@ -1048,6 +1155,7 @@ mod tests {
                waypoint_hint: WaypointHint::Active { emit: Some(WaypointEmit::KeyTap(0x60)) },
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         // Hay enemigo → ataque gana, el waypoint queda en pausa.
         assert_eq!(action, BotAction::UseHotkey { hidcode: 0x2C });
@@ -1067,6 +1175,7 @@ mod tests {
                waypoint_hint: WaypointHint::Inactive,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         assert_eq!(action, BotAction::Idle);
         assert_eq!(fsm.state, FsmState::Idle);
@@ -1130,6 +1239,7 @@ mod tests {
                waypoint_hint: hint,
                heal_override: None,
                attack_override: None,
+               health_gate: HealthGateDecision::default(),
            });
         let interrupting = fsm.is_interrupting_waypoints();
         (action, fsm.state.clone(), interrupting)
@@ -1328,6 +1438,7 @@ mod tests {
             waypoint_hint: WaypointHint::Inactive,
             heal_override: None,
             attack_override: None,
+            health_gate: HealthGateDecision::default(),
         })
     }
 
