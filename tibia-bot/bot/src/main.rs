@@ -242,6 +242,9 @@ async fn main() -> Result<()> {
     // Sin feature `ml-runtime` o sin modelo en disco → reader inhábil,
     // fallback SSE matcher automático.
     vision.load_ml_model(&config.ml);
+    // Item #7 plan robustez: aplicar config inventory (cadencias + stddev).
+    // Defaults preservan el comportamiento pre-configuración.
+    vision.apply_inventory_config(&config.inventory);
     if vision.is_calibrated() {
         info!("Vision calibrada y lista.");
     } else {

@@ -111,7 +111,12 @@ pub struct Vision {
     /// Última suma de unidades por item via OCR del stack count (M1).
     last_inventory_stacks: std::collections::HashMap<String, u32>,
     /// Intervalo de frames entre lecturas de inventario.
+    /// Configurable via `[inventory].detect_interval_ticks`.
     inventory_detect_interval: u32,
+    /// Stage A threshold (luma stddev). Configurable via
+    /// `[inventory].empty_stddev_max`. Override del const
+    /// `EMPTY_STDDEV_MAX` para tuning sin recompile.
+    inventory_empty_stddev_max: f32,
     /// Classifier ML opcional (Fase 2.5). Cargado via `load_ml_model()` si
     /// `config.ml.use_ml=true`. Cuando Some Y `is_ready()`, el inventory
     /// reader delega primero a ML; si infer_slot devuelve None, fallback SSE.
@@ -315,6 +320,7 @@ impl Vision {
             last_inventory_slots:  Vec::new(),
             last_inventory_stacks: std::collections::HashMap::new(),
             inventory_detect_interval: 15,
+            inventory_empty_stddev_max: inventory::EMPTY_STDDEV_MAX,
             ml_reader: None,  // populate via load_ml_model()
             last_reader_costs: [0; crate::instrumentation::ReaderId::COUNT],
         }
@@ -338,6 +344,38 @@ impl Vision {
     /// porque dHash es demasiado frágil al anti-aliasing del cliente Tibia 12.
     /// El archivo sigue soportado por `build_map_index` bin pero no se
     /// consume en runtime. Ver PLAN.md Phase B.2 para el rationale completo.
+    /// Aplica config `[inventory]` a los parámetros del reader (item #7 plan
+    /// robustez). Llamar después de `Vision::load()` desde main.rs. Rango
+    /// válido: detect_interval_ticks ∈ [1, 300]; empty_stddev_max ∈ [0.0, 100.0].
+    /// Valores fuera rango caen a default con warn log.
+    pub fn apply_inventory_config(&mut self, cfg: &crate::config::InventoryConfig) {
+        let interval = cfg.detect_interval_ticks;
+        if (1..=300).contains(&interval) {
+            self.inventory_detect_interval = interval;
+        } else {
+            tracing::warn!(
+                "inventory.detect_interval_ticks={} fuera de [1, 300], usando default 15",
+                interval
+            );
+        }
+        let stddev = cfg.empty_stddev_max;
+        if stddev.is_finite() && (0.0..=100.0).contains(&stddev) {
+            self.inventory_empty_stddev_max = stddev;
+            if let Some(ref mut reader) = self.inventory_reader {
+                reader.set_empty_stddev_max(stddev);
+            }
+        } else {
+            tracing::warn!(
+                "inventory.empty_stddev_max={} inválido, usando default {}",
+                stddev, inventory::EMPTY_STDDEV_MAX
+            );
+        }
+        tracing::info!(
+            "Inventory config: detect_interval={} ticks, empty_stddev_max={:.1}",
+            self.inventory_detect_interval, self.inventory_empty_stddev_max
+        );
+    }
+
     pub fn load_map_index(&mut self, cfg: &crate::config::GameCoordsConfig) {
         if let Some(interval) = cfg.detect_interval {
             self.coords_detect_interval = interval.max(1);

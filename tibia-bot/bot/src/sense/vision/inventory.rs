@@ -247,6 +247,9 @@ pub struct InventoryReader {
     templates: Vec<ItemTemplate>,
     slots:     Vec<RoiDef>,
     digit_templates: super::inventory_ocr::DigitTemplates,
+    /// Threshold runtime para Stage A empty detection. Override del const
+    /// `EMPTY_STDDEV_MAX` configurable via `[inventory].empty_stddev_max`.
+    empty_stddev_max: f32,
 }
 
 impl InventoryReader {
@@ -255,6 +258,15 @@ impl InventoryReader {
             templates: Vec::new(),
             slots:     Vec::new(),
             digit_templates: super::inventory_ocr::DigitTemplates::new(),
+            empty_stddev_max: EMPTY_STDDEV_MAX,
+        }
+    }
+
+    /// Override runtime del threshold Stage A. Valor fuera de rango válido
+    /// [0.0, 100.0] lo rechaza y preserva el valor actual.
+    pub fn set_empty_stddev_max(&mut self, max: f32) {
+        if max.is_finite() && (0.0..=100.0).contains(&max) {
+            self.empty_stddev_max = max;
         }
     }
 
@@ -431,7 +443,7 @@ impl InventoryReader {
                 frame,
                 &Roi::new(slot.x, slot.y, slot.w, slot.h),
             );
-            if stddev < EMPTY_STDDEV_MAX {
+            if stddev < self.empty_stddev_max {
                 slots_out.push(SlotReading::empty(slot_idx));
                 continue;
             }
@@ -537,7 +549,7 @@ impl InventoryReader {
                 frame,
                 &Roi::new(slot.x, slot.y, slot.w, slot.h),
             );
-            if stddev < EMPTY_STDDEV_MAX {
+            if stddev < self.empty_stddev_max {
                 slots_raw.push(SlotRaw::Empty);
                 continue;
             }
@@ -1016,6 +1028,69 @@ mod tests {
         for (i, slot) in reading.slots.iter().enumerate() {
             assert_eq!(slot.slot_idx, i as u32);
         }
+    }
+
+    // ── Item #7: Cadencias configurables (set_empty_stddev_max) ─────────
+
+    #[test]
+    fn set_empty_stddev_max_accepts_valid_range() {
+        let mut reader = InventoryReader::new();
+        let original = reader.empty_stddev_max;
+        reader.set_empty_stddev_max(25.5);
+        assert!((reader.empty_stddev_max - 25.5).abs() < 0.001);
+        reader.set_empty_stddev_max(0.0);
+        assert_eq!(reader.empty_stddev_max, 0.0);
+        reader.set_empty_stddev_max(100.0);
+        assert_eq!(reader.empty_stddev_max, 100.0);
+        // Restore sane default for any subsequent tests (defensivo).
+        reader.set_empty_stddev_max(original);
+    }
+
+    #[test]
+    fn set_empty_stddev_max_rejects_out_of_range() {
+        let mut reader = InventoryReader::new();
+        let original = reader.empty_stddev_max;
+        reader.set_empty_stddev_max(-1.0);
+        assert_eq!(reader.empty_stddev_max, original);  // sin cambio
+        reader.set_empty_stddev_max(150.0);
+        assert_eq!(reader.empty_stddev_max, original);
+        reader.set_empty_stddev_max(f32::NAN);
+        assert_eq!(reader.empty_stddev_max, original);
+        reader.set_empty_stddev_max(f32::INFINITY);
+        assert_eq!(reader.empty_stddev_max, original);
+    }
+
+    #[test]
+    fn set_empty_stddev_max_actually_affects_filtering() {
+        // Con stddev_max muy alto, slots NO se filtran como empty (todo pasa).
+        // Con stddev_max 0.0, todos los slots se filtran (ninguno pasa empty).
+        let mut reader = InventoryReader::new();
+        reader.templates.push(ItemTemplate {
+            name: "dummy".into(),
+            template: make_template(42),
+            threshold: MATCH_THRESHOLD,
+        });
+        reader.set_slots(vec![RoiDef::new(0, 0, 32, 32)]);
+
+        // Frame con stddev ~0 (uniforme).
+        let frame = crate::sense::frame_buffer::Frame {
+            width: 64, height: 64,
+            data: vec![50u8; 64 * 64 * 4],
+            captured_at: std::time::Instant::now(),
+        };
+
+        // Threshold default 20.0 → slot uniforme cuenta como Empty.
+        let reading = reader.read_with_stacks_ml(&frame, None);
+        assert!(reading.slots[0].item.is_none());
+        assert_eq!(reading.slots[0].stage,
+            crate::sense::vision::inventory_slot::SlotStage::Empty);
+
+        // Threshold 0.0 → ningún slot es Empty (todos pasan a Stage C).
+        reader.set_empty_stddev_max(0.0);
+        let reading = reader.read_with_stacks_ml(&frame, None);
+        // Stage ya no es Empty (puede ser Unmatched si nada matcheó).
+        assert_ne!(reading.slots[0].stage,
+            crate::sense::vision::inventory_slot::SlotStage::Empty);
     }
 
     #[test]

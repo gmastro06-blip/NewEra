@@ -32,10 +32,50 @@ pub struct Config {
     pub ml:          MlConfig,
     #[serde(default)]
     pub health:      HealthConfig,
+    #[serde(default)]
+    pub inventory:   InventoryConfig,
     /// Tabla de spells con prioridades. Si vacía, se genera desde `[actions]`.
     #[serde(default, rename = "spell")]
     pub spells:      Vec<SpellConfig>,
 }
+
+/// Configuración del pipeline de detección de inventario (plan robustez
+/// 2026-04-22). Todos los campos opcionales con defaults — un TOML sin
+/// `[inventory]` usa los defaults históricos.
+///
+/// Permite tuning sin recompile durante la sesión live:
+/// - Aumentar `detect_interval_ticks` si el inventory satura el budget.
+/// - Reducir si querés reacción más rápida (trade-off con cost).
+/// - Ajustar `empty_stddev_max` si la calibración de slot empty/llenos
+///   demuestra ruido distinto al asumido.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InventoryConfig {
+    /// Cada cuántos ticks correr el reader completo (Stage A/B/C).
+    /// Default 15 (~500 ms @ 30 Hz). Los ticks "dormidos" reutilizan el
+    /// cache. Subir para reducir cost si el reader es cuello de botella;
+    /// bajar si querés detección más ágil de cambios de inventory.
+    #[serde(default = "default_inventory_detect_interval")]
+    pub detect_interval_ticks: u32,
+
+    /// Threshold de luma stddev para Stage A empty detection.
+    /// Default 20.0 (gap empírico entre slot vacío ~8-12 y llenado ~30+).
+    /// Subir si slots vacíos tienen textura notable (fondo no uniforme).
+    /// Bajar si se pierden slots con items oscuros (sprite bajo stddev).
+    #[serde(default = "default_inventory_empty_stddev_max")]
+    pub empty_stddev_max: f32,
+}
+
+impl Default for InventoryConfig {
+    fn default() -> Self {
+        Self {
+            detect_interval_ticks: default_inventory_detect_interval(),
+            empty_stddev_max:      default_inventory_empty_stddev_max(),
+        }
+    }
+}
+
+fn default_inventory_detect_interval() -> u32 { 15 }
+fn default_inventory_empty_stddev_max() -> f32 { 20.0 }
 
 /// Configuración del HealthSystem (degradación adaptativa runtime).
 ///
