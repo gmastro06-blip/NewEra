@@ -391,6 +391,51 @@ fn bench_inventory_stage_a(c: &mut Criterion) {
     });
 }
 
+// ── Inventory Stage B (adaptive re-matching) ───────────────────────────
+//
+// Valida el claim del plan inventory robustez item #3: Stage B cached
+// single-template hit es ~70x más barato que el full sweep con 70
+// templates. Si el ratio es menor, revisar si el sweep tiene otros
+// costos dominantes (crop, strip, extract).
+
+fn bench_inventory_stage_b(c: &mut Criterion) {
+    use imageproc::template_matching::match_template as mt;
+    use imageproc::template_matching::MatchTemplateMethod;
+
+    // Slot sintético 32×32 + UN template 32×24 (post strip stack count).
+    let slot_img = make_slot(32, 32, 42);
+    let template_single = make_slot(32, 24, 50);
+
+    c.bench_function("inventory_stage_b_cached_single_32x32", |b| {
+        b.iter(|| {
+            let result = mt(
+                black_box(&slot_img),
+                black_box(&template_single),
+                MatchTemplateMethod::CrossCorrelationNormalized,
+            );
+            let _max = result.iter().cloned().fold(f32::MIN, f32::max);
+        });
+    });
+
+    // 70 templates simulando un thresholds.toml típico.
+    let templates: Vec<image::GrayImage> = (0..70u8)
+        .map(|i| make_slot(32, 24, i * 3))
+        .collect();
+
+    c.bench_function("inventory_stage_c_full_sweep_70templates_32x32", |b| {
+        b.iter(|| {
+            for tpl in &templates {
+                let result = mt(
+                    black_box(&slot_img),
+                    black_box(tpl),
+                    MatchTemplateMethod::CrossCorrelationNormalized,
+                );
+                let _max = result.iter().cloned().fold(f32::MIN, f32::max);
+            }
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_inventory_exact_vs_shift,
@@ -400,5 +445,6 @@ criterion_group!(
     bench_instrumentation_record_action_ack,
     bench_health_evaluate_tick,
     bench_inventory_stage_a,
+    bench_inventory_stage_b,
 );
 criterion_main!(benches);

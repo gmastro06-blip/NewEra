@@ -2720,6 +2720,18 @@ async fn handle_prometheus_metrics(State(s): State<AppState>) -> Response {
     writeln!(out, "tibia_inventory_slots_with_stable_total {}",
         s.metrics.inventory_slots_with_stable.load(std::sync::atomic::Ordering::Relaxed)).ok();
 
+    // Per-stage counters (item #3 Stage B monitoreo). Cache hit rate =
+    // cached_hit / (cached_hit + full_sweep). Steady state >0.7 esperado;
+    // caida sostenida sugiere drift de grid o templates obsoletos.
+    writeln!(out, "# HELP tibia_inventory_stage_total Matched slots grouped by pipeline stage").ok();
+    writeln!(out, "# TYPE tibia_inventory_stage_total counter").ok();
+    writeln!(out, "tibia_inventory_stage_total{{stage=\"cached_hit\"}} {}",
+        s.metrics.inventory_stage_cached_hit.load(std::sync::atomic::Ordering::Relaxed)).ok();
+    writeln!(out, "tibia_inventory_stage_total{{stage=\"full_sweep\"}} {}",
+        s.metrics.inventory_stage_full_sweep.load(std::sync::atomic::Ordering::Relaxed)).ok();
+    writeln!(out, "tibia_inventory_stage_total{{stage=\"ml\"}} {}",
+        s.metrics.inventory_stage_ml.load(std::sync::atomic::Ordering::Relaxed)).ok();
+
     // Confidence histogram: emitir percentiles p50/p95/p99 directamente
     // (bucket array es demasiado verbose para /metrics). Unidad: basis
     // points 0..10000, donde 10000 = confidence 1.0.

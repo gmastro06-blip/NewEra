@@ -62,6 +62,14 @@ pub struct MetricsRegistry {
     pub inventory_slots_matched:      AtomicU64,
     pub inventory_slots_unmatched:    AtomicU64,
     pub inventory_slots_with_stable:  AtomicU64,
+    /// Stage B hits — template cacheado resolvió el slot (item #3).
+    /// Cache hit rate = cached_hit_total / (cached_hit_total + full_sweep_total)
+    /// Steady state esperado >0.7; si cae <0.3 sostenido → drift/cambio inventory.
+    pub inventory_stage_cached_hit:   AtomicU64,
+    /// Stage C hits — full sweep resolvió el slot (cache miss o primer read).
+    pub inventory_stage_full_sweep:   AtomicU64,
+    /// ML classifier resolvió el slot (solo si feature `ml-runtime` + modelo).
+    pub inventory_stage_ml:           AtomicU64,
     /// Confidence distribution. Units: confidence × 10000 (basis points),
     /// reusa LatencyHistogram (buckets exponenciales base 500 us).
     /// Bucket 0 → confidence < 0.05 (rechazos borderline).
@@ -156,6 +164,9 @@ impl MetricsRegistry {
             inventory_slots_matched:     AtomicU64::new(0),
             inventory_slots_unmatched:   AtomicU64::new(0),
             inventory_slots_with_stable: AtomicU64::new(0),
+            inventory_stage_cached_hit:  AtomicU64::new(0),
+            inventory_stage_full_sweep:  AtomicU64::new(0),
+            inventory_stage_ml:          AtomicU64::new(0),
             inventory_slot_confidence:   LatencyHistogram::new(),
             actions_emitted:  Default::default(),
             actions_acked:    Default::default(),
@@ -313,6 +324,16 @@ impl MetricsRegistry {
                 SlotStage::CachedHit | SlotStage::FullSweep | SlotStage::MlClassified => {
                     if s.item.is_some() {
                         self.inventory_slots_matched.fetch_add(1, Ordering::Relaxed);
+                        // Por-stage breakdown: monitorea cache hit rate.
+                        match s.stage {
+                            SlotStage::CachedHit =>
+                                self.inventory_stage_cached_hit.fetch_add(1, Ordering::Relaxed),
+                            SlotStage::FullSweep =>
+                                self.inventory_stage_full_sweep.fetch_add(1, Ordering::Relaxed),
+                            SlotStage::MlClassified =>
+                                self.inventory_stage_ml.fetch_add(1, Ordering::Relaxed),
+                            _ => 0,
+                        };
                         // Confidence en basis points [0..10000]. Histograma
                         // interpreta como "µs" pero es solo un bucket index.
                         let bp = (s.confidence * 10_000.0).clamp(0.0, 10_000.0) as u32;
